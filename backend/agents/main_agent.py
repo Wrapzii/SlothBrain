@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import re
 from pathlib import Path
@@ -40,34 +41,84 @@ def _load_protected_prompt() -> str:
 
 
 def _parse_plan(response: str) -> dict:
-    """Parse APPROACH and numbered STEPS from a plan_task response."""
+    """Parse a plan_task response into approach and steps.
+
+    Tries JSON parsing first (preferred — the prompt requests JSON output).
+    Falls back to extracting a numbered list, then a ``STEPS:`` header, and
+    finally treats the whole response as a single step.
+    """
+    stripped = response.strip()
+
+    # ── Attempt 1: JSON parse ─────────────────────────────────────────────
+    fence_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", stripped, re.DOTALL)
+    if fence_match:
+        json_candidate = fence_match.group(1)
+    else:
+        obj_match = re.search(r"\{[^{}]*\}", stripped, re.DOTALL)
+        json_candidate = obj_match.group(0) if obj_match else stripped
+
+    try:
+        data = json.loads(json_candidate)
+        approach = str(data.get("approach", "")).strip()
+        raw_steps = data.get("steps", [])
+        if isinstance(raw_steps, list) and raw_steps:
+            steps = [str(s).strip() for s in raw_steps if str(s).strip()]
+            if steps:
+                return {"approach": approach, "steps": steps[:10]}
+    except (json.JSONDecodeError, AttributeError, TypeError):
+        pass
+
+    # ── Attempt 2: Regex for numbered list items ──────────────────────────
     approach = ""
     approach_match = re.search(r"approach:\s*(.+?)(?:\n|$)", response, re.IGNORECASE)
     if approach_match:
         approach = approach_match.group(1).strip()
 
-    # Extract numbered list items: "1. ...", "2. ...", etc.
-    steps = [s.strip() for s in re.findall(r"^\d+\.\s+(.+)", response, re.MULTILINE) if s.strip()]
+    steps = [
+        s.strip()
+        for s in re.findall(r"^\d+\.\s+(.+)", response, re.MULTILINE)
+        if s.strip()
+    ]
 
     if not steps:
-        # Fallback: lines after "STEPS:" header
+        # ── Attempt 3: Lines after STEPS: header ─────────────────────────
         in_steps = False
         for line in response.splitlines():
-            stripped = line.strip()
-            if re.match(r"steps?\s*:", stripped, re.IGNORECASE):
+            stripped_line = line.strip()
+            if re.match(r"steps?\s*:", stripped_line, re.IGNORECASE):
                 in_steps = True
                 continue
-            if in_steps and stripped:
-                steps.append(stripped.lstrip("-•*").strip())
+            if in_steps and stripped_line:
+                steps.append(stripped_line.lstrip("-•*").strip())
 
     if not steps:
-        # Last resort: treat the whole response as one step
+        # ── Attempt 4: Last resort ────────────────────────────────────────
         steps = [response.strip()[:_MAX_FALLBACK_STEP_LENGTH]]
 
     return {"approach": approach, "steps": steps[:10]}
 
 
 class MainAgent:
+    """High-capability agent responsible for planning and executing complex tasks.
+
+    The MainAgent runs on the main inference slot (higher context window) and
+    provides three core capabilities:
+
+    1. **Task planning** — ``plan_task`` breaks a natural-language task into an
+       ordered list of actionable steps (JSON output for reliable parsing).
+    2. **Step execution** — ``execute_step`` executes one step with accumulated
+       context from previous steps, maintaining coherent long-running task state.
+    3. **Sub-agent delegation** — ``spawn_sub_agent`` creates task-specialised
+       ``SubAgent`` instances via the ``AgentRegistry`` for parallel or
+       specialised work.
+
+    Memory retrieval is performed before every ``process`` call so relevant
+    past context is always available to the model.
+
+    TODO: Add a tool-calling layer so the MainAgent can invoke tools (code
+          execution, file I/O, web search) as part of execute_step.
+    """
+
     def __init__(
         self,
         slot_manager: SlotManager,
@@ -168,19 +219,23 @@ class MainAgent:
     async def plan_task(self, task: str) -> dict:
         """Break a task into an ordered list of actionable steps.
 
+        Requests JSON output for reliable parsing.  Falls back to regex
+        extraction and then single-step execution on any failure.
+
         Returns a dict with keys:
         - ``approach``: brief description of the overall strategy.
         - ``steps``: list of step description strings (max 10).
         """
         plan_prompt = (
             "system: You are a planning AI. Break the following task into clear, "
-            "actionable steps that an AI agent can execute one at a time.\n"
-            "Format your response as:\n"
-            "APPROACH: <brief description of the overall strategy>\n"
-            "STEPS:\n"
-            "1. <first step>\n"
-            "2. <second step>\n"
-            "...\n\n"
+            "actionable steps that an AI agent can execute one at a time.\n\n"
+            "You MUST respond with a single valid JSON object and nothing else:\n"
+            '{"approach": "<brief strategy description>", '
+            '"steps": ["<step 1>", "<step 2>", ...]}\n\n'
+            "Rules:\n"
+            "- Maximum 10 steps.\n"
+            "- Each step should be a single, concrete action.\n"
+            "- Steps must be ordered and build on each other.\n\n"
             f"Task: {task}\nassistant:"
         )
         try:

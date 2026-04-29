@@ -4,6 +4,18 @@ import httpx
 
 
 class LlamaClient:
+    """Async HTTP client for the llama.cpp inference server REST API.
+
+    All methods open a new ``httpx.AsyncClient`` per call.  This is safe
+    but slightly less efficient than a persistent connection pool.
+
+    TODO: Replace per-call AsyncClient creation with a persistent client
+          (created in ``__init__``, closed on shutdown) to benefit from
+          HTTP connection pooling. See BUGS.md BUG-010.
+    TODO: Add configurable retry with exponential back-off for transient
+          errors (connection refused, 503 Service Unavailable).
+    """
+
     def __init__(self, host: str, port: int) -> None:
         self.base_url = f"http://{host}:{port}"
         self._timeout = httpx.Timeout(120.0)

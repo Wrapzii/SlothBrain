@@ -30,6 +30,12 @@ returns ``continue | retry | done | abort``.
 
 An optional ``on_progress`` callback streams structured events to callers for
 real-time client updates.
+
+TODO: Add a tool-dispatch layer so ``MainAgent.execute_step`` can call
+      registered tools (Python REPL, shell, file I/O) and feed results back
+      into context automatically. See TODO.md Phase 3.
+TODO: Emit a structured audit event if the loop exits with an unhandled
+      exception, so the ``SafetySupervisor`` can detect the failure.
 """
 
 from __future__ import annotations

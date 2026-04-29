@@ -4,6 +4,32 @@ from backend.core.llama_client import LlamaClient
 
 
 class RollingContext:
+    """Rolling conversation buffer with automatic LLM-based summarisation.
+
+    Accumulates ``{role, content}`` message dicts and estimates the total
+    token count using a ``len(content) // 4`` heuristic.  When the estimate
+    exceeds ``summarize_at`` the entire conversation is summarised by calling
+    the LLM and the buffer is replaced with the summary.
+
+    This keeps the watcher's context window from overflowing on long sessions.
+
+    Parameters
+    ----------
+    llama_client:
+        Used to call the LLM for summarisation.
+    slot_id:
+        The inference slot to use for summarisation calls.
+    max_tokens:
+        Context window size in tokens (used as an upper bound reference).
+    summarize_at:
+        Token estimate threshold that triggers summarisation (default 3000).
+
+    TODO: Run summarisation as a background task so it does not block
+          ``add_message`` callers. See BUGS.md BUG-002.
+    TODO: Use a proper tokeniser (tiktoken or the llama.cpp /tokenize
+          endpoint) instead of the ``len // 4`` heuristic. See BUGS.md BUG-012.
+    """
+
     def __init__(
         self,
         llama_client: LlamaClient,

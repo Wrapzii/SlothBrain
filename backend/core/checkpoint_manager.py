@@ -7,6 +7,10 @@ continuing with a potentially corrupted context.
 
 Checkpoints are stored in memory only; they are scoped to a single run and are
 cleared once the run completes.
+
+TODO: Add optional disk persistence so checkpoints survive backend restarts.
+      Serialise each TaskCheckpoint to ``data/checkpoints/{run_id}/step_{n}.json``
+      on save and load them on restore. See TODO.md Phase 2 and BUGS.md BUG-004.
 """
 
 from __future__ import annotations
