@@ -23,8 +23,10 @@ from backend.benchmarks.benchmark import BenchmarkSuite
 from backend.config import settings
 from backend.core.approval_queue import ApprovalQueue
 from backend.core.audit_log import AuditLog
+from backend.core.checkpoint_manager import CheckpointManager
 from backend.core.llama_client import LlamaClient
 from backend.core.resource_manager import ResourceManager
+from backend.core.safety_supervisor import SafetySupervisor
 from backend.core.server_manager import ServerManager
 from backend.core.slot_manager import SlotManager
 from backend.memory.lancedb_memory import LanceDBMemory
@@ -50,6 +52,8 @@ agent_registry: AgentRegistry
 server_manager: ServerManager
 audit_log: AuditLog
 approval_queue: ApprovalQueue
+checkpoint_manager: CheckpointManager
+safety_supervisor: SafetySupervisor
 
 
 @asynccontextmanager
@@ -57,6 +61,7 @@ async def lifespan(app: FastAPI):  # type: ignore[type-arg]
     global llama_client, slot_manager, resource_manager, rolling_context
     global memory, watcher_agent, main_agent, handoff_manager, benchmark_suite
     global preset_manager, agent_registry, server_manager, audit_log, approval_queue
+    global checkpoint_manager, safety_supervisor
 
     audit_log = AuditLog()
     approval_queue = ApprovalQueue(max_entries=settings.max_pending_approvals)
@@ -106,12 +111,24 @@ async def lifespan(app: FastAPI):  # type: ignore[type-arg]
     )
     # Give the MainAgent a reference to the registry so it can spawn sub-agents
     main_agent.set_registry(agent_registry)
+
+    # Safety infrastructure for the agentic loop
+    checkpoint_manager = CheckpointManager()
+    safety_supervisor = SafetySupervisor(
+        llama_client=llama_client,
+        checkpoint_manager=checkpoint_manager,
+        poll_interval=settings.supervisor_poll_interval,
+        step_timeout=settings.supervisor_step_timeout,
+    )
+    safety_supervisor.start()
+
     if settings.enable_server_watchdog:
         server_manager.start_watchdog()
 
     yield
 
-    # Shutdown – stop all watchdog tasks
+    # Shutdown – stop all background tasks
+    safety_supervisor.stop()
     server_manager.stop_watchdog()
     agent_registry.destroy_all()
 
@@ -308,7 +325,9 @@ async def agentic_chat(request: AgenticRequest) -> dict:
     """Run a multi-step agentic task loop and return the full result.
 
     The MainAgent plans the task, executes each step in sequence, and the
-    WatcherAgent monitors progress and verifies completion.
+    WatcherAgent monitors progress and verifies completion.  The
+    SafetySupervisor watches for stalls and the CheckpointManager saves state
+    before every step so the loop can recover cleanly on failure.
     """
     from backend.agents.agentic_loop import AgenticLoop
 
@@ -316,6 +335,8 @@ async def agentic_chat(request: AgenticRequest) -> dict:
         main_agent=main_agent,
         watcher_agent=watcher_agent,
         max_steps=_clamp_steps(request.max_steps),
+        checkpoint_manager=checkpoint_manager,
+        supervisor=safety_supervisor,
     )
     try:
         result = await loop.run(task=request.task)
@@ -724,6 +745,8 @@ async def ws_agent_progress(websocket: WebSocket) -> None:
             main_agent=main_agent,
             watcher_agent=watcher_agent,
             max_steps=max_steps,
+            checkpoint_manager=checkpoint_manager,
+            supervisor=safety_supervisor,
         )
 
         audit_log.record(

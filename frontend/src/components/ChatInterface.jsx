@@ -27,6 +27,7 @@ const AGENTIC_STATUS_LABELS = {
   verifying: '🔍 Verifying completion…',
   complete:  '✅ Task complete',
   aborted:   '⛔ Task aborted',
+  escalated: '🚨 Escalated to user',
   error:     '❌ Error',
 }
 
@@ -37,6 +38,7 @@ const AGENTIC_STATUS_COLORS = {
   verifying: '#ffa500',
   complete:  COLORS.green,
   aborted:   '#ff4444',
+  escalated: '#ff8800',
   error:     '#ff4444',
 }
 
@@ -113,6 +115,31 @@ function applyAgenticEvent(msg, event) {
 
     case 'aborted':
       return { ...msg, status: 'aborted', summary: event.reason || '' }
+
+    case 'escalated':
+      return { ...msg, status: 'escalated', summary: event.reason || '' }
+
+    case 'supervisor_intervention':
+      return {
+        ...msg,
+        supervisorEvents: [
+          ...(msg.supervisorEvents || []),
+          { step_num: event.step_num, action: event.action, message: event.message },
+        ],
+      }
+
+    case 'context_reset':
+      return {
+        ...msg,
+        supervisorEvents: [
+          ...(msg.supervisorEvents || []),
+          { step_num: null, action: 'context_reset', message: `Restored to step ${event.restored_to_step}: ${event.message}` },
+        ],
+        // Mark all steps at or after restored_to_step as pending again
+        steps: msg.steps.map((s) =>
+          s.step_num >= event.restored_to_step ? { ...s, status: 'pending', result: '' } : s,
+        ),
+      }
 
     case 'result':
       return {
@@ -248,6 +275,24 @@ function AgenticMessage({ msg }) {
       {msg.summary && (
         <div style={{ color: COLORS.text, fontSize: 13, marginTop: 6, whiteSpace: 'pre-wrap' }}>
           {msg.summary}
+        </div>
+      )}
+
+      {/* Supervisor events */}
+      {msg.supervisorEvents && msg.supervisorEvents.length > 0 && (
+        <div style={{
+          borderTop: `1px solid ${COLORS.border}`,
+          paddingTop: 8,
+          marginTop: 8,
+        }}>
+          <div style={{ color: '#ff8800', fontSize: 11, fontWeight: 700, marginBottom: 4 }}>
+            🛡 Safety Supervisor
+          </div>
+          {msg.supervisorEvents.map((ev, i) => (
+            <div key={i} style={{ color: '#ff8800', fontSize: 11, marginBottom: 2 }}>
+              [{ev.action}]{ev.step_num !== null && ev.step_num !== undefined ? ` step ${ev.step_num}` : ''}: {(ev.message || '').slice(0, 120)}
+            </div>
+          ))}
         </div>
       )}
     </div>

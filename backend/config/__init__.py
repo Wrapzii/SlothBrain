@@ -53,6 +53,10 @@ class AppConfig(BaseSettings):
     require_approval_kv_cache_change: bool = True
     require_approval_large_context_increase: bool = True
     require_approval_emergency_stop: bool = True
+
+    # Safety supervisor settings
+    supervisor_poll_interval: float = 15.0   # seconds between supervision polls
+    supervisor_step_timeout: float = 120.0   # seconds before a step is declared stalled
     cors_allowed_origins: list[str] = [
         "http://localhost:5173",
         "http://127.0.0.1:5173",

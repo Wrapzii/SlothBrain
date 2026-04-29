@@ -1,9 +1,35 @@
-"""Agentic loop: orchestrates multi-step task execution with watcher monitoring.
+"""Agentic loop: orchestrates multi-step task execution.
 
-The MainAgent plans and executes each step while the WatcherAgent observes every
-result, provides course-correction feedback, and ultimately verifies that the
-overall task has been completed.  An optional ``on_progress`` callback streams
-structured events to callers so they can push real-time updates to clients.
+Architecture
+------------
+The loop uses three collaborating components:
+
+``MainAgent``
+    Plans the task (splits it into ordered steps) and executes each step,
+    carrying forward the accumulated context from prior steps.
+
+``CheckpointManager``  *(optional)*
+    Saves a clean snapshot of task state immediately before every step.  If
+    the ``SafetySupervisor`` or an unrecoverable error forces a context reset,
+    the loop restores from the last good checkpoint rather than corrupted state.
+
+``SafetySupervisor``  *(optional)*
+    An independent Python-level watchdog that polls the loop every
+    ``poll_interval`` seconds.  When it detects that a step has been running
+    for longer than ``step_timeout`` seconds it restores the last checkpoint
+    and injects a *recovery intervention* via the ``LoopHandle``:
+
+    nudge            – append a reminder and retry the step
+    reset_context    – restore context from checkpoint, then retry the step
+    retry_step       – retry the current step without touching context
+    end_task         – abort the loop cleanly
+    escalate_to_user – abort and surface the problem to the operator
+
+The watcher (``WatcherAgent``) observes every completed step result and
+returns ``continue | retry | done | abort``.
+
+An optional ``on_progress`` callback streams structured events to callers for
+real-time client updates.
 """
 
 from __future__ import annotations
@@ -11,15 +37,18 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+import uuid
 from typing import TYPE_CHECKING, Awaitable, Callable, Optional
 
 if TYPE_CHECKING:
     from backend.agents.main_agent import MainAgent
     from backend.agents.watcher import WatcherAgent
+    from backend.core.checkpoint_manager import CheckpointManager
+    from backend.core.safety_supervisor import LoopHandle, SafetySupervisor
 
 logger = logging.getLogger(__name__)
 
-# Maximum retries the watcher may request for a single step before moving on.
+# Maximum watcher-requested retries for a single step before moving on.
 _MAX_STEP_RETRIES = 2
 
 
@@ -61,26 +90,29 @@ class AgenticLoop:
     ----
     1. MainAgent **plans** the task → ordered list of steps.
     2. For each step:
-       a. MainAgent **executes** the step using context from prior steps.
-       b. An optional screenshot is captured.
-       c. WatcherAgent **monitors** the result and returns one of:
-          ``continue`` – proceed to the next step.
-          ``retry``    – re-execute the current step (up to _MAX_STEP_RETRIES).
-          ``done``     – task is complete; skip remaining steps.
-          ``abort``    – something went wrong; stop immediately.
+       a. Checkpoint is saved (before execution).
+       b. Supervisor heartbeat is updated.
+       c. Any pending supervisor intervention is applied first.
+       d. MainAgent **executes** the step with accumulated context.
+       e. Optional screenshot is captured.
+       f. WatcherAgent **monitors** the result.
+       g. Supervisor intervention (if any) is merged with watcher decision.
     3. WatcherAgent **verifies** the overall task is complete.
 
     Parameters
     ----------
     main_agent:
-        The MainAgent instance responsible for planning and execution.
+        The ``MainAgent`` instance responsible for planning and execution.
     watcher_agent:
-        The WatcherAgent instance that monitors progress.
+        The ``WatcherAgent`` instance that monitors progress.
     max_steps:
-        Hard cap on the number of steps that will be executed (default 10).
+        Hard cap on the number of steps executed (default 10).
     screenshot_fn:
-        Optional async callable that returns a dict with an
-        ``annotated_png_b64`` key.  Called after each step execution.
+        Optional async callable → dict with ``annotated_png_b64`` key.
+    checkpoint_manager:
+        Optional ``CheckpointManager``; checkpoints are skipped when absent.
+    supervisor:
+        Optional ``SafetySupervisor``; monitoring is skipped when absent.
     """
 
     def __init__(
@@ -89,11 +121,15 @@ class AgenticLoop:
         watcher_agent: "WatcherAgent",
         max_steps: int = 10,
         screenshot_fn: Optional[Callable[[], Awaitable[dict]]] = None,
+        checkpoint_manager: Optional["CheckpointManager"] = None,
+        supervisor: Optional["SafetySupervisor"] = None,
     ) -> None:
         self._main = main_agent
         self._watcher = watcher_agent
         self._max_steps = max_steps
         self._screenshot_fn = screenshot_fn
+        self._cp = checkpoint_manager
+        self._supervisor = supervisor
 
     # ------------------------------------------------------------------
     # Public interface
@@ -120,6 +156,7 @@ class AgenticLoop:
             Keys: ``task``, ``steps``, ``completion_verified``, ``summary``,
             ``total_steps``, ``duration_seconds``.
         """
+        run_id = str(uuid.uuid4())
         start_time = time.monotonic()
 
         async def emit(event_type: str, data: dict | None = None) -> None:
@@ -131,8 +168,42 @@ class AgenticLoop:
             except Exception as exc:  # pragma: no cover
                 logger.debug("Progress callback raised: %s", exc.__class__.__name__)
 
-        await emit("start", {"task": task})
+        # Register with supervisor
+        handle: Optional["LoopHandle"] = None
+        if self._supervisor is not None:
+            handle = self._supervisor.register(run_id)
 
+        await emit("start", {"task": task, "run_id": run_id})
+
+        try:
+            result = await self._execute(
+                run_id=run_id,
+                task=task,
+                handle=handle,
+                emit=emit,
+                start_time=start_time,
+            )
+        finally:
+            # Always deregister and clean up checkpoints
+            if self._supervisor is not None:
+                self._supervisor.deregister(run_id)
+            if self._cp is not None:
+                self._cp.clear(run_id)
+
+        return result
+
+    # ------------------------------------------------------------------
+    # Internal execution
+    # ------------------------------------------------------------------
+
+    async def _execute(
+        self,
+        run_id: str,
+        task: str,
+        handle: Optional["LoopHandle"],
+        emit: Callable[[str, dict | None], Awaitable[None]],
+        start_time: float,
+    ) -> dict:
         # ── 1. Plan ──────────────────────────────────────────────────────────
         await emit("planning", {"task": task})
         try:
@@ -162,21 +233,101 @@ class AgenticLoop:
         context: list[str] = []
         final_action = "continue"
 
-        for idx, description in enumerate(step_descriptions, start=1):
-            step = AgenticStep(step_num=idx, description=description)
+        # Use an explicit index so supervisor reset_context can jump back.
+        idx = 0
+        while idx < len(step_descriptions):
+            description = step_descriptions[idx]
+            step_num = idx + 1  # 1-based for display/checkpoints
+
+            # ── Checkpoint ───────────────────────────────────────────────
+            if self._cp is not None:
+                self._cp.save(
+                    run_id=run_id,
+                    task=task,
+                    step_num=step_num,
+                    step_descriptions=step_descriptions,
+                    context=context,
+                    executed_steps=[s.to_dict() for s in executed],
+                )
+
+            # ── Supervisor heartbeat ──────────────────────────────────────
+            if handle is not None:
+                handle.heartbeat(
+                    step_num=step_num,
+                    task=task,
+                    context=context,
+                )
+
+            step = AgenticStep(step_num=step_num, description=description)
             step.status = "running"
 
             await emit(
                 "step_start",
                 {
-                    "step_num": idx,
+                    "step_num": step_num,
                     "total_steps": len(step_descriptions),
                     "description": description,
                 },
             )
 
             for attempt in range(_MAX_STEP_RETRIES + 1):
-                # Execute
+                # ── Check for supervisor intervention ─────────────────────
+                if handle is not None:
+                    intervention = await handle.pop_intervention()
+                    if intervention:
+                        jump = await self._apply_intervention(
+                            intervention=intervention,
+                            step=step,
+                            idx=idx,
+                            run_id=run_id,
+                            context=context,
+                            executed=executed,
+                            emit=emit,
+                        )
+                        if jump is not None:
+                            # jump is the new idx to restart from
+                            idx = jump
+                            # Rebuild loop state from restored checkpoint
+                            cp = (
+                                self._cp.restore_last(run_id)
+                                if self._cp is not None
+                                else None
+                            )
+                            if cp is not None:
+                                context = list(cp.context)
+                                # Rebuild executed list from checkpoint
+                                executed = [
+                                    _dict_to_step(s)
+                                    for s in cp.executed_steps
+                                ]
+                                description = step_descriptions[idx]
+                                step = AgenticStep(
+                                    step_num=idx + 1,
+                                    description=description,
+                                )
+                                step.status = "running"
+                            break  # restart inner attempt loop
+
+                        action = intervention.get("action", "nudge")
+                        if action == "end_task":
+                            final_action = "abort"
+                            step.result = intervention.get(
+                                "message", "Task ended by supervisor."
+                            )
+                            break
+                        if action == "escalate_to_user":
+                            final_action = "escalate"
+                            step.result = intervention.get(
+                                "message", "Escalated to user by supervisor."
+                            )
+                            break
+                        if action == "nudge":
+                            context.append(
+                                f"Supervisor nudge: {intervention.get('message', '')}"
+                            )
+                            # Fall through to normal execution
+
+                # ── Execute step ─────────────────────────────────────────
                 try:
                     result = await self._main.execute_step(
                         step=description,
@@ -187,29 +338,32 @@ class AgenticLoop:
                 except Exception as exc:
                     logger.error(
                         "execute_step error (step %d, attempt %d): %s",
-                        idx,
+                        step_num,
                         attempt + 1,
                         exc,
                     )
                     step.result = f"Execution error: {exc.__class__.__name__}"
 
-                # Optional screenshot
+                # ── Optional screenshot ───────────────────────────────────
                 if self._screenshot_fn is not None:
                     try:
                         shot = await self._screenshot_fn()
-                        b64 = shot.get("annotated_png_b64") or shot.get("image_b64", "")
+                        b64 = (
+                            shot.get("annotated_png_b64")
+                            or shot.get("image_b64", "")
+                        )
                         if b64:
                             step.screenshots.append(b64)
                     except Exception:
                         pass  # screenshots are best-effort
 
-                # Watcher assessment
+                # ── Watcher assessment ────────────────────────────────────
                 try:
                     assessment = await self._watcher.monitor_step(
                         task=task,
                         step_description=description,
                         step_result=step.result,
-                        step_num=idx,
+                        step_num=step_num,
                         total_steps=len(step_descriptions),
                         context=context,
                     )
@@ -225,7 +379,7 @@ class AgenticLoop:
                 await emit(
                     "step_monitored",
                     {
-                        "step_num": idx,
+                        "step_num": step_num,
                         "action": final_action,
                         "feedback": step.watcher_feedback,
                         "result_preview": step.result[:300],
@@ -240,42 +394,50 @@ class AgenticLoop:
                     await emit(
                         "step_retry",
                         {
-                            "step_num": idx,
+                            "step_num": step_num,
                             "attempt": attempt + 2,
                             "feedback": step.watcher_feedback,
                         },
                     )
                     context.append(
-                        f"Step {idx} retry feedback: {step.watcher_feedback}"
+                        f"Step {step_num} retry feedback: {step.watcher_feedback}"
                     )
-                    continue
+                    continue  # retry this step
 
-                # "continue" or "done" – move on
+                # "continue" or "done" – move to next step
                 break
 
-            step.status = "complete" if final_action != "abort" else "failed"
+            if final_action in ("abort", "escalate"):
+                step.status = "failed"
+            else:
+                step.status = "complete"
+
             step.finish()
-            context.append(f"Step {idx} – {description}:\n{step.result}")
+            context.append(f"Step {step_num} – {description}:\n{step.result}")
             executed.append(step)
 
             await emit("step_complete", step.to_dict())
 
-            if final_action == "abort":
-                await emit(
-                    "aborted",
-                    {"step_num": idx, "reason": step.watcher_feedback},
-                )
+            if final_action in ("abort", "escalate"):
+                # Use watcher feedback as the human-readable reason when
+                # available (supervisor end_task/escalate use step.result).
+                reason = step.watcher_feedback or step.result
+                if final_action == "escalate":
+                    await emit("escalated", {"step_num": step_num, "reason": reason})
+                else:
+                    await emit("aborted", {"step_num": step_num, "reason": reason})
                 return _build_result(
                     task,
                     executed,
                     False,
-                    f"Task aborted at step {idx}: {step.watcher_feedback}",
+                    f"Task stopped at step {step_num}: {reason}",
                     start_time,
                 )
 
             if final_action == "done":
-                # Watcher determined the task is already complete
-                break
+                break  # watcher declared task already complete
+
+            idx += 1  # advance to next step
 
         # ── 3. Verify ────────────────────────────────────────────────────────
         await emit("verifying", {"steps_completed": len(executed)})
@@ -293,26 +455,100 @@ class AgenticLoop:
             verified = len(executed) > 0
             summary = "Task execution complete."
 
-        result = _build_result(task, executed, verified, summary, start_time)
+        result_dict = _build_result(task, executed, verified, summary, start_time)
         await emit(
             "complete",
             {
                 "verified": verified,
                 "summary": summary,
                 "total_steps": len(executed),
-                "duration_seconds": result["duration_seconds"],
+                "duration_seconds": result_dict["duration_seconds"],
             },
         )
-        return result
+        return result_dict
+
+    # ------------------------------------------------------------------
+    # Supervisor intervention handler
+    # ------------------------------------------------------------------
+
+    async def _apply_intervention(
+        self,
+        intervention: dict,
+        step: "AgenticStep",
+        idx: int,
+        run_id: str,
+        context: list[str],
+        executed: list["AgenticStep"],
+        emit: Callable[[str, dict | None], Awaitable[None]],
+    ) -> Optional[int]:
+        """Apply a supervisor intervention.
+
+        Returns the new loop index to jump to when a ``reset_context`` is
+        requested (so the caller can restart from the checkpoint step), or
+        ``None`` when execution should continue in the current step.
+        """
+        action = intervention.get("action", "nudge")
+        message = intervention.get("message", "")
+
+        await emit(
+            "supervisor_intervention",
+            {
+                "step_num": step.step_num,
+                "action": action,
+                "message": message,
+            },
+        )
+        logger.info(
+            "Supervisor intervention (run=%s, step=%d): %s – %s",
+            run_id,
+            step.step_num,
+            action,
+            message[:80],
+        )
+
+        if action == "reset_context":
+            # Restore checkpoint and signal the loop to jump back
+            cp = self._cp.restore_last(run_id) if self._cp is not None else None
+            if cp is not None:
+                new_idx = cp.step_num - 1  # 0-based
+                await emit(
+                    "context_reset",
+                    {
+                        "restored_to_step": cp.step_num,
+                        "message": message,
+                    },
+                )
+                return new_idx
+            # No checkpoint – fall back to nudge
+            context.append(f"Supervisor reset (no checkpoint): {message}")
+            return None
+
+        if action == "retry_step":
+            # Emit the retry event so the UI shows it, but don't increment
+            # step.retries here – that counter is managed by the watcher retry
+            # path so it accurately reflects watcher-requested retries.
+            await emit(
+                "step_retry",
+                {
+                    "step_num": step.step_num,
+                    "attempt": step.retries + 1,
+                    "feedback": f"Supervisor: {message}",
+                },
+            )
+            return None  # caller executes the step in the current attempt
+
+        # nudge / end_task / escalate_to_user handled by caller
+        return None
 
 
 # ---------------------------------------------------------------------------
 # Private helpers
 # ---------------------------------------------------------------------------
 
+
 def _build_result(
     task: str,
-    steps: list[AgenticStep],
+    steps: "list[AgenticStep]",
     verified: bool,
     summary: str,
     start_time: float,
@@ -325,3 +561,19 @@ def _build_result(
         "total_steps": len(steps),
         "duration_seconds": round(time.monotonic() - start_time, 2),
     }
+
+
+def _dict_to_step(d: dict) -> "AgenticStep":
+    """Reconstruct an ``AgenticStep`` from a ``to_dict()`` snapshot."""
+    step = AgenticStep(
+        step_num=d.get("step_num", 0),
+        description=d.get("description", ""),
+    )
+    step.result = d.get("result", "")
+    step.watcher_feedback = d.get("watcher_feedback", "")
+    step.status = d.get("status", "complete")
+    step.screenshots = d.get("screenshots", [])
+    step.retries = d.get("retries", 0)
+    step.finish()  # mark as done so duration is recorded
+    return step
+
