@@ -56,14 +56,12 @@ def _parse_monitor_response(response: str) -> dict:
     stripped = response.strip()
 
     # ── Attempt 1: JSON parse ─────────────────────────────────────────────
-    json_candidate = stripped
     fence_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", stripped, re.DOTALL)
     if fence_match:
         json_candidate = fence_match.group(1)
     else:
         obj_match = re.search(r"\{[^{}]*\}", stripped, re.DOTALL)
-        if obj_match:
-            json_candidate = obj_match.group(0)
+        json_candidate = obj_match.group(0) if obj_match else stripped
 
     try:
         data = json.loads(json_candidate)
@@ -109,14 +107,12 @@ def _parse_verify_response(response: str) -> dict:
     stripped = response.strip()
 
     # ── Attempt 1: JSON parse ─────────────────────────────────────────────
-    json_candidate = stripped
     fence_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", stripped, re.DOTALL)
     if fence_match:
         json_candidate = fence_match.group(1)
     else:
         obj_match = re.search(r"\{[^{}]*\}", stripped, re.DOTALL)
-        if obj_match:
-            json_candidate = obj_match.group(0)
+        json_candidate = obj_match.group(0) if obj_match else stripped
 
     try:
         data = json.loads(json_candidate)

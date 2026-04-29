@@ -95,17 +95,15 @@ def _parse_judge_response(response: str) -> dict:
     Returns a dict with keys ``action`` and ``message``.
     """
     # ── Attempt 1: JSON parse ─────────────────────────────────────────────
-    # The model may wrap JSON in a markdown code fence; strip it first.
+    # The model may wrap JSON in a markdown code fence; try to extract it.
+    # Fall back to the full stripped response if no fence/object is found.
     stripped = response.strip()
-    json_candidate = stripped
     fence_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", stripped, re.DOTALL)
     if fence_match:
         json_candidate = fence_match.group(1)
     else:
-        # Try to extract a bare JSON object
         obj_match = re.search(r"\{[^{}]*\}", stripped, re.DOTALL)
-        if obj_match:
-            json_candidate = obj_match.group(0)
+        json_candidate = obj_match.group(0) if obj_match else stripped
 
     try:
         data = json.loads(json_candidate)
