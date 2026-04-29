@@ -89,6 +89,51 @@ export async function sendChat(message, agent = 'auto') {
   })
 }
 
+export async function sendAgenticChat(task, maxSteps = 10) {
+  return apiFetch('/api/chat/agentic', {
+    method: 'POST',
+    body: JSON.stringify({ task, max_steps: maxSteps }),
+  })
+}
+
+/**
+ * Open a WebSocket to /ws/agent-progress and stream agentic task events.
+ *
+ * @param {string} task - The task description.
+ * @param {number} maxSteps - Maximum number of steps (default 10).
+ * @param {function} onEvent - Called with each parsed event object.
+ * @param {function} onError - Called on error.
+ * @returns {{ close: function }} Handle to close the socket early.
+ */
+export function createAgentProgressSocket(task, maxSteps = 10, onEvent, onError) {
+  const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws'
+  const host = window.location.host
+  const ws = new WebSocket(`${protocol}://${host}/ws/agent-progress`)
+
+  ws.onopen = () => {
+    ws.send(JSON.stringify({ task, max_steps: maxSteps }))
+  }
+
+  ws.onmessage = (event) => {
+    try {
+      const data = JSON.parse(event.data)
+      if (onEvent) onEvent(data)
+    } catch {
+      // ignore malformed frames
+    }
+  }
+
+  ws.onerror = (err) => {
+    if (onError) onError(err)
+  }
+
+  ws.onclose = () => {}
+
+  return {
+    close() { ws.close() },
+  }
+}
+
 export async function setMode(mode) {
   return apiFetch('/api/mode', {
     method: 'POST',
