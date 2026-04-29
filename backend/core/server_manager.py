@@ -98,8 +98,8 @@ class ServerManager:
         self._status = "starting"
         self._process = await asyncio.create_subprocess_exec(
             *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
         )
         self._status = "running"
         self._audit.record(
@@ -137,6 +137,11 @@ class ServerManager:
 
     async def _watchdog(self) -> None:
         """Poll the llama-server /health endpoint; restart on failure."""
+        if not self._config.llama_server_path:
+            logger.info("Watchdog disabled: llama_server_path is not configured.")
+            self._status = "stopped"
+            return
+
         base_url = f"http://{self._config.llama_host}:{self._config.llama_port}"
         while True:
             await asyncio.sleep(30)
@@ -148,6 +153,10 @@ class ServerManager:
                 logger.warning("Watchdog: llama-server health check failed: %s", exc)
                 try:
                     await self.restart(actor="watchdog")
+                except ValueError as config_err:
+                    logger.warning("Watchdog restart skipped: %s", config_err)
+                    self._status = "stopped"
+                    return
                 except RuntimeError as rate_err:
                     logger.error("Watchdog restart blocked: %s", rate_err)
 

@@ -61,6 +61,8 @@ class ApprovalQueue:
             self._queue.pop(oldest, None)
 
     def submit(self, action: str, description: str, payload: Any = None) -> PendingApproval:
+        if action not in self.CRITICAL_ACTIONS:
+            raise ValueError(f"Action {action!r} is not eligible for approval queue")
         self._prune_if_needed()
         approval = PendingApproval(
             approval_id=str(uuid.uuid4()),

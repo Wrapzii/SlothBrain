@@ -90,7 +90,6 @@ class SubAgent:
     async def process(
         self,
         user_input: str,
-        context_size: int | None = None,
         max_tokens: int | None = None,
     ) -> str:
         """Process a message.
@@ -99,6 +98,9 @@ class SubAgent:
         context_size and max_tokens to further tune resource usage.
         """
         effective_max_tokens = max_tokens or self.max_tokens
+        # Rough token budget to keep prompts aligned with context_size.
+        # 1 token ~= 4 chars is a common approximation.
+        max_prompt_chars = max(self.context_size * 4, 512)
 
         memory_context = ""
         if self._memory is not None:
@@ -115,6 +117,19 @@ class SubAgent:
             f"{memory_context}\n\n"
             f"user: {user_input}\nassistant:"
         )
+        if len(full_prompt) > max_prompt_chars:
+            # Keep most recent task input; trim older memory context first.
+            keep_user = f"user: {user_input}\nassistant:"
+            available = max_prompt_chars - len("system: ") - len(self.system_prompt) - len("\n\n") - len(keep_user)
+            if available > 0 and memory_context:
+                memory_context = memory_context[-available:]
+            else:
+                memory_context = ""
+            full_prompt = (
+                f"system: {self.system_prompt}"
+                f"{memory_context}\n\n"
+                f"{keep_user}"
+            )
 
         # slot_id=-1 → llama.cpp picks any available slot from its pool
         response = await self._client.complete(

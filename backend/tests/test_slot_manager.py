@@ -53,7 +53,10 @@ async def test_send_to_watcher(slot_manager, mock_llama_client):
     response = await slot_manager.send_to_watcher("Hello", max_tokens=64)
     assert response == "Mock response from llama"
     mock_llama_client.complete.assert_awaited_once_with(
-        prompt="Hello", slot_id=0, max_tokens=64
+        prompt="Hello",
+        slot_id=0,
+        max_tokens=64,
+        stop=["\nuser:", "\nassistant:", "\nsystem:", "\n# Response"],
     )
 
 
@@ -62,7 +65,10 @@ async def test_send_to_main(slot_manager, mock_llama_client):
     response = await slot_manager.send_to_main("Solve this problem", max_tokens=512)
     assert response == "Mock response from llama"
     mock_llama_client.complete.assert_awaited_once_with(
-        prompt="Solve this problem", slot_id=1, max_tokens=512
+        prompt="Solve this problem",
+        slot_id=1,
+        max_tokens=512,
+        stop=["\nuser:", "\nassistant:", "\nsystem:", "\n# Response"],
     )
 
 
@@ -86,3 +92,28 @@ async def test_history_recorded(slot_manager):
     history = slot_manager.get_history(0)
     assert len(history) == 1
     assert history[0]["role"] == "assistant"
+
+
+@pytest.mark.asyncio
+async def test_send_to_watcher_strips_echoed_transcript(slot_manager, mock_llama_client):
+    mock_llama_client.complete = AsyncMock(
+        return_value=(
+            "assistant: Hey! What's on your mind?\n\n"
+            "user: Tell me a joke\nassistant: fabricated"
+        )
+    )
+
+    response = await slot_manager.send_to_watcher("Hello")
+
+    assert response == "Hey! What's on your mind?"
+
+
+@pytest.mark.asyncio
+async def test_send_to_main_strips_response_heading(slot_manager, mock_llama_client):
+    mock_llama_client.complete = AsyncMock(
+        return_value="# Response\n\nA clean final answer\nuser: ignored"
+    )
+
+    response = await slot_manager.send_to_main("Hello")
+
+    assert response == "A clean final answer"

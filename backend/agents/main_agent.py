@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 from backend.config import AppConfig
 from backend.core.slot_manager import SlotManager
@@ -39,7 +39,7 @@ class MainAgent:
     def __init__(
         self,
         slot_manager: SlotManager,
-        memory: LanceDBMemory,
+        memory: Optional[LanceDBMemory],
         config: AppConfig,
     ) -> None:
         self._slot_manager = slot_manager
@@ -92,10 +92,11 @@ class MainAgent:
         context_from_watcher: str = "",
     ) -> str:
         memory_results: list[dict] = []
-        try:
-            memory_results = await self._memory.search(user_input, limit=5)
-        except Exception as exc:
-            logger.warning("MainAgent memory search failed: %s", exc.__class__.__name__)
+        if self._memory is not None:
+            try:
+                memory_results = await self._memory.search(user_input, limit=5)
+            except Exception as exc:
+                logger.warning("MainAgent memory search failed: %s", exc.__class__.__name__)
 
         memory_context = ""
         if memory_results:
@@ -117,12 +118,13 @@ class MainAgent:
             full_prompt, max_tokens=2048
         )
 
-        try:
-            await self._memory.store(
-                text=f"user: {user_input}\nassistant: {response}",
-                metadata={"agent": "main", "slot": self.slot_id},
-            )
-        except Exception as exc:
-            logger.warning("MainAgent memory store failed: %s", exc.__class__.__name__)
+        if self._memory is not None:
+            try:
+                await self._memory.store(
+                    text=f"user: {user_input}\nassistant: {response}",
+                    metadata={"agent": "main", "slot": self.slot_id},
+                )
+            except Exception as exc:
+                logger.warning("MainAgent memory store failed: %s", exc.__class__.__name__)
 
         return response

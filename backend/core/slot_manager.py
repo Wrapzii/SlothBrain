@@ -1,6 +1,31 @@
 from __future__ import annotations
 
+import re
+
 from backend.core.llama_client import LlamaClient
+
+
+_STOP_SEQUENCES = ["\nuser:", "\nassistant:", "\nsystem:", "\n# Response"]
+_RESPONSE_PREFIX_RE = re.compile(
+    r"(?is)^(?:\s*(?:system|user|assistant):.*?)+\s*(?:#\s*Response\s*)?"
+)
+
+
+def _sanitize_response(response: str) -> str:
+    cleaned = (response or "").strip()
+    if not cleaned:
+        return ""
+
+    cleaned = _RESPONSE_PREFIX_RE.sub("", cleaned).strip()
+    if cleaned.lower().startswith("# response"):
+        cleaned = cleaned[len("# response") :].strip()
+
+    for marker in ("\nuser:", "\nassistant:", "\nsystem:", "\n# Response"):
+        index = cleaned.find(marker)
+        if index != -1:
+            cleaned = cleaned[:index].rstrip()
+
+    return cleaned
 
 
 class SlotManager:
@@ -35,7 +60,9 @@ class SlotManager:
             prompt=prompt,
             slot_id=self._watcher_slot,
             max_tokens=max_tokens,
+            stop=_STOP_SEQUENCES,
         )
+        response = _sanitize_response(response)
         self._histories.setdefault(self._watcher_slot, []).append(
             {"role": "assistant", "content": response}
         )
@@ -48,7 +75,9 @@ class SlotManager:
             prompt=prompt,
             slot_id=self._main_slot,
             max_tokens=max_tokens,
+            stop=_STOP_SEQUENCES,
         )
+        response = _sanitize_response(response)
         self._histories.setdefault(self._main_slot, []).append(
             {"role": "assistant", "content": response}
         )

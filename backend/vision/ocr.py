@@ -13,11 +13,12 @@ import hashlib
 import io
 import logging
 from functools import lru_cache
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
 # Module-level backend flag so we only probe once
-_BACKEND: str | None = None
+_BACKEND: Optional[str] = None
 
 
 def _detect_backend() -> str:

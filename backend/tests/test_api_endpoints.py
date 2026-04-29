@@ -14,6 +14,8 @@ def _restore_settings(snapshot: dict) -> None:
 def test_chat_returns_503_when_backend_unavailable() -> None:
     snapshot = settings.model_dump()
     try:
+        settings.llama_host = "127.0.0.1"
+        settings.llama_port = 65534
         with TestClient(app, raise_server_exceptions=False) as client:
             resp = client.post("/api/chat", json={"message": "hello", "agent": "auto"})
             assert resp.status_code == 503
@@ -52,5 +54,30 @@ def test_emergency_stop_queues_when_approval_required() -> None:
             body = resp.json()
             assert "pending_approval" in body
             assert body["pending_approval"]["action"] == "emergency_stop"
+    finally:
+        _restore_settings(snapshot)
+
+
+def test_set_mode_invalid_returns_400() -> None:
+    snapshot = settings.model_dump()
+    try:
+        with TestClient(app, raise_server_exceptions=False) as client:
+            resp = client.post("/api/mode", json={"mode": "turbo"})
+            assert resp.status_code == 400
+            assert "Invalid mode" in resp.json()["detail"]
+    finally:
+        _restore_settings(snapshot)
+
+
+def test_api_key_required_when_configured() -> None:
+    snapshot = settings.model_dump()
+    try:
+        settings.api_key = "secret"
+        with TestClient(app, raise_server_exceptions=False) as client:
+            denied = client.get("/api/status")
+            assert denied.status_code == 401
+
+            allowed = client.get("/api/status", headers={"x-api-key": "secret"})
+            assert allowed.status_code == 200
     finally:
         _restore_settings(snapshot)

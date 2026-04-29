@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import logging
 from contextlib import asynccontextmanager
@@ -8,8 +9,9 @@ from functools import lru_cache
 from typing import Any
 
 import httpx
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from backend.agents.handoff import HandoffManager
@@ -104,6 +106,8 @@ async def lifespan(app: FastAPI):  # type: ignore[type-arg]
     )
     # Give the MainAgent a reference to the registry so it can spawn sub-agents
     main_agent.set_registry(agent_registry)
+    if settings.enable_server_watchdog:
+        server_manager.start_watchdog()
 
     yield
 
@@ -124,6 +128,30 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def protect_api(request: Request, call_next):
+    path = request.url.path
+    if path != "/health" and path.startswith("/api"):
+        configured_key = settings.api_key.strip()
+        header_key = request.headers.get("x-api-key", "").strip()
+        bearer_key = _parse_bearer_token(request.headers.get("authorization"))
+
+        if configured_key:
+            if header_key != configured_key and bearer_key != configured_key:
+                return JSONResponse(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    content={"detail": "Unauthorized"},
+                )
+        else:
+            client_host = request.client.host if request.client else None
+            if not _is_loopback_host(client_host):
+                return JSONResponse(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    content={"detail": "Remote API access denied without configured api_key"},
+                )
+    return await call_next(request)
 
 
 # ---------------------------------------------------------------------------
@@ -185,7 +213,6 @@ class PresetUpdate(BaseModel):
 
 class AgentChatRequest(BaseModel):
     message: str
-    context_size: int | None = None   # per-call override
     max_tokens: int | None = None     # per-call override
 
 
@@ -204,6 +231,26 @@ def _raise_service_unavailable(exc: Exception, context: str) -> None:
         status_code=503,
         detail=f"{context} unavailable. Ensure llama.cpp server is running and reachable.",
     ) from exc
+
+
+def _parse_bearer_token(authorization_header: str | None) -> str:
+    if not authorization_header:
+        return ""
+    scheme, _, token = authorization_header.partition(" ")
+    if scheme.lower() != "bearer":
+        return ""
+    return token.strip()
+
+
+def _is_loopback_host(host: str | None) -> bool:
+    if not host:
+        return False
+    if host in {"localhost", "127.0.0.1", "::1", "testclient"}:
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -247,7 +294,10 @@ async def get_mode() -> dict:
 
 @app.post("/api/mode")
 async def set_mode(request: ModeRequest) -> dict:
-    await resource_manager.set_mode(request.mode)
+    try:
+        await resource_manager.set_mode(request.mode)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"mode": resource_manager.mode}
 
 
@@ -427,7 +477,6 @@ async def chat_with_agent(agent_id: str, request: AgentChatRequest) -> dict:
     try:
         response = await agent.process(
             request.message,
-            context_size=request.context_size,
             max_tokens=request.max_tokens,
         )
     except (httpx.HTTPError, RuntimeError, ValueError) as exc:
@@ -544,6 +593,19 @@ async def get_audit_log(n: int = 100) -> dict:
 # ---------------------------------------------------------------------------
 @app.websocket("/ws/status")
 async def ws_status(websocket: WebSocket) -> None:
+    configured_key = settings.api_key.strip()
+    header_key = websocket.headers.get("x-api-key", "").strip()
+    bearer_key = _parse_bearer_token(websocket.headers.get("authorization"))
+    client_host = websocket.client.host if websocket.client else None
+
+    if configured_key:
+        if header_key != configured_key and bearer_key != configured_key:
+            await websocket.close(code=1008)
+            return
+    elif not _is_loopback_host(client_host):
+        await websocket.close(code=1008)
+        return
+
     await websocket.accept()
     try:
         while True:
@@ -576,6 +638,22 @@ def _get_desktop_controller():
     """Return a module-level DesktopController, lazily imported."""
     from backend.vision.controller import DesktopController
     return DesktopController()
+
+
+@app.get("/api/vision/status")
+async def vision_status() -> dict:
+    """Report runtime vision capabilities on this machine."""
+    try:
+        dc = _get_desktop_controller()
+        capabilities = dc.capabilities()
+        capabilities["mmproj_configured"] = False
+        capabilities["notes"] = [
+            "Automated vision_run currently requires OCR-readable screen text.",
+            "True multimodal image-to-model support is not wired into this codebase yet.",
+        ]
+        return capabilities
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
 class VisionActionRequest(BaseModel):
@@ -633,6 +711,17 @@ async def vision_run(request: VisionRunRequest) -> dict:
         dc = _get_desktop_controller()
     except Exception as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    capabilities = dc.capabilities()
+    if not capabilities.get("vision_run_supported"):
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Automated vision_run is not supported on this machine yet: "
+                "no OCR backend is available, and true multimodal image-to-model support "
+                "is not wired into this build. Manual screenshot/action endpoints remain available."
+            ),
+        )
 
     loop = asyncio.get_event_loop()
     audit_log.record(action="vision_run_start", actor="api", details=request.task)

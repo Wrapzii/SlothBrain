@@ -41,6 +41,12 @@ class AppConfig(BaseSettings):
     llama_server_path: str = ""
     llama_server_args: list[str] = []
     max_restarts_per_hour: int = 3
+    enable_server_watchdog: bool = True
+
+    # API surface hardening:
+    # - If api_key is set, all API/WS calls must present it.
+    # - If api_key is empty, only loopback clients may access API/WS routes.
+    api_key: str = ""
 
     # Approval gates – set to True to require human approval for that action
     require_approval_server_restart: bool = True

@@ -2,6 +2,8 @@
 
 A persistent local AI assistant that connects to a locally-running **llama.cpp** server, manages dual-agent inference slots, dynamically controls GPU resources, and maintains long-term memory via **LanceDB**.
 
+Primary interaction is terminal-based via `backend/cli.py` (no web UI required).
+
 ---
 
 ## Architecture
@@ -66,14 +68,21 @@ pip install -r requirements.txt
 uvicorn backend.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-### Frontend
+### Terminal Interface (Recommended)
+
+```bash
+# From repo root
+python -m backend.cli
+# or
+python -m backend.cli --agent main
+```
+
+### Optional Web Frontend
 
 ```bash
 cd frontend
 npm install
 npm run dev        # Dev server on http://localhost:5173
-# or
-npm run build      # Production build → dist/
 ```
 
 ---
@@ -108,7 +117,23 @@ SLOTHBRAIN_MODE=active
 
 ## Usage
 
-### Chat
+### Chat (Terminal)
+
+Run:
+
+```bash
+python -m backend.cli
+```
+
+Built-in commands:
+
+- `/agent auto|watcher|main`
+- `/mode idle|active`
+- `/status`
+- `/help`
+- `/quit`
+
+### Chat (Web, optional)
 
 Navigate to the **Chat** tab. Select an agent routing strategy:
 - **auto** – Watcher handles the request; if it detects a complex task it hands off to Main.

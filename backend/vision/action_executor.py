@@ -21,7 +21,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Literal, Optional, Union
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +67,7 @@ class DragAction:
     duration: float = 0.4
 
 
-Action = ClickAction | TypeAction | PressAction | ScrollAction | DragAction
+Action = Union[ClickAction, TypeAction, PressAction, ScrollAction, DragAction]
 
 
 class ActionExecutor:
@@ -132,7 +132,7 @@ class ActionExecutor:
 # Command-string parser
 # ---------------------------------------------------------------------------
 
-def parse_action_string(cmd: str, grid) -> Action | None:
+def parse_action_string(cmd: str, grid) -> Optional[Action]:
     """Parse a model-issued action command string into an Action object.
 
     ``grid`` must be a ``ScreenGrid`` instance (used to resolve cell labels

@@ -18,7 +18,7 @@ from __future__ import annotations
 import logging
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 from backend.vision.action_executor import (
     ActionExecutor,
@@ -26,7 +26,7 @@ from backend.vision.action_executor import (
     parse_action_string,
 )
 from backend.vision.grid import ScreenGrid
-from backend.vision.ocr import ocr_cell_bytes
+from backend.vision.ocr import _detect_backend, ocr_cell_bytes
 from backend.vision.screen_capture import ScreenInfo, capture_screen
 
 if TYPE_CHECKING:
@@ -68,8 +68,32 @@ class DesktopController:
         self._delay = screenshot_delay
         self._ocr = ocr_enabled
         self._executor = ActionExecutor()
-        self._last_screen: ScreenInfo | None = None
-        self._last_grid: ScreenGrid | None = None
+        self._last_screen: Optional[ScreenInfo] = None
+        self._last_grid: Optional[ScreenGrid] = None
+
+    def capabilities(self) -> dict:
+        """Return effective runtime capabilities for desktop control."""
+        import importlib.util
+
+        screenshot_backend = "none"
+        if importlib.util.find_spec("mss") is not None:
+            screenshot_backend = "mss"
+        elif importlib.util.find_spec("pyautogui") is not None:
+            screenshot_backend = "pyautogui"
+
+        input_available = importlib.util.find_spec("pyautogui") is not None
+        ocr_backend = _detect_backend()
+        ocr_available = ocr_backend != "none"
+
+        return {
+            "screenshot_backend": screenshot_backend,
+            "input_available": input_available,
+            "ocr_backend": ocr_backend,
+            "ocr_available": ocr_available,
+            # This implementation is text/OCR driven only; no image-to-model path exists yet.
+            "multimodal_available": False,
+            "vision_run_supported": ocr_available,
+        }
 
     # ------------------------------------------------------------------
     # Screen capture helpers
@@ -190,6 +214,20 @@ class DesktopController:
 
 def _get_active_window_title() -> str:
     """Return the active window title, best-effort across platforms."""
+    try:
+        # Windows
+        import ctypes
+        user32 = ctypes.windll.user32
+        hwnd = user32.GetForegroundWindow()
+        if hwnd:
+            length = user32.GetWindowTextLengthW(hwnd)
+            buffer = ctypes.create_unicode_buffer(length + 1)
+            user32.GetWindowTextW(hwnd, buffer, length + 1)
+            title = buffer.value.strip()
+            if title:
+                return title
+    except Exception:
+        pass
     try:
         # Linux (X11)
         import subprocess

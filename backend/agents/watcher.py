@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from typing import Optional
 
 from backend.config import AppConfig
 from backend.core.slot_manager import SlotManager
@@ -23,7 +24,7 @@ class WatcherAgent:
         self,
         slot_manager: SlotManager,
         rolling_context: RollingContext,
-        memory: LanceDBMemory,
+        memory: Optional[LanceDBMemory],
         config: AppConfig,
     ) -> None:
         self._slot_manager = slot_manager
@@ -41,13 +42,14 @@ class WatcherAgent:
             full_prompt, max_tokens=256
         )
         await self._rolling_context.add_message("assistant", response)
-        try:
-            await self._memory.store(
-                text=f"user: {user_input}\nassistant: {response}",
-                metadata={"agent": "watcher", "slot": self.slot_id},
-            )
-        except Exception as exc:
-            logger.warning("WatcherAgent memory store failed: %s", exc.__class__.__name__)
+        if self._memory is not None:
+            try:
+                await self._memory.store(
+                    text=f"user: {user_input}\nassistant: {response}",
+                    metadata={"agent": "watcher", "slot": self.slot_id},
+                )
+            except Exception as exc:
+                logger.warning("WatcherAgent memory store failed: %s", exc.__class__.__name__)
         return response
 
     async def should_handoff(self, response: str) -> bool:
