@@ -2,10 +2,15 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from backend.config import AppConfig
 from backend.core.slot_manager import SlotManager
 from backend.memory.lancedb_memory import LanceDBMemory
+
+if TYPE_CHECKING:
+    from backend.agents.registry import AgentRegistry
+    from backend.agents.sub_agent import SubAgent
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +47,44 @@ class MainAgent:
         self._config = config
         self.slot_id = config.main_slot
         self.system_prompt = _load_protected_prompt()
+        # Injected after construction so we avoid circular imports
+        self._registry: AgentRegistry | None = None
+
+    def set_registry(self, registry: "AgentRegistry") -> None:
+        """Inject the AgentRegistry so MainAgent can spawn sub-agents."""
+        self._registry = registry
+
+    # ------------------------------------------------------------------
+    # Sub-agent delegation
+    # ------------------------------------------------------------------
+
+    def spawn_sub_agent(
+        self,
+        preset_id: str,
+        task_description: str,
+        context_size: int | None = None,
+        max_tokens: int | None = None,
+    ) -> "SubAgent":
+        """Spawn a sub-agent with task-appropriate resource budgets.
+
+        ``context_size`` and ``max_tokens`` override the preset defaults so
+        the MainAgent can right-size the allocation for the actual workload.
+        If not provided, preset defaults are used.
+
+        Raises RuntimeError if the registry is not set or max_slots exceeded.
+        """
+        if self._registry is None:
+            raise RuntimeError("AgentRegistry not injected into MainAgent")
+        return self._registry.spawn(
+            preset_id=preset_id,
+            context_size_override=context_size,
+            max_tokens_override=max_tokens,
+            task_description=task_description,
+        )
+
+    # ------------------------------------------------------------------
+    # Core processing
+    # ------------------------------------------------------------------
 
     async def process(
         self,

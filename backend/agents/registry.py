@@ -24,7 +24,19 @@ class AgentRegistry:
         self._memory = memory
         self._agents: dict[str, SubAgent] = {}
 
-    def spawn(self, preset_id: str) -> SubAgent:
+    def spawn(
+        self,
+        preset_id: str,
+        context_size_override: int | None = None,
+        max_tokens_override: int | None = None,
+        task_description: str = "",
+    ) -> SubAgent:
+        """Spawn a sub-agent from a preset.
+
+        The MainAgent (or the API) can pass ``context_size_override`` and
+        ``max_tokens_override`` to right-size the agent for the actual task
+        instead of always using the preset's static defaults.
+        """
         preset = self._preset_manager.get_preset(preset_id)
         agent_id = str(uuid.uuid4())
         agent = SubAgent(
@@ -32,6 +44,9 @@ class AgentRegistry:
             preset=preset,
             llama_client=self._llama_client,
             memory=self._memory,
+            context_size_override=context_size_override,
+            max_tokens_override=max_tokens_override,
+            task_description=task_description,
         )
         self._agents[agent_id] = agent
         return agent

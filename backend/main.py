@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 from contextlib import asynccontextmanager
+from functools import lru_cache
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
@@ -100,6 +101,8 @@ async def lifespan(app: FastAPI):  # type: ignore[type-arg]
         llama_client=llama_client,
         memory=memory,
     )
+    # Give the MainAgent a reference to the registry so it can spawn sub-agents
+    main_agent.set_registry(agent_registry)
 
     yield
 
@@ -179,10 +182,14 @@ class PresetUpdate(BaseModel):
 
 class AgentChatRequest(BaseModel):
     message: str
+    context_size: int | None = None   # per-call override
+    max_tokens: int | None = None     # per-call override
 
 
-class ApprovalAction(BaseModel):
-    pass  # no body needed – the action is in the URL
+class SpawnRequest(BaseModel):
+    context_size: int | None = None   # override preset default
+    max_tokens: int | None = None     # override preset default
+    task_description: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -352,14 +359,24 @@ async def delete_preset(preset_id: str) -> None:
 
 
 @app.post("/api/presets/{preset_id}/spawn", status_code=201)
-async def spawn_agent(preset_id: str) -> dict:
+async def spawn_agent(preset_id: str, body: SpawnRequest = SpawnRequest()) -> dict:
     if len(agent_registry.list_agents()) >= settings.max_slots:
         raise HTTPException(
             status_code=400,
             detail=f"Max running agents ({settings.max_slots}) reached.",
         )
+    if body.context_size and body.context_size > settings.max_context_size:
+        raise HTTPException(
+            status_code=400,
+            detail=f"context_size {body.context_size} exceeds hard limit {settings.max_context_size}",
+        )
     try:
-        agent = agent_registry.spawn(preset_id)
+        agent = agent_registry.spawn(
+            preset_id,
+            context_size_override=body.context_size,
+            max_tokens_override=body.max_tokens,
+            task_description=body.task_description,
+        )
         audit_log.record(action="agent_spawned", actor="api", after=agent.info())
         return agent.info()
     except KeyError as exc:
@@ -389,7 +406,11 @@ async def chat_with_agent(agent_id: str, request: AgentChatRequest) -> dict:
         agent = agent_registry.get(agent_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    response = await agent.process(request.message)
+    response = await agent.process(
+        request.message,
+        context_size=request.context_size,
+        max_tokens=request.max_tokens,
+    )
     return {"agent_id": agent_id, "response": response}
 
 
@@ -503,3 +524,126 @@ async def ws_status(websocket: WebSocket) -> None:
         pass
     except Exception:
         pass
+
+
+# ---------------------------------------------------------------------------
+# Vision & Desktop Control
+# ---------------------------------------------------------------------------
+
+@lru_cache(maxsize=1)
+def _get_desktop_controller():
+    """Return a module-level DesktopController, lazily imported."""
+    from backend.vision.controller import DesktopController
+    return DesktopController()
+
+
+class VisionActionRequest(BaseModel):
+    command: str   # e.g. "CLICK B3", "TYPE \"hello\"", "PRESS ctrl+c"
+
+
+class VisionRunRequest(BaseModel):
+    task: str
+    max_steps: int = 20
+
+
+@app.get("/api/vision/screenshot")
+async def vision_screenshot() -> dict:
+    """Take a screenshot and return screen state as text + annotated PNG (base64)."""
+    try:
+        dc = _get_desktop_controller()
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, dc.capture)
+        audit_log.record(action="vision_screenshot", actor="api")
+        return result
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@app.post("/api/vision/action")
+async def vision_action(request: VisionActionRequest) -> dict:
+    """Execute a single desktop action command (e.g. CLICK A3, PRESS enter)."""
+    try:
+        dc = _get_desktop_controller()
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            None, dc.execute_command_then_capture, request.command
+        )
+        audit_log.record(
+            action="vision_action",
+            actor="api",
+            details=request.command,
+        )
+        return result
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@app.post("/api/vision/run")
+async def vision_run(request: VisionRunRequest) -> dict:
+    """Run a multi-step vision-guided task.
+
+    The MainAgent sees the current screen state, issues one action command per
+    step, and we execute it. Continues until the model says DONE or max_steps
+    is reached.
+
+    Returns a list of step results.
+    """
+    try:
+        dc = _get_desktop_controller()
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    loop = asyncio.get_event_loop()
+    audit_log.record(action="vision_run_start", actor="api", details=request.task)
+
+    steps: list[dict] = []
+    # Initial screenshot
+    screen = await loop.run_in_executor(None, dc.capture)
+
+    for step_num in range(request.max_steps):
+        # Build the prompt for the MainAgent
+        prompt = (
+            f"You are performing a desktop task. Task: {request.task}\n\n"
+            f"{screen['state_text']}\n\n"
+            "Issue exactly ONE action command from the allowed syntax, or DONE to finish.\n"
+            "Action:"
+        )
+
+        try:
+            model_response = await main_agent.process(prompt)
+        except Exception as exc:
+            steps.append({"step": step_num + 1, "error": str(exc)})
+            break
+
+        # Extract the first non-empty line as the command
+        command = next(
+            (line.strip() for line in model_response.splitlines() if line.strip()),
+            "DONE",
+        )
+
+        step_result = await loop.run_in_executor(
+            None, dc.execute_command_then_capture, command
+        )
+        step_result["step"] = step_num + 1
+        step_result["model_response"] = model_response
+        steps.append(step_result)
+
+        audit_log.record(
+            action="vision_step",
+            actor="main_agent",
+            details=f"step={step_num + 1} cmd={command!r}",
+        )
+
+        if command.upper() == "DONE":
+            break
+
+        # Update screen for next iteration
+        if "screen" in step_result:
+            screen = step_result["screen"]
+
+    audit_log.record(
+        action="vision_run_end",
+        actor="api",
+        details=f"task={request.task!r} steps={len(steps)}",
+    )
+    return {"task": request.task, "steps": steps, "total_steps": len(steps)}
