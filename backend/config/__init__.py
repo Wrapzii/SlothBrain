@@ -48,6 +48,10 @@ class AppConfig(BaseSettings):
     # - If api_key is empty, only loopback clients may access API/WS routes.
     api_key: str = ""
 
+    # Optional Discord operator channel (owner DM)
+    discord_bot_token: str = ""
+    discord_owner_user_id: int = 0
+
     # Approval gates – set to True to require human approval for that action
     require_approval_server_restart: bool = True
     require_approval_kv_cache_change: bool = True
