@@ -119,6 +119,23 @@ SLOTHBRAIN_DISCORD_OWNER_USER_ID=123456789012345678
 
 ---
 
+
+### Discord owner prompt API
+
+If Discord is configured, you can ask the owner for input and wait for a response:
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/discord/prompt \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"What is your name?","timeout_seconds":120}'
+```
+
+Response:
+
+```json
+{"reply":"Alice"}
+```
+
 ## Usage
 
 ### Chat (Terminal)

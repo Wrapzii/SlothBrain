@@ -256,6 +256,10 @@ class SettingsUpdate(BaseModel):
 class BenchmarkRequest(BaseModel):
     type: str = "all"  # "speed" | "vram" | "slots" | "all"
 
+class DiscordPromptRequest(BaseModel):
+    prompt: str
+    timeout_seconds: float = 120.0
+
 
 class PresetCreate(BaseModel):
     name: str
@@ -678,6 +682,18 @@ async def emergency_stop() -> dict:
     agent_registry.destroy_all()
     await server_manager.stop()
     return {"status": "stopped", "agents_destroyed": True}
+
+
+
+@app.post("/api/discord/prompt")
+async def discord_prompt(body: DiscordPromptRequest) -> dict:
+    if discord_bridge is None:
+        raise HTTPException(status_code=503, detail="Discord bridge is not configured")
+    try:
+        reply = await discord_bridge.prompt_owner_for_text(body.prompt, timeout_seconds=body.timeout_seconds)
+    except TimeoutError as exc:
+        raise HTTPException(status_code=408, detail="Timed out waiting for Discord owner reply") from exc
+    return {"reply": reply}
 
 
 # ---------------------------------------------------------------------------

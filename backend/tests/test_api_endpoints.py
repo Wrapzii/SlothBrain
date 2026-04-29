@@ -81,3 +81,12 @@ def test_api_key_required_when_configured() -> None:
             assert allowed.status_code == 200
     finally:
         _restore_settings(snapshot)
+
+
+def test_discord_prompt_unavailable_when_not_configured() -> None:
+    from backend import main as main_mod
+
+    with TestClient(app) as client:
+        main_mod.discord_bridge = None
+        resp = client.post("/api/discord/prompt", json={"prompt": "What is your name?"})
+        assert resp.status_code == 503
