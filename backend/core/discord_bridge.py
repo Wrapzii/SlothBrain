@@ -8,6 +8,7 @@ from typing import Any
 from backend.core.approval_queue import PendingApproval
 
 logger = logging.getLogger(__name__)
+
 ApprovalHandler = Callable[[str], Awaitable[dict]]
 
 try:
@@ -21,11 +22,14 @@ if discord is None:
         def __init__(self, *_: Any, **__: Any) -> None:
             logger.warning("discord.py not installed; DiscordBridge disabled")
 
-        async def start(self) -> None: ...
-        async def stop(self) -> None: ...
-        async def send_approval(self, approval: PendingApproval) -> None: ...
-        async def prompt_owner_for_text(self, prompt: str, timeout_seconds: float = 120.0) -> str:
-            raise RuntimeError("Discord bridge unavailable")
+        async def start(self) -> None:
+            return
+
+        async def stop(self) -> None:
+            return
+
+        async def send_approval(self, approval: PendingApproval) -> None:
+            return
 else:
     class ApprovalView(discord.ui.View):
         def __init__(self, bridge: "DiscordBridge", approval_id: str):
@@ -34,7 +38,8 @@ else:
             self.approval_id = approval_id
 
         async def _authorized(self, interaction: discord.Interaction) -> bool:
-            if interaction.user.id != self.bridge.owner_user_id:
+            owner_id = self.bridge.owner_user_id
+            if owner_id and interaction.user.id != owner_id:
                 await interaction.response.send_message("Only the configured owner can use this control.", ephemeral=True)
                 return False
             return True
@@ -60,11 +65,8 @@ else:
             self.owner_user_id = owner_user_id
             self.approve_handler = approve_handler
             self.reject_handler = reject_handler
-            self._pending_owner_reply: asyncio.Future[str] | None = None
-
             intents = discord.Intents.none()
             intents.dm_messages = True
-            intents.message_content = True
             self.client = discord.Client(intents=intents)
             self.tree = discord.app_commands.CommandTree(self.client)
             self._task: asyncio.Task | None = None
@@ -74,16 +76,12 @@ else:
                 logger.info("Discord bridge connected as %s", self.client.user)
                 await self.tree.sync()
 
-            @self.client.event
-            async def on_message(message: discord.Message) -> None:
-                if message.author.bot:
+            @self.tree.command(name="status", description="Get SlothBrain status")
+            async def status_command(interaction: discord.Interaction) -> None:
+                if interaction.user.id != self.owner_user_id:
+                    await interaction.response.send_message("Unauthorized.", ephemeral=True)
                     return
-                if message.author.id != self.owner_user_id:
-                    return
-                if not isinstance(message.channel, discord.DMChannel):
-                    return
-                if self._pending_owner_reply and not self._pending_owner_reply.done():
-                    self._pending_owner_reply.set_result(message.content.strip())
+                await interaction.response.send_message("SlothBrain is online. Approvals will appear in DM.", ephemeral=True)
 
         async def start(self) -> None:
             if self._task:
@@ -103,15 +101,7 @@ else:
         async def send_approval(self, approval: PendingApproval) -> None:
             user = self.client.get_user(self.owner_user_id) or await self.client.fetch_user(self.owner_user_id)
             view = ApprovalView(self, approval.id)
-            await user.send(f"⚠️ Approval required\n**Action:** `{approval.action}`\n**Description:** {approval.description}\n**ID:** `{approval.id}`", view=view)
-
-        async def prompt_owner_for_text(self, prompt: str, timeout_seconds: float = 120.0) -> str:
-            user = self.client.get_user(self.owner_user_id) or await self.client.fetch_user(self.owner_user_id)
-            self._pending_owner_reply = asyncio.get_running_loop().create_future()
-            await user.send(f"{prompt}\n\nPlease reply in this DM thread.")
-            try:
-                reply = await asyncio.wait_for(self._pending_owner_reply, timeout=timeout_seconds)
-            finally:
-                self._pending_owner_reply = None
-            await user.send(f"Got it — you said: **{reply}**")
-            return reply
+            await user.send(
+                f"⚠️ Approval required\n**Action:** `{approval.action}`\n**Description:** {approval.description}\n**ID:** `{approval.id}`",
+                view=view,
+            )
