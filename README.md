@@ -105,12 +105,16 @@ All settings can be changed via the **Settings** tab in the UI or by setting env
 | `embedding_model` | `all-MiniLM-L6-v2` | Sentence-Transformers model for memory |
 | `vram_threshold_mb` | `2048` | RAM threshold (MB) that triggers idle mode |
 | `mode` | `idle` | Initial operating mode |
+| `discord_bot_token` | `` | Optional Discord bot token for HITL notifications and actions |
+| `discord_owner_user_id` | `0` | Discord user ID allowed to approve/reject actions (owner-only) |
 
 Example `.env`:
 ```
 SLOTHBRAIN_LLAMA_PORT=8080
 SLOTHBRAIN_VRAM_THRESHOLD_MB=4096
 SLOTHBRAIN_MODE=active
+SLOTHBRAIN_DISCORD_BOT_TOKEN=your_bot_token
+SLOTHBRAIN_DISCORD_OWNER_USER_ID=123456789012345678
 ```
 
 ---

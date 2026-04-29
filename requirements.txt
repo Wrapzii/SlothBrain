@@ -18,3 +18,4 @@ Pillow>=10.3.0
 mss>=9.0.1
 pyautogui>=0.9.54
 pytesseract>=0.3.10
+discord.py>=2.5.0

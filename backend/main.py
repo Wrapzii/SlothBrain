@@ -24,6 +24,7 @@ from backend.config import settings
 from backend.core.approval_queue import ApprovalQueue
 from backend.core.audit_log import AuditLog
 from backend.core.checkpoint_manager import CheckpointManager
+from backend.core.discord_bridge import DiscordBridge
 from backend.core.llama_client import LlamaClient
 from backend.core.resource_manager import ResourceManager
 from backend.core.safety_supervisor import SafetySupervisor
@@ -54,6 +55,7 @@ audit_log: AuditLog
 approval_queue: ApprovalQueue
 checkpoint_manager: CheckpointManager
 safety_supervisor: SafetySupervisor
+discord_bridge: DiscordBridge | None = None
 
 
 @asynccontextmanager
@@ -61,7 +63,7 @@ async def lifespan(app: FastAPI):  # type: ignore[type-arg]
     global llama_client, slot_manager, resource_manager, rolling_context
     global memory, watcher_agent, main_agent, handoff_manager, benchmark_suite
     global preset_manager, agent_registry, server_manager, audit_log, approval_queue
-    global checkpoint_manager, safety_supervisor
+    global checkpoint_manager, safety_supervisor, discord_bridge
 
     audit_log = AuditLog()
     approval_queue = ApprovalQueue(max_entries=settings.max_pending_approvals)
@@ -125,13 +127,58 @@ async def lifespan(app: FastAPI):  # type: ignore[type-arg]
     if settings.enable_server_watchdog:
         server_manager.start_watchdog()
 
+    if settings.discord_bot_token and settings.discord_owner_user_id:
+        discord_bridge = DiscordBridge(
+            token=settings.discord_bot_token,
+            owner_user_id=settings.discord_owner_user_id,
+            approve_handler=_approve_internal,
+            reject_handler=_reject_internal,
+        )
+        await discord_bridge.start()
+
     yield
 
     # Shutdown – stop all background tasks
     safety_supervisor.stop()
     server_manager.stop_watchdog()
+    if discord_bridge is not None:
+        await discord_bridge.stop()
     agent_registry.destroy_all()
 
+
+
+
+async def _approve_internal(approval_id: str) -> dict[str, Any]:
+    approval = approval_queue.approve(approval_id)
+    audit_log.record(action="approval_granted", actor="human", details=approval_id)
+
+    result: dict[str, Any] = {"approved": True, "action": approval.action}
+    if approval.action == "server_restart":
+        try:
+            await server_manager.restart(actor="human")
+            result["server_status"] = server_manager.status
+        except RuntimeError as exc:
+            result["error"] = str(exc)
+        except (ValueError, OSError, FileNotFoundError) as exc:
+            result["error"] = str(exc)
+    elif approval.action in ("kv_cache_change", "large_context_increase"):
+        payload = approval.payload or {}
+        for key, value in payload.items():
+            if hasattr(settings, key):
+                setattr(settings, key, value)
+        result["settings"] = settings.model_dump()
+    elif approval.action == "emergency_stop":
+        agent_registry.destroy_all()
+        await server_manager.stop()
+        result["status"] = "stopped"
+        result["agents_destroyed"] = True
+    return result
+
+
+async def _reject_internal(approval_id: str) -> dict[str, Any]:
+    approval = approval_queue.reject(approval_id)
+    audit_log.record(action="approval_rejected", actor="human", details=approval_id)
+    return {"rejected": True, "action": approval.action}
 
 # ---------------------------------------------------------------------------
 # App
@@ -394,6 +441,8 @@ async def update_settings(update: SettingsUpdate) -> dict:
             payload={k: v for k, v in data.items() if k in kv_fields},
         )
         audit_log.record(action="kv_cache_change_queued", actor="api", details=approval.id)
+        if discord_bridge is not None:
+            await discord_bridge.send_approval(approval)
         return {"pending_approval": approval.to_dict()}
 
     # Guard large context increases
@@ -406,6 +455,8 @@ async def update_settings(update: SettingsUpdate) -> dict:
                 payload={"main_context_size": new_main_ctx},
             )
             audit_log.record(action="large_context_increase_queued", actor="api", details=approval.id)
+            if discord_bridge is not None:
+                await discord_bridge.send_approval(approval)
             return {"pending_approval": approval.to_dict()}
 
     before = settings.model_dump()
@@ -573,6 +624,8 @@ async def restart_server() -> dict:
             description="llama-server restart requested via API",
         )
         audit_log.record(action="server_restart_queued", actor="api", details=approval.id)
+        if discord_bridge is not None:
+            await discord_bridge.send_approval(approval)
         return {"pending_approval": approval.to_dict()}
     try:
         await server_manager.restart(actor="api")
@@ -594,45 +647,17 @@ async def list_approvals() -> dict:
 @app.post("/api/approvals/{approval_id}/approve")
 async def approve_action(approval_id: str) -> dict:
     try:
-        approval = approval_queue.approve(approval_id)
+        return await _approve_internal(approval_id)
     except (KeyError, ValueError) as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-    audit_log.record(action="approval_granted", actor="human", details=approval_id)
-
-    # Execute the approved action
-    result: dict[str, Any] = {"approved": True, "action": approval.action}
-    if approval.action == "server_restart":
-        try:
-            await server_manager.restart(actor="human")
-            result["server_status"] = server_manager.status
-        except RuntimeError as exc:
-            result["error"] = str(exc)
-        except (ValueError, OSError, FileNotFoundError) as exc:
-            result["error"] = str(exc)
-    elif approval.action in ("kv_cache_change", "large_context_increase"):
-        payload = approval.payload or {}
-        for key, value in payload.items():
-            if hasattr(settings, key):
-                setattr(settings, key, value)
-        result["settings"] = settings.model_dump()
-    elif approval.action == "emergency_stop":
-        agent_registry.destroy_all()
-        await server_manager.stop()
-        result["status"] = "stopped"
-        result["agents_destroyed"] = True
-
-    return result
 
 
 @app.post("/api/approvals/{approval_id}/reject")
 async def reject_action(approval_id: str) -> dict:
     try:
-        approval = approval_queue.reject(approval_id)
+        return await _reject_internal(approval_id)
     except (KeyError, ValueError) as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    audit_log.record(action="approval_rejected", actor="human", details=approval_id)
-    return {"rejected": True, "action": approval.action}
 
 
 # ---------------------------------------------------------------------------
@@ -646,6 +671,8 @@ async def emergency_stop() -> dict:
             description="Emergency stop requested via API",
         )
         audit_log.record(action="emergency_stop_queued", actor="api", details=approval.id)
+        if discord_bridge is not None:
+            await discord_bridge.send_approval(approval)
         return {"pending_approval": approval.to_dict()}
     audit_log.record(action="emergency_stop", actor="human")
     agent_registry.destroy_all()
