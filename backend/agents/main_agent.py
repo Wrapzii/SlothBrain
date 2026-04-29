@@ -175,6 +175,10 @@ class MainAgent:
         plan_prompt = (
             "system: You are a planning AI. Break the following task into clear, "
             "actionable steps that an AI agent can execute one at a time.\n"
+            "The plan must be genuinely agentic and end-to-end, not a single-pass answer.\n"
+            "Include concrete execution + validation flow: discovery, implementation, testing, "
+            "verification, and final reporting.\n"
+            "Prefer 5-10 steps when appropriate.\n"
             "Format your response as:\n"
             "APPROACH: <brief description of the overall strategy>\n"
             "STEPS:\n"
@@ -221,7 +225,9 @@ class MainAgent:
             f"Overall task: {task}\n"
             f"Current step: {step}"
             f"{context_section}\n\n"
-            "Execute this step thoroughly and report what you did and what you found.\n"
+            "Execute this step thoroughly. Perform real follow-through work, then report:\n"
+            "1) actions taken, 2) outputs/evidence, 3) what changed, 4) remaining risk.\n"
+            "If the step requires tools/checks, run them now rather than deferring.\n"
             "assistant:"
         )
 

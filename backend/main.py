@@ -320,6 +320,15 @@ async def chat(request: ChatRequest) -> dict:
         _raise_service_unavailable(exc, "Chat service")
 
 
+
+
+async def _capture_agentic_screenshot() -> dict:
+    """Capture a desktop screenshot for agentic-loop progress snapshots."""
+    dc = _get_desktop_controller()
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, dc.capture)
+
+
 @app.post("/api/chat/agentic")
 async def agentic_chat(request: AgenticRequest) -> dict:
     """Run a multi-step agentic task loop and return the full result.
@@ -337,6 +346,7 @@ async def agentic_chat(request: AgenticRequest) -> dict:
         max_steps=_clamp_steps(request.max_steps),
         checkpoint_manager=checkpoint_manager,
         supervisor=safety_supervisor,
+        screenshot_fn=_capture_agentic_screenshot,
     )
     try:
         result = await loop.run(task=request.task)
@@ -747,6 +757,7 @@ async def ws_agent_progress(websocket: WebSocket) -> None:
             max_steps=max_steps,
             checkpoint_manager=checkpoint_manager,
             supervisor=safety_supervisor,
+            screenshot_fn=_capture_agentic_screenshot,
         )
 
         audit_log.record(
