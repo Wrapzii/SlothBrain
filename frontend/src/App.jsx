@@ -1,8 +1,11 @@
-import { useState } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import Dashboard from './components/Dashboard.jsx'
 import ChatInterface from './components/ChatInterface.jsx'
 import Settings from './components/Settings.jsx'
 import BenchmarkSuite from './components/BenchmarkSuite.jsx'
+import AgentsTab from './components/AgentsTab.jsx'
+import ApprovalQueue from './components/ApprovalQueue.jsx'
+import { emergencyStop, createStatusSocket } from './api/client.js'
 
 const COLORS = {
   bg: '#1a1a2e',
@@ -10,18 +13,47 @@ const COLORS = {
   accent: '#0f3460',
   text: '#e0e0e0',
   green: '#00ff88',
+  red: '#ff4d4d',
   border: '#1e3a5f',
 }
 
 const TABS = [
   { id: 'dashboard', label: '📊 Dashboard' },
   { id: 'chat', label: '💬 Chat' },
+  { id: 'agents', label: '🤖 Agents' },
   { id: 'settings', label: '⚙️ Settings' },
   { id: 'benchmarks', label: '🧪 Benchmarks' },
 ]
 
 export default function App() {
   const [activeTab, setActiveTab] = useState('dashboard')
+  const [pendingApprovals, setPendingApprovals] = useState(0)
+  const [stopping, setStopping] = useState(false)
+  const wsRef = useRef(null)
+
+  const handleMessage = useCallback((data) => {
+    if (typeof data.pending_approvals === 'number') {
+      setPendingApprovals(data.pending_approvals)
+    }
+  }, [])
+
+  useEffect(() => {
+    wsRef.current = createStatusSocket(handleMessage, () => {})
+    return () => wsRef.current?.close()
+  }, [handleMessage])
+
+  const handleEmergencyStop = async () => {
+    if (!confirm('⚠️ EMERGENCY STOP: Kill llama-server and destroy all agents?')) return
+    setStopping(true)
+    try {
+      await emergencyStop()
+      alert('Emergency stop executed. All agents destroyed and server stopped.')
+    } catch (err) {
+      alert(`Emergency stop failed: ${err.message}`)
+    } finally {
+      setStopping(false)
+    }
+  }
 
   return (
     <div style={{
@@ -39,7 +71,7 @@ export default function App() {
         alignItems: 'center',
         gap: 16,
       }}>
-        <div>
+        <div style={{ flex: 1 }}>
           <div style={{ fontSize: 22, fontWeight: 800, letterSpacing: 1 }}>
             🧠 <span style={{ color: COLORS.green }}>Sloth</span>Brain
           </div>
@@ -47,6 +79,29 @@ export default function App() {
             Local AI Assistant · llama.cpp · LanceDB Memory
           </div>
         </div>
+
+        {/* Approval queue badge */}
+        <ApprovalQueue pendingCount={pendingApprovals} />
+
+        {/* Emergency stop */}
+        <button
+          onClick={handleEmergencyStop}
+          disabled={stopping}
+          style={{
+            background: COLORS.red,
+            color: '#fff',
+            border: 'none',
+            borderRadius: 6,
+            padding: '8px 18px',
+            fontSize: 13,
+            fontWeight: 700,
+            cursor: stopping ? 'not-allowed' : 'pointer',
+            opacity: stopping ? 0.7 : 1,
+            letterSpacing: 0.5,
+          }}
+        >
+          🛑 {stopping ? 'Stopping…' : 'Emergency Stop'}
+        </button>
       </header>
 
       {/* Nav tabs */}
@@ -74,6 +129,21 @@ export default function App() {
             }}
           >
             {tab.label}
+            {tab.id === 'agents' && pendingApprovals > 0 && (
+              <span style={{
+                background: COLORS.red,
+                color: '#fff',
+                borderRadius: '50%',
+                width: 16,
+                height: 16,
+                display: 'inline-flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                fontSize: 10,
+                fontWeight: 700,
+                marginLeft: 6,
+              }}>{pendingApprovals}</span>
+            )}
           </button>
         ))}
       </nav>
@@ -82,6 +152,7 @@ export default function App() {
       <main style={{ padding: '28px 32px', maxWidth: 1100, margin: '0 auto' }}>
         {activeTab === 'dashboard' && <Dashboard />}
         {activeTab === 'chat' && <ChatInterface />}
+        {activeTab === 'agents' && <AgentsTab />}
         {activeTab === 'settings' && <Settings />}
         {activeTab === 'benchmarks' && <BenchmarkSuite />}
       </main>

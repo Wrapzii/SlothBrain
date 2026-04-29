@@ -4,18 +4,24 @@ import asyncio
 import json
 import logging
 from contextlib import asynccontextmanager
+from typing import Any
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from backend.agents.handoff import HandoffManager
 from backend.agents.main_agent import MainAgent
+from backend.agents.preset_manager import PresetManager
+from backend.agents.registry import AgentRegistry
 from backend.agents.watcher import WatcherAgent
 from backend.benchmarks.benchmark import BenchmarkSuite
 from backend.config import settings
+from backend.core.approval_queue import ApprovalQueue
+from backend.core.audit_log import AuditLog
 from backend.core.llama_client import LlamaClient
 from backend.core.resource_manager import ResourceManager
+from backend.core.server_manager import ServerManager
 from backend.core.slot_manager import SlotManager
 from backend.memory.lancedb_memory import LanceDBMemory
 from backend.memory.rolling_context import RollingContext
@@ -35,12 +41,22 @@ watcher_agent: WatcherAgent
 main_agent: MainAgent
 handoff_manager: HandoffManager
 benchmark_suite: BenchmarkSuite
+preset_manager: PresetManager
+agent_registry: AgentRegistry
+server_manager: ServerManager
+audit_log: AuditLog
+approval_queue: ApprovalQueue
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):  # type: ignore[type-arg]
     global llama_client, slot_manager, resource_manager, rolling_context
     global memory, watcher_agent, main_agent, handoff_manager, benchmark_suite
+    global preset_manager, agent_registry, server_manager, audit_log, approval_queue
+
+    audit_log = AuditLog()
+    approval_queue = ApprovalQueue()
+    server_manager = ServerManager(config=settings, audit_log=audit_log)
 
     llama_client = LlamaClient(host=settings.llama_host, port=settings.llama_port)
     slot_manager = SlotManager(llama_client=llama_client)
@@ -78,7 +94,18 @@ async def lifespan(app: FastAPI):  # type: ignore[type-arg]
     handoff_manager = HandoffManager(watcher=watcher_agent, main_agent=main_agent)
     benchmark_suite = BenchmarkSuite(llama_client=llama_client, config=settings)
 
+    preset_manager = PresetManager()
+    agent_registry = AgentRegistry(
+        preset_manager=preset_manager,
+        llama_client=llama_client,
+        memory=memory,
+    )
+
     yield
+
+    # Shutdown – stop all watchdog tasks
+    server_manager.stop_watchdog()
+    agent_registry.destroy_all()
 
 
 # ---------------------------------------------------------------------------
@@ -118,14 +145,60 @@ class SettingsUpdate(BaseModel):
     active_kv_quant: str | None = None
     vram_threshold_mb: int | None = None
     embedding_model: str | None = None
+    llama_server_path: str | None = None
+    llama_server_args: list[str] | None = None
+    max_context_size: int | None = None
+    max_slots: int | None = None
+    max_restarts_per_hour: int | None = None
+    require_approval_server_restart: bool | None = None
+    require_approval_kv_cache_change: bool | None = None
+    require_approval_large_context_increase: bool | None = None
 
 
 class BenchmarkRequest(BaseModel):
     type: str = "all"  # "speed" | "vram" | "slots" | "all"
 
 
+class PresetCreate(BaseModel):
+    name: str
+    description: str = ""
+    system_prompt: str
+    context_size: int = 8192
+    temperature: float = 0.7
+    max_tokens: int = 1024
+
+
+class PresetUpdate(BaseModel):
+    name: str | None = None
+    description: str | None = None
+    system_prompt: str | None = None
+    context_size: int | None = None
+    temperature: float | None = None
+    max_tokens: int | None = None
+
+
+class AgentChatRequest(BaseModel):
+    message: str
+
+
+class ApprovalAction(BaseModel):
+    pass  # no body needed – the action is in the URL
+
+
 # ---------------------------------------------------------------------------
-# Endpoints
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _guard_context_size(new_size: int, current_size: int) -> None:
+    if new_size > settings.max_context_size:
+        raise HTTPException(
+            status_code=400,
+            detail=f"context_size {new_size} exceeds hard limit {settings.max_context_size}",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Existing endpoints
 # ---------------------------------------------------------------------------
 @app.get("/health")
 async def health_check() -> dict:
@@ -148,7 +221,6 @@ async def chat(request: ChatRequest) -> dict:
     if agent_choice == "main":
         response = await main_agent.process(request.message)
         return {"agent": "main", "response": response, "handoff": False}
-    # auto – route through HandoffManager
     return await handoff_manager.route(request.message)
 
 
@@ -171,9 +243,35 @@ async def get_settings() -> dict:
 @app.post("/api/settings")
 async def update_settings(update: SettingsUpdate) -> dict:
     data = update.model_dump(exclude_none=True)
+
+    # Guard KV cache changes
+    kv_fields = {"idle_kv_quant", "active_kv_quant"}
+    if kv_fields & set(data.keys()) and settings.require_approval_kv_cache_change:
+        approval = approval_queue.submit(
+            action="kv_cache_change",
+            description="KV cache quantisation change requested",
+            payload={k: v for k, v in data.items() if k in kv_fields},
+        )
+        audit_log.record(action="kv_cache_change_queued", actor="api", details=approval.id)
+        return {"pending_approval": approval.to_dict()}
+
+    # Guard large context increases
+    new_main_ctx = data.get("main_context_size")
+    if new_main_ctx and settings.require_approval_large_context_increase:
+        if new_main_ctx > settings.main_context_size * 2:
+            approval = approval_queue.submit(
+                action="large_context_increase",
+                description=f"main_context_size increase from {settings.main_context_size} to {new_main_ctx}",
+                payload={"main_context_size": new_main_ctx},
+            )
+            audit_log.record(action="large_context_increase_queued", actor="api", details=approval.id)
+            return {"pending_approval": approval.to_dict()}
+
+    before = settings.model_dump()
     for key, value in data.items():
         if hasattr(settings, key):
             setattr(settings, key, value)
+    audit_log.record(action="settings_update", actor="api", before=before, after=settings.model_dump())
     return settings.model_dump()
 
 
@@ -206,6 +304,191 @@ async def memory_search(q: str, limit: int = 5) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Agent Presets
+# ---------------------------------------------------------------------------
+@app.get("/api/presets")
+async def list_presets() -> dict:
+    return {"presets": preset_manager.list_presets()}
+
+
+@app.post("/api/presets", status_code=201)
+async def create_preset(body: PresetCreate) -> dict:
+    if body.context_size > settings.max_context_size:
+        raise HTTPException(
+            status_code=400,
+            detail=f"context_size {body.context_size} exceeds hard limit {settings.max_context_size}",
+        )
+    preset = preset_manager.create_preset(body.model_dump())
+    audit_log.record(action="preset_created", actor="api", after=preset)
+    return preset
+
+
+@app.get("/api/presets/{preset_id}")
+async def get_preset(preset_id: str) -> dict:
+    try:
+        return preset_manager.get_preset(preset_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.put("/api/presets/{preset_id}")
+async def update_preset(preset_id: str, body: PresetUpdate) -> dict:
+    data = body.model_dump(exclude_none=True)
+    if "context_size" in data and data["context_size"] > settings.max_context_size:
+        raise HTTPException(
+            status_code=400,
+            detail=f"context_size {data['context_size']} exceeds hard limit {settings.max_context_size}",
+        )
+    try:
+        before = preset_manager.get_preset(preset_id)
+        updated = preset_manager.update_preset(preset_id, data)
+        audit_log.record(action="preset_updated", actor="api", before=before, after=updated)
+        return updated
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.delete("/api/presets/{preset_id}", status_code=204)
+async def delete_preset(preset_id: str) -> None:
+    try:
+        before = preset_manager.get_preset(preset_id)
+        preset_manager.delete_preset(preset_id)
+        audit_log.record(action="preset_deleted", actor="api", before=before)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/api/presets/{preset_id}/spawn", status_code=201)
+async def spawn_agent(preset_id: str) -> dict:
+    if len(agent_registry.list_agents()) >= settings.max_slots:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Max running agents ({settings.max_slots}) reached.",
+        )
+    try:
+        agent = agent_registry.spawn(preset_id)
+        audit_log.record(action="agent_spawned", actor="api", after=agent.info())
+        return agent.info()
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+# ---------------------------------------------------------------------------
+# Running Agents
+# ---------------------------------------------------------------------------
+@app.get("/api/agents")
+async def list_agents() -> dict:
+    return {"agents": agent_registry.list_agents()}
+
+
+@app.delete("/api/agents/{agent_id}", status_code=204)
+async def destroy_agent(agent_id: str) -> None:
+    try:
+        audit_log.record(action="agent_destroyed", actor="api", details=agent_id)
+        agent_registry.destroy(agent_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/api/agents/{agent_id}/chat")
+async def chat_with_agent(agent_id: str, request: AgentChatRequest) -> dict:
+    try:
+        agent = agent_registry.get(agent_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    response = await agent.process(request.message)
+    return {"agent_id": agent_id, "response": response}
+
+
+# ---------------------------------------------------------------------------
+# Server Management
+# ---------------------------------------------------------------------------
+@app.get("/api/server/status")
+async def get_server_status() -> dict:
+    return {"status": server_manager.status}
+
+
+@app.post("/api/server/restart")
+async def restart_server() -> dict:
+    if settings.require_approval_server_restart:
+        approval = approval_queue.submit(
+            action="server_restart",
+            description="llama-server restart requested via API",
+        )
+        audit_log.record(action="server_restart_queued", actor="api", details=approval.id)
+        return {"pending_approval": approval.to_dict()}
+    try:
+        await server_manager.restart(actor="api")
+    except RuntimeError as exc:
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
+    return {"status": server_manager.status}
+
+
+# ---------------------------------------------------------------------------
+# Approval Queue
+# ---------------------------------------------------------------------------
+@app.get("/api/approvals")
+async def list_approvals() -> dict:
+    return {"approvals": approval_queue.list_pending()}
+
+
+@app.post("/api/approvals/{approval_id}/approve")
+async def approve_action(approval_id: str) -> dict:
+    try:
+        approval = approval_queue.approve(approval_id)
+    except (KeyError, ValueError) as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    audit_log.record(action="approval_granted", actor="human", details=approval_id)
+
+    # Execute the approved action
+    result: dict[str, Any] = {"approved": True, "action": approval.action}
+    if approval.action == "server_restart":
+        try:
+            await server_manager.restart(actor="human")
+            result["server_status"] = server_manager.status
+        except RuntimeError as exc:
+            result["error"] = str(exc)
+    elif approval.action in ("kv_cache_change", "large_context_increase"):
+        payload = approval.payload or {}
+        for key, value in payload.items():
+            if hasattr(settings, key):
+                setattr(settings, key, value)
+        result["settings"] = settings.model_dump()
+
+    return result
+
+
+@app.post("/api/approvals/{approval_id}/reject")
+async def reject_action(approval_id: str) -> dict:
+    try:
+        approval = approval_queue.reject(approval_id)
+    except (KeyError, ValueError) as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    audit_log.record(action="approval_rejected", actor="human", details=approval_id)
+    return {"rejected": True, "action": approval.action}
+
+
+# ---------------------------------------------------------------------------
+# Emergency Stop
+# ---------------------------------------------------------------------------
+@app.post("/api/emergency-stop")
+async def emergency_stop() -> dict:
+    audit_log.record(action="emergency_stop", actor="human")
+    agent_registry.destroy_all()
+    await server_manager.stop()
+    return {"status": "stopped", "agents_destroyed": True}
+
+
+# ---------------------------------------------------------------------------
+# Audit Log
+# ---------------------------------------------------------------------------
+@app.get("/api/audit-log")
+async def get_audit_log(n: int = 100) -> dict:
+    return {"entries": audit_log.tail(n)}
+
+
+# ---------------------------------------------------------------------------
 # WebSocket – live status stream
 # ---------------------------------------------------------------------------
 @app.websocket("/ws/status")
@@ -215,7 +498,12 @@ async def ws_status(websocket: WebSocket) -> None:
         while True:
             stats = await resource_manager.get_system_stats()
             slot_info = await slot_manager.get_slot_info()
-            payload = {**stats, "slots": slot_info}
+            payload = {
+                **stats,
+                "slots": slot_info,
+                "server_status": server_manager.status,
+                "pending_approvals": len(approval_queue.list_pending()),
+            }
             await websocket.send_text(json.dumps(payload))
             await asyncio.sleep(2)
     except WebSocketDisconnect:

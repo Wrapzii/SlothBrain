@@ -1,13 +1,33 @@
 from __future__ import annotations
 
+import logging
+from pathlib import Path
+
 from backend.config import AppConfig
 from backend.core.slot_manager import SlotManager
 from backend.memory.lancedb_memory import LanceDBMemory
 
-SYSTEM_PROMPT = (
+logger = logging.getLogger(__name__)
+
+_PROTECTED_PROMPT_PATH = (
+    Path(__file__).parent.parent / "config" / "protected" / "main_system_prompt.txt"
+)
+
+_FALLBACK_SYSTEM_PROMPT = (
     "You are a high-performance AI assistant specializing in complex tasks and coding. "
     "Use the provided context and memory to give comprehensive answers."
 )
+
+
+def _load_protected_prompt() -> str:
+    """Load the main agent's system prompt from the protected file (read-only)."""
+    try:
+        return _PROTECTED_PROMPT_PATH.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        logger.warning(
+            "Could not read protected system prompt (%s); using fallback.", exc
+        )
+        return _FALLBACK_SYSTEM_PROMPT
 
 
 class MainAgent:
@@ -21,7 +41,7 @@ class MainAgent:
         self._memory = memory
         self._config = config
         self.slot_id = config.main_slot
-        self.system_prompt = SYSTEM_PROMPT
+        self.system_prompt = _load_protected_prompt()
 
     async def process(
         self,

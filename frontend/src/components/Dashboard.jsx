@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { createStatusSocket, setMode } from '../api/client.js'
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts'
+import AuditLogViewer from './AuditLogViewer.jsx'
 
 const COLORS = {
   bg: '#1a1a2e',
@@ -211,6 +212,9 @@ export default function Dashboard() {
           </tbody>
         </table>
       </Card>
+
+      {/* Audit Log */}
+      <AuditLogViewer />
     </div>
   )
 }
