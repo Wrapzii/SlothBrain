@@ -37,6 +37,9 @@ logger = logging.getLogger(__name__)
 # Cells with very short text (e.g. a single blank) are omitted from
 # the description to keep the prompt compact.
 _MIN_CELL_TEXT_LEN = 2
+# Brief pause between a click and the subsequent type action.
+# Needed so the OS has time to focus the clicked element before keystrokes arrive.
+_CLICK_TO_TYPE_DELAY = 0.08  # seconds
 
 
 class DesktopController:
@@ -159,7 +162,7 @@ class DesktopController:
         try:
             if isinstance(action, _ClickAndType):
                 self._executor.execute(action.click)
-                time.sleep(0.08)
+                time.sleep(_CLICK_TO_TYPE_DELAY)
                 self._executor.execute(action.type_)
             elif action is not None:
                 self._executor.execute(action)

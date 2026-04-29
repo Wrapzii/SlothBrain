@@ -612,7 +612,8 @@ async def vision_run(request: VisionRunRequest) -> dict:
         try:
             model_response = await main_agent.process(prompt)
         except Exception as exc:
-            steps.append({"step": step_num + 1, "error": str(exc)})
+            logger.error("MainAgent failed during vision run: %s", exc.__class__.__name__)
+            steps.append({"step": step_num + 1, "error": "Model error; stopping."})
             break
 
         # Extract the first non-empty line as the command
@@ -637,9 +638,14 @@ async def vision_run(request: VisionRunRequest) -> dict:
         if command.upper() == "DONE":
             break
 
-        # Update screen for next iteration
+        # Update screen for next iteration; re-capture if step had no screenshot
         if "screen" in step_result:
             screen = step_result["screen"]
+        else:
+            try:
+                screen = await loop.run_in_executor(None, dc.capture)
+            except Exception:
+                pass  # keep stale screen rather than crashing
 
     audit_log.record(
         action="vision_run_end",

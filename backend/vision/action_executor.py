@@ -27,8 +27,8 @@ logger = logging.getLogger(__name__)
 
 # Maximum type-string length to guard against prompt injection
 _MAX_TYPE_LEN = 2000
-# Allowed key names (non-exhaustive – pyautogui validates internally)
-_KEY_RE = re.compile(r"^[a-z0-9\+\-_ ]+$", re.IGNORECASE)
+# Allowed key names: alphanumeric, +, -, _ only (no spaces – pyautogui uses hotkey(*keys))
+_KEY_RE = re.compile(r"^[a-z0-9\+\-_]+$", re.IGNORECASE)
 
 
 @dataclass

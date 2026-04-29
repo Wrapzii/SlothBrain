@@ -87,11 +87,20 @@ class ScreenGrid:
         overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
         draw = ImageDraw.Draw(overlay)
 
-        # Try to load a small font, fall back to default
-        try:
-            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 11)
-        except Exception:
-            font = ImageFont.load_default()
+        # Probe common font paths across Linux, macOS, Windows; fall back to default
+        _FONT_CANDIDATES = [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",       # Debian/Ubuntu
+            "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",                # Fedora/RHEL
+            "/System/Library/Fonts/Helvetica.ttc",                         # macOS
+            "C:/Windows/Fonts/arialbd.ttf",                                # Windows
+        ]
+        font = ImageFont.load_default()
+        for _fp in _FONT_CANDIDATES:
+            try:
+                font = ImageFont.truetype(_fp, 11)
+                break
+            except Exception:
+                continue
 
         # Draw grid lines
         for ci in range(self.cols + 1):
