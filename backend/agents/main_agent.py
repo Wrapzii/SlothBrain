@@ -23,9 +23,9 @@ def _load_protected_prompt() -> str:
     """Load the main agent's system prompt from the protected file (read-only)."""
     try:
         return _PROTECTED_PROMPT_PATH.read_text(encoding="utf-8").strip()
-    except OSError as exc:
+    except OSError:
         logger.warning(
-            "Could not read protected system prompt (%s); using fallback.", exc
+            "Could not read protected system prompt; using fallback."
         )
         return _FALLBACK_SYSTEM_PROMPT
 

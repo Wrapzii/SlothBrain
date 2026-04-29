@@ -189,13 +189,6 @@ class ApprovalAction(BaseModel):
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _guard_context_size(new_size: int, current_size: int) -> None:
-    if new_size > settings.max_context_size:
-        raise HTTPException(
-            status_code=400,
-            detail=f"context_size {new_size} exceeds hard limit {settings.max_context_size}",
-        )
-
 
 # ---------------------------------------------------------------------------
 # Existing endpoints

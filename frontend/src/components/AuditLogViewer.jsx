@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useCallback } from 'react'
 import { getAuditLog } from '../api/client.js'
 
 const COLORS = {
@@ -30,7 +30,7 @@ export default function AuditLogViewer() {
   const [loading, setLoading] = useState(false)
   const [n, setN] = useState(50)
 
-  const refresh = async () => {
+  const refresh = useCallback(async () => {
     setLoading(true)
     try {
       const data = await getAuditLog(n)
@@ -40,11 +40,11 @@ export default function AuditLogViewer() {
     } finally {
       setLoading(false)
     }
-  }
+  }, [n])
 
   useEffect(() => {
     if (open) refresh()
-  }, [open, n])
+  }, [open, refresh])
 
   return (
     <div style={{

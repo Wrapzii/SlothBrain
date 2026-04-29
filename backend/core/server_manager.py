@@ -5,7 +5,6 @@ import asyncio
 import json
 import logging
 import shlex
-from asyncio import subprocess
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
