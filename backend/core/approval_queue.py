@@ -40,10 +40,28 @@ class ApprovalQueue:
         {"server_restart", "kv_cache_change", "large_context_increase", "emergency_stop"}
     )
 
-    def __init__(self) -> None:
+    def __init__(self, max_entries: int = 500) -> None:
         self._queue: dict[str, PendingApproval] = {}
+        self._max_entries = max_entries
+
+    def _prune_if_needed(self) -> None:
+        # Drop non-pending entries first, then oldest remaining if still over cap.
+        if len(self._queue) < self._max_entries:
+            return
+        done_ids = [aid for aid, a in self._queue.items() if a.status != "pending"]
+        for aid in done_ids:
+            if len(self._queue) < self._max_entries:
+                break
+            self._queue.pop(aid, None)
+        if len(self._queue) >= self._max_entries:
+            oldest = min(
+                self._queue.items(),
+                key=lambda kv: kv[1].created_at,
+            )[0]
+            self._queue.pop(oldest, None)
 
     def submit(self, action: str, description: str, payload: Any = None) -> PendingApproval:
+        self._prune_if_needed()
         approval = PendingApproval(
             approval_id=str(uuid.uuid4()),
             action=action,

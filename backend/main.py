@@ -7,6 +7,7 @@ from contextlib import asynccontextmanager
 from functools import lru_cache
 from typing import Any
 
+import httpx
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -56,7 +57,7 @@ async def lifespan(app: FastAPI):  # type: ignore[type-arg]
     global preset_manager, agent_registry, server_manager, audit_log, approval_queue
 
     audit_log = AuditLog()
-    approval_queue = ApprovalQueue()
+    approval_queue = ApprovalQueue(max_entries=settings.max_pending_approvals)
     server_manager = ServerManager(config=settings, audit_log=audit_log)
 
     llama_client = LlamaClient(host=settings.llama_host, port=settings.llama_port)
@@ -118,7 +119,7 @@ app = FastAPI(title="SlothBrain", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=settings.cors_allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -147,6 +148,7 @@ class SettingsUpdate(BaseModel):
     idle_kv_quant: str | None = None
     active_kv_quant: str | None = None
     vram_threshold_mb: int | None = None
+    ram_threshold_mb: int | None = None
     embedding_model: str | None = None
     llama_server_path: str | None = None
     llama_server_args: list[str] | None = None
@@ -156,6 +158,7 @@ class SettingsUpdate(BaseModel):
     require_approval_server_restart: bool | None = None
     require_approval_kv_cache_change: bool | None = None
     require_approval_large_context_increase: bool | None = None
+    require_approval_emergency_stop: bool | None = None
 
 
 class BenchmarkRequest(BaseModel):
@@ -195,6 +198,12 @@ class SpawnRequest(BaseModel):
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+def _raise_service_unavailable(exc: Exception, context: str) -> None:
+    logger.warning("%s failed: %s", context, exc.__class__.__name__)
+    raise HTTPException(
+        status_code=503,
+        detail=f"{context} unavailable. Ensure llama.cpp server is running and reachable.",
+    ) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -208,20 +217,27 @@ async def health_check() -> dict:
 @app.get("/api/status")
 async def get_status() -> dict:
     stats = await resource_manager.get_system_stats()
-    slot_info = await slot_manager.get_slot_info()
+    try:
+        slot_info = await slot_manager.get_slot_info()
+    except Exception as exc:
+        logger.warning("Failed to fetch slot info: %s", exc.__class__.__name__)
+        slot_info = {"watcher": settings.watcher_slot, "main": settings.main_slot, "slots": []}
     return {**stats, "slots": slot_info}
 
 
 @app.post("/api/chat")
 async def chat(request: ChatRequest) -> dict:
     agent_choice = request.agent.lower()
-    if agent_choice == "watcher":
-        response = await watcher_agent.process(request.message)
-        return {"agent": "watcher", "response": response, "handoff": False}
-    if agent_choice == "main":
-        response = await main_agent.process(request.message)
-        return {"agent": "main", "response": response, "handoff": False}
-    return await handoff_manager.route(request.message)
+    try:
+        if agent_choice == "watcher":
+            response = await watcher_agent.process(request.message)
+            return {"agent": "watcher", "response": response, "handoff": False}
+        if agent_choice == "main":
+            response = await main_agent.process(request.message)
+            return {"agent": "main", "response": response, "handoff": False}
+        return await handoff_manager.route(request.message)
+    except (httpx.HTTPError, RuntimeError, ValueError) as exc:
+        _raise_service_unavailable(exc, "Chat service")
 
 
 @app.get("/api/mode")
@@ -243,6 +259,8 @@ async def get_settings() -> dict:
 @app.post("/api/settings")
 async def update_settings(update: SettingsUpdate) -> dict:
     data = update.model_dump(exclude_none=True)
+    if "vram_threshold_mb" in data and "ram_threshold_mb" not in data:
+        data["ram_threshold_mb"] = data["vram_threshold_mb"]
 
     # Guard KV cache changes
     kv_fields = {"idle_kv_quant", "active_kv_quant"}
@@ -406,11 +424,14 @@ async def chat_with_agent(agent_id: str, request: AgentChatRequest) -> dict:
         agent = agent_registry.get(agent_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    response = await agent.process(
-        request.message,
-        context_size=request.context_size,
-        max_tokens=request.max_tokens,
-    )
+    try:
+        response = await agent.process(
+            request.message,
+            context_size=request.context_size,
+            max_tokens=request.max_tokens,
+        )
+    except (httpx.HTTPError, RuntimeError, ValueError) as exc:
+        _raise_service_unavailable(exc, "Agent chat")
     return {"agent_id": agent_id, "response": response}
 
 
@@ -435,6 +456,8 @@ async def restart_server() -> dict:
         await server_manager.restart(actor="api")
     except RuntimeError as exc:
         raise HTTPException(status_code=429, detail=str(exc)) from exc
+    except (ValueError, OSError, FileNotFoundError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"status": server_manager.status}
 
 
@@ -463,12 +486,19 @@ async def approve_action(approval_id: str) -> dict:
             result["server_status"] = server_manager.status
         except RuntimeError as exc:
             result["error"] = str(exc)
+        except (ValueError, OSError, FileNotFoundError) as exc:
+            result["error"] = str(exc)
     elif approval.action in ("kv_cache_change", "large_context_increase"):
         payload = approval.payload or {}
         for key, value in payload.items():
             if hasattr(settings, key):
                 setattr(settings, key, value)
         result["settings"] = settings.model_dump()
+    elif approval.action == "emergency_stop":
+        agent_registry.destroy_all()
+        await server_manager.stop()
+        result["status"] = "stopped"
+        result["agents_destroyed"] = True
 
     return result
 
@@ -488,6 +518,13 @@ async def reject_action(approval_id: str) -> dict:
 # ---------------------------------------------------------------------------
 @app.post("/api/emergency-stop")
 async def emergency_stop() -> dict:
+    if settings.require_approval_emergency_stop:
+        approval = approval_queue.submit(
+            action="emergency_stop",
+            description="Emergency stop requested via API",
+        )
+        audit_log.record(action="emergency_stop_queued", actor="api", details=approval.id)
+        return {"pending_approval": approval.to_dict()}
     audit_log.record(action="emergency_stop", actor="human")
     agent_registry.destroy_all()
     await server_manager.stop()
@@ -511,7 +548,11 @@ async def ws_status(websocket: WebSocket) -> None:
     try:
         while True:
             stats = await resource_manager.get_system_stats()
-            slot_info = await slot_manager.get_slot_info()
+            try:
+                slot_info = await slot_manager.get_slot_info()
+            except Exception as exc:
+                logger.warning("ws/status slot fetch failed: %s", exc.__class__.__name__)
+                slot_info = {"watcher": settings.watcher_slot, "main": settings.main_slot, "slots": []}
             payload = {
                 **stats,
                 "slots": slot_info,
@@ -522,8 +563,8 @@ async def ws_status(websocket: WebSocket) -> None:
             await asyncio.sleep(2)
     except WebSocketDisconnect:
         pass
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("ws/status disconnected due to error: %s", exc.__class__.__name__)
 
 
 # ---------------------------------------------------------------------------

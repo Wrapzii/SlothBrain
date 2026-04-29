@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 from typing import Any
 
@@ -25,6 +26,7 @@ class LanceDBMemory:
         self._db: Any = None
         self._table: Any = None
         self._encoder: Any = None
+        self._init_lock = asyncio.Lock()
 
     def _get_encoder(self) -> Any:
         if self._encoder is None:
@@ -53,27 +55,34 @@ class LanceDBMemory:
         return self._table
 
     async def store(self, text: str, metadata: dict | None = None) -> None:
-        encoder = self._get_encoder()
-        vector = encoder.encode(text).tolist()
-        table = self._get_table()
+        async with self._init_lock:
+            encoder = await asyncio.to_thread(self._get_encoder)
+            vector = await asyncio.to_thread(encoder.encode, text)
+            table = await asyncio.to_thread(self._get_table)
         import json
         row = {
-            "vector": vector,
+            "vector": vector.tolist(),
             "text": text,
             "metadata": json.dumps(metadata or {}),
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
-        table.add([row])
+        await asyncio.to_thread(table.add, [row])
 
     async def search(self, query: str, limit: int = 5) -> list[dict]:
-        encoder = self._get_encoder()
-        query_vector = encoder.encode(query).tolist()
-        table = self._get_table()
-        results = (
-            table.search(query_vector)
-            .limit(limit)
-            .to_pandas()
-        )
+        async with self._init_lock:
+            encoder = await asyncio.to_thread(self._get_encoder)
+            query_vector = await asyncio.to_thread(encoder.encode, query)
+            table = await asyncio.to_thread(self._get_table)
+        query_vector = query_vector.tolist()
+
+        def _search():
+            return (
+                table.search(query_vector)
+                .limit(limit)
+                .to_pandas()
+            )
+
+        results = await asyncio.to_thread(_search)
         import json
         output: list[dict] = []
         for _, row in results.iterrows():

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 from backend.config import AppConfig
 from backend.core.slot_manager import SlotManager
 from backend.memory.lancedb_memory import LanceDBMemory
@@ -13,6 +15,7 @@ SYSTEM_PROMPT = (
     "You are a lightweight always-on assistant. Monitor activity and decide when to "
     "hand off complex tasks to the main agent. Keep responses concise."
 )
+logger = logging.getLogger(__name__)
 
 
 class WatcherAgent:
@@ -43,8 +46,8 @@ class WatcherAgent:
                 text=f"user: {user_input}\nassistant: {response}",
                 metadata={"agent": "watcher", "slot": self.slot_id},
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("WatcherAgent memory store failed: %s", exc.__class__.__name__)
         return response
 
     async def should_handoff(self, response: str) -> bool:

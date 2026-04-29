@@ -26,9 +26,13 @@ class AppConfig(BaseSettings):
     embedding_model: str = "all-MiniLM-L6-v2"
 
     # Resource limits
+    # Deprecated name kept for backwards compatibility.
     vram_threshold_mb: int = 2048
+    # Preferred name (system RAM threshold used for idle-mode fallback).
+    ram_threshold_mb: int = 2048
     max_context_size: int = 131072
     max_slots: int = 8
+    max_pending_approvals: int = 500
 
     # Operating mode
     mode: str = "idle"
@@ -42,6 +46,13 @@ class AppConfig(BaseSettings):
     require_approval_server_restart: bool = True
     require_approval_kv_cache_change: bool = True
     require_approval_large_context_increase: bool = True
+    require_approval_emergency_stop: bool = True
+    cors_allowed_origins: list[str] = [
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:8000",
+        "http://127.0.0.1:8000",
+    ]
 
     @field_validator("max_context_size")
     @classmethod
@@ -62,6 +73,13 @@ class AppConfig(BaseSettings):
     def _validate_max_restarts(cls, v: int) -> int:
         if v < 1:
             raise ValueError("max_restarts_per_hour must be at least 1")
+        return v
+
+    @field_validator("max_pending_approvals")
+    @classmethod
+    def _validate_max_pending_approvals(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError("max_pending_approvals must be at least 1")
         return v
 
     model_config = {"env_prefix": "SLOTHBRAIN_", "env_file": ".env", "extra": "ignore"}

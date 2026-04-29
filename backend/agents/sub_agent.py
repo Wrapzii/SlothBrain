@@ -107,8 +107,8 @@ class SubAgent:
                 if results:
                     snippets = "\n".join(f"- {r['text']}" for r in results)
                     memory_context = f"\n\nRelevant context:\n{snippets}"
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("SubAgent memory search failed: %s", exc.__class__.__name__)
 
         full_prompt = (
             f"system: {self.system_prompt}"
@@ -130,7 +130,7 @@ class SubAgent:
                     text=f"user: {user_input}\nassistant: {response}",
                     metadata={"agent": self.agent_id, "preset": self.preset_id},
                 )
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("SubAgent memory store failed: %s", exc.__class__.__name__)
 
         return response

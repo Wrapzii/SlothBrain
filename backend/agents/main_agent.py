@@ -94,8 +94,8 @@ class MainAgent:
         memory_results: list[dict] = []
         try:
             memory_results = await self._memory.search(user_input, limit=5)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("MainAgent memory search failed: %s", exc.__class__.__name__)
 
         memory_context = ""
         if memory_results:
@@ -122,7 +122,7 @@ class MainAgent:
                 text=f"user: {user_input}\nassistant: {response}",
                 metadata={"agent": "main", "slot": self.slot_id},
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("MainAgent memory store failed: %s", exc.__class__.__name__)
 
         return response

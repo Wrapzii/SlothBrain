@@ -36,7 +36,8 @@ class ResourceManager:
 
     async def auto_adjust(self) -> None:
         stats = await self.get_system_stats()
-        if stats["ram_used_mb"] > self._config.vram_threshold_mb:
+        threshold_mb = getattr(self._config, "ram_threshold_mb", self._config.vram_threshold_mb)
+        if stats["ram_used_mb"] > threshold_mb:
             await self.set_mode("idle")
         elif self._mode == "active":
             # Already active — keep it

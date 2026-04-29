@@ -1,4 +1,57 @@
 const BASE = ''
+let statusSocket = null
+let reconnectTimer = null
+let reconnectDelayMs = 500
+const subscribers = new Set()
+const statusListeners = new Set()
+const errorListeners = new Set()
+
+function notifyStatus(connected) {
+  statusListeners.forEach((fn) => {
+    try { fn(connected) } catch {}
+  })
+}
+
+function connectStatusSocket() {
+  if (statusSocket && (statusSocket.readyState === WebSocket.OPEN || statusSocket.readyState === WebSocket.CONNECTING)) {
+    return
+  }
+  const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws'
+  const host = window.location.host
+  statusSocket = new WebSocket(`${protocol}://${host}/ws/status`)
+
+  statusSocket.onopen = () => {
+    reconnectDelayMs = 500
+    notifyStatus(true)
+  }
+
+  statusSocket.onmessage = (event) => {
+    try {
+      const data = JSON.parse(event.data)
+      subscribers.forEach((fn) => {
+        try { fn(data) } catch {}
+      })
+    } catch {
+      // ignore malformed frames
+    }
+  }
+
+  statusSocket.onerror = (err) => {
+    errorListeners.forEach((fn) => {
+      try { fn(err) } catch {}
+    })
+  }
+
+  statusSocket.onclose = () => {
+    notifyStatus(false)
+    statusSocket = null
+    if (subscribers.size === 0) return
+    clearTimeout(reconnectTimer)
+    const jitter = Math.floor(Math.random() * 250)
+    reconnectTimer = setTimeout(connectStatusSocket, reconnectDelayMs + jitter)
+    reconnectDelayMs = Math.min(reconnectDelayMs * 2, 5000)
+  }
+}
 
 async function apiFetch(path, options = {}) {
   const res = await fetch(`${BASE}${path}`, {
@@ -124,22 +177,27 @@ export async function getAuditLog(n = 100) {
 }
 
 export function createStatusSocket(onMessage, onError) {
-  const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws'
-  const host = window.location.host
-  const ws = new WebSocket(`${protocol}://${host}/ws/status`)
+  if (onMessage) subscribers.add(onMessage)
+  if (onError) errorListeners.add(onError)
+  connectStatusSocket()
 
-  ws.onmessage = (event) => {
-    try {
-      const data = JSON.parse(event.data)
-      onMessage(data)
-    } catch {
-      // ignore malformed frames
-    }
+  return {
+    close() {
+      if (onMessage) subscribers.delete(onMessage)
+      if (onError) errorListeners.delete(onError)
+      if (subscribers.size > 0) return
+      clearTimeout(reconnectTimer)
+      reconnectTimer = null
+      if (statusSocket) {
+        statusSocket.close()
+        statusSocket = null
+      }
+      notifyStatus(false)
+    },
+    onStatusChange(cb) {
+      if (!cb) return () => {}
+      statusListeners.add(cb)
+      return () => statusListeners.delete(cb)
+    },
   }
-
-  ws.onerror = (err) => {
-    if (onError) onError(err)
-  }
-
-  return ws
 }

@@ -62,7 +62,11 @@ export default function Dashboard() {
 
   useEffect(() => {
     wsRef.current = createStatusSocket(handleMessage, () => setConnected(false))
-    return () => wsRef.current?.close()
+    const off = wsRef.current?.onStatusChange?.((isConnected) => setConnected(isConnected))
+    return () => {
+      if (off) off()
+      wsRef.current?.close()
+    }
   }, [handleMessage])
 
   const handleSetMode = async (mode) => {

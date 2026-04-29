@@ -1,11 +1,12 @@
-import { useState, useEffect, useCallback, useRef } from 'react'
-import Dashboard from './components/Dashboard.jsx'
-import ChatInterface from './components/ChatInterface.jsx'
-import Settings from './components/Settings.jsx'
-import BenchmarkSuite from './components/BenchmarkSuite.jsx'
-import AgentsTab from './components/AgentsTab.jsx'
+import { useState, useEffect, useCallback, useRef, Suspense, lazy } from 'react'
 import ApprovalQueue from './components/ApprovalQueue.jsx'
 import { emergencyStop, createStatusSocket } from './api/client.js'
+
+const Dashboard = lazy(() => import('./components/Dashboard.jsx'))
+const ChatInterface = lazy(() => import('./components/ChatInterface.jsx'))
+const Settings = lazy(() => import('./components/Settings.jsx'))
+const BenchmarkSuite = lazy(() => import('./components/BenchmarkSuite.jsx'))
+const AgentsTab = lazy(() => import('./components/AgentsTab.jsx'))
 
 const COLORS = {
   bg: '#1a1a2e',
@@ -46,8 +47,12 @@ export default function App() {
     if (!confirm('⚠️ EMERGENCY STOP: Kill llama-server and destroy all agents?')) return
     setStopping(true)
     try {
-      await emergencyStop()
-      alert('Emergency stop executed. All agents destroyed and server stopped.')
+      const result = await emergencyStop()
+      if (result?.pending_approval) {
+        alert('Emergency stop queued for approval.')
+      } else {
+        alert('Emergency stop executed. All agents destroyed and server stopped.')
+      }
     } catch (err) {
       alert(`Emergency stop failed: ${err.message}`)
     } finally {
@@ -150,11 +155,13 @@ export default function App() {
 
       {/* Content */}
       <main style={{ padding: '28px 32px', maxWidth: 1100, margin: '0 auto' }}>
-        {activeTab === 'dashboard' && <Dashboard />}
-        {activeTab === 'chat' && <ChatInterface />}
-        {activeTab === 'agents' && <AgentsTab />}
-        {activeTab === 'settings' && <Settings />}
-        {activeTab === 'benchmarks' && <BenchmarkSuite />}
+        <Suspense fallback={<div style={{ color: '#888' }}>Loading…</div>}>
+          {activeTab === 'dashboard' && <Dashboard />}
+          {activeTab === 'chat' && <ChatInterface />}
+          {activeTab === 'agents' && <AgentsTab />}
+          {activeTab === 'settings' && <Settings />}
+          {activeTab === 'benchmarks' && <BenchmarkSuite />}
+        </Suspense>
       </main>
     </div>
   )
