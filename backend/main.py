@@ -222,9 +222,25 @@ class SpawnRequest(BaseModel):
     task_description: str = ""
 
 
+class AgenticRequest(BaseModel):
+    task: str
+    max_steps: int = 10
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+# Bounds for the number of agentic steps accepted via API.
+_MIN_AGENTIC_STEPS = 1
+_MAX_AGENTIC_STEPS = 20
+
+
+def _clamp_steps(n: int) -> int:
+    """Clamp a requested step count to the valid API range."""
+    return min(max(n, _MIN_AGENTIC_STEPS), _MAX_AGENTIC_STEPS)
+
+
 def _raise_service_unavailable(exc: Exception, context: str) -> None:
     logger.warning("%s failed: %s", context, exc.__class__.__name__)
     raise HTTPException(
@@ -285,6 +301,32 @@ async def chat(request: ChatRequest) -> dict:
         return await handoff_manager.route(request.message)
     except (httpx.HTTPError, RuntimeError, ValueError) as exc:
         _raise_service_unavailable(exc, "Chat service")
+
+
+@app.post("/api/chat/agentic")
+async def agentic_chat(request: AgenticRequest) -> dict:
+    """Run a multi-step agentic task loop and return the full result.
+
+    The MainAgent plans the task, executes each step in sequence, and the
+    WatcherAgent monitors progress and verifies completion.
+    """
+    from backend.agents.agentic_loop import AgenticLoop
+
+    loop = AgenticLoop(
+        main_agent=main_agent,
+        watcher_agent=watcher_agent,
+        max_steps=_clamp_steps(request.max_steps),
+    )
+    try:
+        result = await loop.run(task=request.task)
+    except (httpx.HTTPError, RuntimeError, ValueError) as exc:
+        _raise_service_unavailable(exc, "Agentic loop")
+    audit_log.record(
+        action="agentic_task",
+        actor="api",
+        details=request.task[:100],
+    )
+    return result
 
 
 @app.get("/api/mode")
@@ -627,6 +669,85 @@ async def ws_status(websocket: WebSocket) -> None:
         pass
     except Exception as exc:
         logger.warning("ws/status disconnected due to error: %s", exc.__class__.__name__)
+
+
+@app.websocket("/ws/agent-progress")
+async def ws_agent_progress(websocket: WebSocket) -> None:
+    """Stream real-time agentic-loop progress events to a WebSocket client.
+
+    Protocol
+    --------
+    1. Client connects and sends a JSON object:  ``{"task": "...", "max_steps": 10}``
+    2. Server sends a sequence of progress-event objects (each has a ``type`` field).
+    3. After the final ``complete`` event the server sends a ``result`` object and
+       closes the connection.
+    """
+    configured_key = settings.api_key.strip()
+    header_key = websocket.headers.get("x-api-key", "").strip()
+    bearer_key = _parse_bearer_token(websocket.headers.get("authorization"))
+    client_host = websocket.client.host if websocket.client else None
+
+    if configured_key:
+        if header_key != configured_key and bearer_key != configured_key:
+            await websocket.close(code=1008)
+            return
+    elif not _is_loopback_host(client_host):
+        await websocket.close(code=1008)
+        return
+
+    await websocket.accept()
+
+    async def _send(data: dict) -> None:
+        try:
+            await websocket.send_text(json.dumps(data))
+        except Exception:
+            pass
+
+    try:
+        raw = await websocket.receive_text()
+        try:
+            task_data = json.loads(raw)
+        except json.JSONDecodeError:
+            await _send({"type": "error", "message": "Invalid JSON"})
+            return
+
+        task = (task_data.get("task") or "").strip()
+        if not task:
+            await _send({"type": "error", "message": "No task provided"})
+            return
+
+        max_steps = _clamp_steps(int(task_data.get("max_steps", 10)))
+
+        from backend.agents.agentic_loop import AgenticLoop
+
+        loop = AgenticLoop(
+            main_agent=main_agent,
+            watcher_agent=watcher_agent,
+            max_steps=max_steps,
+        )
+
+        audit_log.record(
+            action="agentic_task_ws", actor="api", details=task[:100]
+        )
+
+        try:
+            result = await loop.run(task=task, on_progress=_send)
+        except (httpx.HTTPError, RuntimeError, ValueError) as exc:
+            await _send(
+                {
+                    "type": "error",
+                    "message": f"Service unavailable: {exc.__class__.__name__}",
+                }
+            )
+            return
+
+        await _send({"type": "result", **result})
+
+    except WebSocketDisconnect:
+        pass
+    except Exception as exc:
+        logger.error("ws/agent-progress error: %s", exc)
+        await _send({"type": "error", "message": f"Internal error: {exc.__class__.__name__}"})
 
 
 # ---------------------------------------------------------------------------
