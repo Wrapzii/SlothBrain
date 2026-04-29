@@ -7,6 +7,25 @@ from backend.core.llama_client import LlamaClient
 
 
 class ResourceManager:
+    """Manages operating mode (idle/active) and system resource monitoring.
+
+    The resource manager controls the KV-cache quantisation level used by
+    llama.cpp and can automatically switch to idle mode when system RAM
+    exceeds a configurable threshold.
+
+    Modes
+    -----
+    idle
+        Uses ``idle_kv_quant`` (default ``q4``).  Lower memory footprint,
+        suitable for background / light workloads.
+    active
+        Uses ``active_kv_quant`` (default ``q8``).  Higher quality outputs,
+        suitable for demanding tasks.
+
+    TODO: Expose GPU VRAM monitoring (nvidia-smi / nvml) in addition to
+          system RAM so the threshold can be driven by actual VRAM pressure.
+    """
+
     def __init__(self, config: AppConfig, llama_client: LlamaClient) -> None:
         self._config = config
         self._client = llama_client

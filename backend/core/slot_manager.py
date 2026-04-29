@@ -29,6 +29,19 @@ def _sanitize_response(response: str) -> str:
 
 
 class SlotManager:
+    """Manages named inference slot assignments and per-slot conversation history.
+
+    Each slot corresponds to a llama.cpp KV-cache context.  The ``SlotManager``
+    wraps ``LlamaClient`` with:
+    - Named slot assignment (``watcher_slot``, ``main_slot``).
+    - Per-slot message history for UI display purposes.
+    - Response sanitisation: strips leaked role prefixes (``system:``,
+      ``user:``, ``assistant:``) and truncates at stop sequences.
+
+    TODO: Clear the per-slot history when a slot is reassigned so stale
+          messages from a previous session do not appear in the UI.
+    """
+
     def __init__(self, llama_client: LlamaClient) -> None:
         self._client = llama_client
         self._watcher_slot: int | None = None

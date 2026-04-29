@@ -22,11 +22,16 @@ Architecture
     escalate_to_user  – stop and surface the situation to the human operator
 - The loop checks for pending interventions via ``LoopHandle.pop_intervention()``
   and applies the recovery action immediately.
+
+TODO: Wrap _call_judge in asyncio.wait_for to prevent a slow Judge from blocking
+      the supervisor while other handles need servicing. See BUGS.md BUG-001.
+TODO: Add a supervisor metrics endpoint (stall counts, intervention distribution).
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import time
@@ -61,16 +66,17 @@ _VALID_JUDGE_ACTIONS = (
 _JUDGE_SYSTEM_PROMPT = (
     "You are an AI task supervisor. A running agent appears to be stuck or has "
     "produced an error. Review the recent history and checkpoint summary, then "
-    "decide the best recovery action.\n"
-    "Reply with exactly two lines:\n"
-    "ACTION: <nudge|reset_context|retry_step|end_task|escalate_to_user>\n"
-    "MESSAGE: <brief explanation>\n\n"
-    "Action meanings:\n"
+    "decide the best recovery action.\n\n"
+    "You MUST respond with a single valid JSON object and nothing else:\n"
+    '{"action": "<action>", "message": "<brief explanation>"}\n\n'
+    "Valid action values (choose exactly one):\n"
     "  nudge            – send a gentle reminder to continue the current step\n"
     "  reset_context    – clear accumulated context and retry from the checkpoint\n"
     "  retry_step       – retry only the current step without clearing context\n"
     "  end_task         – the task cannot be completed; stop cleanly\n"
-    "  escalate_to_user – the situation requires human input"
+    "  escalate_to_user – the situation requires human input\n\n"
+    "Severity order (prefer lower severity when uncertain): "
+    "nudge < retry_step < reset_context < end_task < escalate_to_user"
 )
 
 
@@ -80,26 +86,58 @@ _JUDGE_SYSTEM_PROMPT = (
 
 
 def _parse_judge_response(response: str) -> dict:
-    """Extract ACTION and MESSAGE from the Judge LLM response."""
-    lower = response.lower()
+    """Extract action and message from the Judge LLM response.
 
-    action = "nudge"  # safest default
-    action_match = re.search(r"action:\s*(\S+)", lower)
+    Tries JSON parsing first (preferred — the prompt requests JSON output).
+    Falls back to regex key extraction and ultimately to a keyword scan so
+    the supervisor never crashes on unexpected model output.
+
+    Returns a dict with keys ``action`` and ``message``.
+    """
+    # ── Attempt 1: JSON parse ─────────────────────────────────────────────
+    # The model may wrap JSON in a markdown code fence; strip it first.
+    stripped = response.strip()
+    json_candidate = stripped
+    fence_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", stripped, re.DOTALL)
+    if fence_match:
+        json_candidate = fence_match.group(1)
+    else:
+        # Try to extract a bare JSON object
+        obj_match = re.search(r"\{[^{}]*\}", stripped, re.DOTALL)
+        if obj_match:
+            json_candidate = obj_match.group(0)
+
+    try:
+        data = json.loads(json_candidate)
+        action = str(data.get("action", "nudge")).strip().lower()
+        if action not in _VALID_JUDGE_ACTIONS:
+            action = "nudge"
+        message = str(data.get("message", "")).strip()[:400]
+        return {"action": action, "message": message}
+    except (json.JSONDecodeError, AttributeError, TypeError):
+        pass
+
+    # ── Attempt 2: Regex key extraction ──────────────────────────────────
+    lower = response.lower()
+    action = "nudge"
+    action_match = re.search(r'"?action"?\s*:\s*"?(\w+)"?', lower)
     if action_match:
         candidate = action_match.group(1).strip()
         if candidate in _VALID_JUDGE_ACTIONS:
             action = candidate
     else:
-        # Keyword scan: pick first match in severity order
+        # ── Attempt 3: Keyword scan in severity order ─────────────────────
         for keyword in _VALID_JUDGE_ACTIONS:
             if keyword.replace("_", " ") in lower or keyword in lower:
                 action = keyword
                 break
 
     message = response.strip()
-    msg_match = re.search(r"message:\s*(.+)", response, re.IGNORECASE | re.DOTALL)
+    msg_match = re.search(
+        r'"?message"?\s*:\s*"?(.+)"?', response, re.IGNORECASE | re.DOTALL
+    )
     if msg_match:
-        message = msg_match.group(1).strip()[:400]
+        message = msg_match.group(1).strip().rstrip('"').strip()[:400]
 
     return {"action": action, "message": message}
 
@@ -187,6 +225,14 @@ class LoopHandle:
 class SafetySupervisor:
     """Python-level watchdog for all running ``AgenticLoop`` instances.
 
+    The supervisor runs an independent asyncio background task that polls
+    registered loop handles every ``poll_interval`` seconds.  It is fully
+    decoupled from the LLM inference slots and continues working even when
+    all slots are busy.
+
+    If the background task crashes (unexpected exception) it is automatically
+    restarted so supervision is never silently lost.
+
     Parameters
     ----------
     llama_client:
@@ -215,15 +261,20 @@ class SafetySupervisor:
         self._step_timeout = step_timeout
         self._handles: dict[str, LoopHandle] = {}
         self._task: Optional["asyncio.Task[None]"] = None
+        self._running: bool = False
 
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
     def start(self) -> None:
-        """Start the background supervisor task."""
+        """Start the background supervisor task.
+
+        Safe to call multiple times — a no-op if already running.
+        """
+        self._running = True
         if self._task is None or self._task.done():
-            self._task = asyncio.create_task(self._run())
+            self._task = asyncio.create_task(self._run_with_restart())
             logger.info(
                 "SafetySupervisor started (poll=%.0fs timeout=%.0fs)",
                 self._poll_interval,
@@ -232,6 +283,7 @@ class SafetySupervisor:
 
     def stop(self) -> None:
         """Stop the supervisor and clean up all handles."""
+        self._running = False
         if self._task and not self._task.done():
             self._task.cancel()
         self._handles.clear()
@@ -258,6 +310,25 @@ class SafetySupervisor:
     # ------------------------------------------------------------------
     # Internal polling loop
     # ------------------------------------------------------------------
+
+    async def _run_with_restart(self) -> None:
+        """Wrapper that restarts the supervision loop if it crashes unexpectedly.
+
+        Without this, any unhandled exception in ``_run`` would silently kill
+        the supervisor and leave all registered loops unmonitored.
+        """
+        while self._running:
+            try:
+                await self._run()
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logger.error(
+                    "SafetySupervisor background task crashed (%s: %s); restarting in 5s",
+                    exc.__class__.__name__,
+                    exc,
+                )
+                await asyncio.sleep(5)
 
     async def _run(self) -> None:
         """Main supervision loop – runs until cancelled."""
@@ -302,8 +373,15 @@ class SafetySupervisor:
     ) -> dict:
         """Ask the Judge LLM for a recovery decision.
 
+        Constructs a structured prompt requesting JSON output, then parses the
+        response with ``_parse_judge_response`` (JSON-first, regex fallback).
+
         Falls back to ``nudge`` on any error so the supervisor never crashes
         the loop.
+
+        TODO: Add asyncio.wait_for with a configurable timeout (e.g. 30 s) to
+              prevent a slow Judge from blocking supervision of other handles.
+              See BUGS.md BUG-001.
         """
         context_str = "\n".join(handle.recent_context) or "(no context yet)"
         cp_info = ""
@@ -320,6 +398,7 @@ class SafetySupervisor:
             f"Time without progress: {handle.seconds_since_heartbeat():.0f}s\n"
             f"{cp_info}\n"
             f"Recent context:\n{context_str}\n"
+            'Respond with only a JSON object: {"action": "...", "message": "..."}\n'
             "assistant:"
         )
 

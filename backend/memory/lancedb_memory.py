@@ -15,6 +15,29 @@ except ImportError:
 
 
 class LanceDBMemory:
+    """Persistent long-term memory backed by LanceDB and sentence-transformers.
+
+    Every conversation turn (user + assistant) is embedded and stored with
+    metadata and a UTC timestamp.  Semantic search retrieves the most
+    relevant past interactions for any new query.
+
+    Initialisation is lazy and protected by an ``asyncio.Lock`` so the first
+    concurrent callers do not race to create the table.
+
+    Parameters
+    ----------
+    db_path:
+        Path to the LanceDB database directory.
+    embedding_model:
+        ``sentence-transformers`` model name (e.g. ``all-MiniLM-L6-v2``).
+
+    TODO: Replace the seed-row table creation workaround with a PyArrow
+          schema passed directly to ``create_table`` to prevent orphaned
+          zero-vector rows. See BUGS.md BUG-003.
+    TODO: Add a ``delete_by_metadata`` method so old or irrelevant memories
+          can be pruned without resetting the entire database.
+    """
+
     def __init__(self, db_path: str, embedding_model: str) -> None:
         if not _DEPS_AVAILABLE:
             raise ImportError(

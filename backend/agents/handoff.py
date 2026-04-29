@@ -5,6 +5,18 @@ from backend.agents.watcher import WatcherAgent
 
 
 class HandoffManager:
+    """Routes single-turn user messages to the appropriate agent.
+
+    The ``WatcherAgent`` processes every message first.  If it detects a
+    complex task (via ``should_handoff``), the ``MainAgent`` is invoked with
+    the watcher's initial response as additional context.
+
+    TODO: Replace the phrase-based ``should_handoff`` heuristic with a
+          structured response field from the watcher (e.g. a JSON field
+          ``handoff: true/false``) to avoid false positives on negations
+          such as "I do NOT need to hand off this task".
+    """
+
     def __init__(self, watcher: WatcherAgent, main_agent: MainAgent) -> None:
         self._watcher = watcher
         self._main_agent = main_agent
