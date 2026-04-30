@@ -2,6 +2,11 @@
 
 All file operations are restricted to a configurable workspace root
 (``AppConfig.tool_workspace_root``) to prevent path traversal.
+
+When the ``list`` action is used and a :class:`WorkspaceIndexTool` is
+injected, the listed directory is automatically scheduled for background
+indexing so the agent can later perform semantic search over it without any
+manual setup.
 """
 from __future__ import annotations
 
@@ -13,6 +18,7 @@ from backend.tools.base import Tool, ToolResult
 
 if TYPE_CHECKING:
     from backend.config import AppConfig
+    from backend.tools.impl.workspace_index_tool import WorkspaceIndexTool
 
 logger = logging.getLogger(__name__)
 
@@ -62,10 +68,15 @@ class FileTool(Tool):
         "required": ["action", "path"],
     }
 
-    def __init__(self, config: "AppConfig") -> None:
+    def __init__(
+        self,
+        config: "AppConfig",
+        workspace_index: "WorkspaceIndexTool | None" = None,
+    ) -> None:
         workspace = getattr(config, "tool_workspace_root", "./workspace")
         self._root = Path(workspace).resolve()
         self._root.mkdir(parents=True, exist_ok=True)
+        self._workspace_index = workspace_index
 
     def _safe_path(self, rel_path: str) -> Path | None:
         """Resolve *rel_path* relative to the workspace root.
@@ -104,7 +115,13 @@ class FileTool(Tool):
         if action == "append":
             return self._append(safe, content, encoding)
         if action == "list":
-            return self._list(safe)
+            result = self._list(safe)
+            if result.ok and self._workspace_index is not None:
+                # Auto-trigger background indexing for the listed directory.
+                listed_dir = safe if safe.is_dir() else safe.parent
+                if self._workspace_index.is_available():
+                    self._workspace_index.trigger_auto_index(listed_dir)
+            return result
         if action == "delete":
             return self._delete(safe)
         if action == "exists":

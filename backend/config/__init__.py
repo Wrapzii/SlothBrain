@@ -81,6 +81,14 @@ class AppConfig(BaseSettings):
     # Web search: set to a SearXNG base URL to use it instead of DuckDuckGo
     searxng_url: str = ""
 
+    # Workspace / file-system indexing
+    # When True, WorkspaceIndexTool is registered and FileTool auto-triggers
+    # background indexing whenever a directory is listed.
+    workspace_index_enabled: bool = True
+    # Set to a custom path to store the workspace index in a separate location
+    # from the main LanceDB memory.  Defaults to a sub-directory of lancedb_path.
+    workspace_index_db_path: str = ""
+
     cors_allowed_origins: list[str] = [
         "http://localhost:5173",
         "http://127.0.0.1:5173",
