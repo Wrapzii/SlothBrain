@@ -105,6 +105,10 @@ class WorkspaceIndexTool(Tool):
     # Public helpers
     # ------------------------------------------------------------------
 
+    def is_available(self) -> bool:
+        """Return ``True`` if the underlying indexer is configured and ready."""
+        return self._indexer is not None
+
     def trigger_auto_index(self, directory: str | Path) -> None:
         """Fire-and-forget: schedule background indexing for *directory*.
 

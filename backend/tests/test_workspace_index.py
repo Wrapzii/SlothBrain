@@ -247,7 +247,7 @@ class TestWorkspaceIndexTool:
         tool, _ = _make_tool(tmp_path)
         resolved = str(tmp_path.resolve())
         tool._indexing_in_progress.add(resolved)
-        # Should not schedule a second task
+        # Should not schedule a second task (already in progress)
         tool.trigger_auto_index(tmp_path)
         # Still only one entry
         assert resolved in tool._indexing_in_progress
@@ -267,7 +267,7 @@ class TestFileToolAutoTrigger:
     @pytest.mark.asyncio
     async def test_list_triggers_auto_index(self, tmp_path: Path):
         mock_tool = MagicMock()
-        mock_tool._indexer = MagicMock()  # non-None so trigger fires
+        mock_tool.is_available.return_value = True
         mock_tool.trigger_auto_index = MagicMock()
 
         file_tool = self._make_file_tool(tmp_path, workspace_index=mock_tool)
@@ -287,7 +287,7 @@ class TestFileToolAutoTrigger:
         f = tmp_path / "hello.txt"
         f.write_text("hello")
         mock_tool = MagicMock()
-        mock_tool._indexer = MagicMock()
+        mock_tool.is_available.return_value = True
         mock_tool.trigger_auto_index = MagicMock()
 
         file_tool = self._make_file_tool(tmp_path, workspace_index=mock_tool)

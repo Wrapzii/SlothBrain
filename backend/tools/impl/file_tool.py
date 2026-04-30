@@ -119,7 +119,7 @@ class FileTool(Tool):
             if result.ok and self._workspace_index is not None:
                 # Auto-trigger background indexing for the listed directory.
                 listed_dir = safe if safe.is_dir() else safe.parent
-                if getattr(self._workspace_index, "_indexer", None) is not None:
+                if self._workspace_index.is_available():
                     self._workspace_index.trigger_auto_index(listed_dir)
             return result
         if action == "delete":
