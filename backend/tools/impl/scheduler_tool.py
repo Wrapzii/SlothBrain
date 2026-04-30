@@ -14,6 +14,7 @@ Actions
 from __future__ import annotations
 
 import asyncio
+import datetime as dt_module
 import json
 import logging
 import uuid
@@ -158,11 +159,8 @@ class SchedulerTool(Tool):
                 # Update next_run_at for recurring jobs
                 interval = job.get("interval_seconds")
                 if interval:
-                    job["next_run_at"] = datetime.now(timezone.utc).isoformat()
                     job["last_run_at"] = now.isoformat()
-                    # Advance by interval
-                    import datetime as dt_mod
-                    next_dt = now + dt_mod.timedelta(seconds=interval)
+                    next_dt = now + dt_module.timedelta(seconds=interval)
                     job["next_run_at"] = next_dt.isoformat()
                 else:
                     job["cancelled"] = True  # one-shot job fired; mark done
@@ -205,8 +203,7 @@ class SchedulerTool(Tool):
             except Exception:
                 return ToolResult(ok=False, error=f"Invalid 'run_at' datetime: {run_at!r}")
         elif interval_seconds:
-            import datetime as dt_mod
-            next_run = (datetime.now(timezone.utc) + dt_mod.timedelta(seconds=interval_seconds)).isoformat()
+            next_run = (datetime.now(timezone.utc) + dt_module.timedelta(seconds=interval_seconds)).isoformat()
 
         jid = str(uuid.uuid4())[:8]
         self._jobs[jid] = {

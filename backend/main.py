@@ -198,7 +198,13 @@ def _register_tools(
     # Shell / process / code
     registry.register(ShellTool(config=config, audit_log=audit_log))
     registry.register(ProcessTool(config=config, audit_log=audit_log))
-    registry.register(CodeExecTool())
+    # CodeExecTool requires explicit opt-in (exec() is not a true sandbox).
+    if getattr(config, "code_exec_enabled", False):
+        registry.register(CodeExecTool())
+    else:
+        logger.info(
+            "CodeExecTool not registered (set SLOTHBRAIN_CODE_EXEC_ENABLED=true to enable)"
+        )
 
     # File system
     registry.register(FileTool(config=config))

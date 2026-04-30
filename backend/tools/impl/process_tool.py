@@ -80,8 +80,15 @@ class ProcessTool(Tool):
         allowlist: list[str] = getattr(self._config, "shell_allowlist", [])
         if not allowlist:
             return False
-        cmd_lower = command.strip().lower()
-        return any(cmd_lower.startswith(prefix.lower()) for prefix in allowlist)
+        import shlex as _shlex
+        try:
+            tokens = _shlex.split(command)
+        except ValueError:
+            return False
+        if not tokens:
+            return False
+        executable = tokens[0].lower()
+        return any(executable == prefix.lower() for prefix in allowlist)
 
     async def execute(
         self,

@@ -107,7 +107,6 @@ class CodeExecTool(Tool):
     async def execute(self, code: str = "", timeout: float = _DEFAULT_TIMEOUT, **kwargs: Any) -> ToolResult:
         if not code:
             return ToolResult(ok=False, error="'code' argument is required")
-
         try:
             result = await asyncio.wait_for(
                 asyncio.to_thread(_run_code, code),

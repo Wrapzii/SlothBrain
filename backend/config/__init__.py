@@ -67,6 +67,9 @@ class AppConfig(BaseSettings):
     # When True, the shell and process tools accept any command (no allowlist check).
     # Enable only in trusted local environments.
     allow_unrestricted_shell: bool = False
+    # When True, the code_exec tool is available. Disabled by default because
+    # exec() is not a full sandbox and should only be used in trusted environments.
+    code_exec_enabled: bool = False
     # Default tool profile for the main agent ("full" gives access to every tool).
     main_tool_profile: str = "full"
 

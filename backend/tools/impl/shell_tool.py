@@ -68,8 +68,16 @@ class ShellTool(Tool):
         allowlist: list[str] = getattr(self._config, "shell_allowlist", [])
         if not allowlist:
             return False
-        cmd_lower = command.strip().lower()
-        return any(cmd_lower.startswith(prefix.lower()) for prefix in allowlist)
+        # Parse with shlex to extract only the executable name, preventing
+        # bypass via shell metacharacters (e.g. 'git;rm -rf /').
+        try:
+            tokens = shlex.split(command)
+        except ValueError:
+            return False
+        if not tokens:
+            return False
+        executable = tokens[0].lower()
+        return any(executable == prefix.lower() for prefix in allowlist)
 
     async def execute(
         self,

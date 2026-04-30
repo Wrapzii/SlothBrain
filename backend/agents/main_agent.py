@@ -345,7 +345,8 @@ class MainAgent:
                         result_dict = tool_result.to_dict()
                     except Exception as exc:
                         logger.warning("Tool %s raised: %s", tool_name, exc)
-                        result_dict = {"ok": False, "error": str(exc)}
+                        # Avoid leaking internal paths or credentials to the model.
+                        result_dict = {"ok": False, "error": "Tool execution failed"}
 
                 result_json = json.dumps(
                     {"tool": tool_name, **result_dict},
