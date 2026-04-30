@@ -217,17 +217,13 @@ class DashboardTab(Container):
 
 
 class ChatTab(Container):
-    AGENT_CHOICES = [("Auto", "auto"), ("Main", "main"), ("Watcher", "watcher")]
-
     def compose(self) -> ComposeResult:
         yield Label("[b]Chat[/b]")
-        with Horizontal(id="chat-agent-row"):
-            yield Label("Agent: ", id="agent-label")
-            yield Select(self.AGENT_CHOICES, value="auto", id="agent-select", allow_blank=False)
+        yield Label("Agentic mode only: tasks are planned and executed step-by-step.", id="agentic-label")
         yield Log(id="chat-log", highlight=True)
         with Horizontal(id="chat-input-row"):
-            yield Input(placeholder="Message (Enter to send)", id="chat-input")
-            yield Button("Send", variant="primary", id="chat-send")
+            yield Input(placeholder="Describe a task (Enter to run)", id="chat-input")
+            yield Button("Run", variant="primary", id="chat-send")
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "chat-send":
@@ -243,24 +239,37 @@ class ChatTab(Container):
         if not msg:
             return
         inp.value = ""
-        agent = self.query_one("#agent-select", Select).value
+        inp.disabled = True
+        send_btn = self.query_one("#chat-send", Button)
+        send_btn.disabled = True
         log = self.query_one("#chat-log", Log)
-        log.write_line(f"[You → {agent}] {msg}")
-        self.app.call_later(self._send_async, msg, str(agent), log)
+        log.write_line(f"[You → agentic] {msg}")
+        log.write_line("[thinking…]")
+        self.run_worker(self._send_async(msg, log), exclusive=False, name="chat-request")
 
-    async def _send_async(self, msg: str, agent: str, log: Log) -> None:
+    async def _send_async(self, msg: str, log: Log) -> None:
         try:
-            result = await api.send_chat(msg, agent)
-            reply = result.get("response") or result.get("content") or str(result)
-            log.write_line(f"[{agent}] {reply}")
+            result = await api.send_agentic_chat(msg)
+            summary = result.get("summary") or "(no summary returned)"
+            completed = result.get("completed", False)
+            verified = result.get("completion_verified", False)
+            status_bits = [
+                "completed" if completed else "incomplete",
+                "verified" if verified else "unverified",
+            ]
+            log.write_line(f"[agentic:{', '.join(status_bits)}] {summary}")
         except Exception as exc:
             log.write_line(f"[error] {exc}")
+        finally:
+            inp = self.query_one("#chat-input", Input)
+            inp.disabled = False
+            send_btn = self.query_one("#chat-send", Button)
+            send_btn.disabled = False
+            inp.focus()
 
     DEFAULT_CSS = """
     ChatTab { padding: 1; }
-    #chat-agent-row { height: auto; }
-    #agent-label { width: auto; margin-top: 1; }
-    #agent-select { width: 20; }
+    #agentic-label { color: $accent; margin-top: 1; }
     #chat-log { height: 1fr; border: round $primary; margin-top: 1; }
     #chat-input-row { height: auto; margin-top: 1; }
     #chat-input { width: 1fr; }

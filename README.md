@@ -22,12 +22,11 @@
 
 ```
 ┌───────────────────────────────────────────────────────────────────┐
-│                        React Frontend (Vite)                       │
-│   Dashboard │ Chat │ Settings │ Benchmarks │ Agent Presets         │
-│   WebSocket live stats ──────────────────────────────────────────┐│
-└────────────────────────────┬──────────────────────────────────────┘│
-                             │ HTTP / WS                             │
-┌────────────────────────────▼──────────────────────────────────────▼┐
+│                     Python TUI (Textual)                           │
+│    Dashboard │ Chat │ Settings │ Benchmarks │ Agents │ Approvals   │
+└────────────────────────────┬───────────────────────────────────────┘
+                             │ HTTP / WS
+┌────────────────────────────▼────────────────────────────────────────┐
 │                      FastAPI Backend (Python)                        │
 │                                                                      │
 │  ┌──────────────────────────────────────────────────────────────┐  │
@@ -87,32 +86,23 @@
 - Node.js 18+
 - A running [llama.cpp](https://github.com/ggerganov/llama.cpp) server with `--parallel 2`
 
-### Backend
+### Install Dependencies
 
 ```bash
 # From repo root
 pip install -r requirements.txt
-
-# Start the API server
-uvicorn backend.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-### Terminal Interface (Recommended)
+### Start SlothBrain
 
 ```bash
 # From repo root
-python -m backend.cli
-# or
-python -m backend.cli --agent main
+python run_slothbrain.py
 ```
 
-### Optional Web Frontend
-
-```bash
-cd frontend
-npm install
-npm run dev        # Dev server on http://localhost:5173
-```
+This single command starts:
+- FastAPI backend on `127.0.0.1:8000`
+- Textual TUI in the same terminal session
 
 ---
 
@@ -146,28 +136,18 @@ SLOTHBRAIN_MODE=active
 
 ## Usage
 
-### Chat (Terminal)
+### Chat
 
 Run:
 
 ```bash
-python -m backend.cli
+python run_slothbrain.py
 ```
 
-Built-in commands:
-
-- `/agent auto|watcher|main`
-- `/mode idle|active`
-- `/status`
-- `/help`
-- `/quit`
-
-### Chat (Web, optional)
-
-Navigate to the **Chat** tab. Select an agent routing strategy:
-- **auto** – Watcher handles the request; if it detects a complex task it hands off to Main.
-- **watcher** – Always use the lightweight Watcher agent (slot 0).
-- **main** – Always use the high-performance Main agent (slot 1).
+In the TUI Chat tab, chat runs in **Agentic** mode only:
+- The task is planned and executed step-by-step.
+- The Watcher monitors each step and provides feedback/retries.
+- The final task summary is shown in the chat panel.
 
 ### Resource Modes
 
@@ -194,7 +174,7 @@ The loop automatically: plans steps → saves checkpoints → executes → monit
 |---|---|---|
 | GET | `/health` | Liveness check |
 | GET | `/api/status` | System stats + slot info |
-| POST | `/api/chat` | Send a message (auto/watcher/main routing) |
+| POST | `/api/chat` | Agentic chat alias (backward-compatible) |
 | POST | `/api/chat/agentic` | Run a full multi-step agentic task |
 | GET/POST | `/api/mode` | Get/set operating mode |
 | GET/POST | `/api/settings` | Get/update configuration |
@@ -268,10 +248,10 @@ SlothBrain/
 │   ├── memory/          # LanceDBMemory, RollingContext
 │   ├── tests/           # pytest unit + integration tests
 │   ├── vision/          # DesktopController, ActionExecutor, ScreenGrid, OCR
-│   ├── cli.py           # Terminal interface
+│   ├── cli.py           # Legacy terminal interface (optional)
 │   └── main.py          # FastAPI app + lifespan wiring
-├── frontend/            # Vite + React dashboard (optional)
 ├── tui/                 # Textual TUI (optional)
+├── run_slothbrain.py    # Single-command launcher (backend + TUI)
 ├── data/                # LanceDB, audit.log, agent presets, backups (gitignored)
 ├── docs/                # In-depth architecture and API docs
 ├── IMPLEMENTATION.md    # Architecture deep-dive

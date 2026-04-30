@@ -16,7 +16,7 @@ async def get(path: str) -> Any:
 
 
 async def post(path: str, data: Optional[dict] = None) -> Any:
-    async with httpx.AsyncClient(timeout=120) as c:
+    async with httpx.AsyncClient(timeout=600) as c:
         r = await c.post(f"{BASE}{path}", json=data or {})
         r.raise_for_status()
         return r.json()
@@ -65,8 +65,8 @@ async def emergency_stop() -> dict:
 
 # --- Chat ---
 
-async def send_chat(message: str, agent: str = "auto") -> dict:
-    return await post("/api/chat", {"message": message, "agent": agent})
+async def send_agentic_chat(task: str, max_steps: int = 10) -> dict:
+    return await post("/api/chat/agentic", {"task": task, "max_steps": max_steps})
 
 
 async def chat_with_agent(agent_id: str, message: str) -> dict:

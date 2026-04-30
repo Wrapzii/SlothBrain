@@ -5,10 +5,11 @@ import re
 from backend.core.llama_client import LlamaClient
 
 
-_STOP_SEQUENCES = ["\nuser:", "\nassistant:", "\nsystem:", "\n# Response"]
+_STOP_SEQUENCES = ["\nuser:", "\nassistant:", "\nsystem:", "\n# Response", "<think>"]
 _RESPONSE_PREFIX_RE = re.compile(
     r"(?is)^(?:\s*(?:system|user|assistant):.*?)+\s*(?:#\s*Response\s*)?"
 )
+
 
 
 def _sanitize_response(response: str) -> str:

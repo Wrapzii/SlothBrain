@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import re
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Awaitable, Callable, Optional
 
 from backend.config import AppConfig
 from backend.core.slot_manager import SlotManager
@@ -138,7 +139,8 @@ class MainAgent:
         self._registry: AgentRegistry | None = None
         self._tool_registry: "ToolRegistry | None" = None
         self._tool_profile: str = getattr(config, "main_tool_profile", "full")
-
+        # Guardrail: cap injected tool transcript size to avoid runaway prompt growth.
+        self._MAX_TOOL_CONTEXT_CHARS = 6000
     def set_registry(self, registry: "AgentRegistry") -> None:
         """Inject the AgentRegistry so MainAgent can spawn sub-agents."""
         self._registry = registry
@@ -238,10 +240,16 @@ class MainAgent:
         - ``approach``: brief description of the overall strategy.
         - ``steps``: list of step description strings (max 10).
         """
+        # NOTE: The plan prompt MUST share the same system-prompt prefix as
+        # execute_step so llama.cpp can reuse the KV cache between planning and
+        # execution calls on the same slot.  Using a different system prompt
+        # (e.g. "You are a planning AI") invalidates the cache and forces a
+        # full re-process of the entire prompt on every call.
         plan_prompt = (
-            "system: You are a planning AI. Break the following task into clear, "
-            "actionable steps that an AI agent can execute one at a time.\n\n"
-            "You MUST respond with a single valid JSON object and nothing else:\n"
+            f"system: {self.system_prompt}\n\n"
+            "Break the following task into clear, actionable steps that you can "
+            "execute one at a time.\n\n"
+            "Respond with a single valid JSON object only:\n"
             '{"approach": "<brief strategy description>", '
             '"steps": ["<step 1>", "<step 2>", ...]}\n\n'
             "Rules:\n"
@@ -251,8 +259,11 @@ class MainAgent:
             f"Task: {task}\nassistant:"
         )
         try:
+            # 512 tokens is ample for a JSON plan object (≤10 steps).
+            # Using 1024 caused the model to hit the limit and produce a
+            # truncated / non-parseable response that fell back to a single step.
             response = await self._slot_manager.send_to_main(
-                plan_prompt, max_tokens=1024
+                plan_prompt, max_tokens=512
             )
         except Exception as exc:
             logger.warning("plan_task failed: %s", exc.__class__.__name__)
@@ -265,6 +276,7 @@ class MainAgent:
         step: str,
         task: str,
         context: list[str] | None = None,
+        on_event: Callable[[dict], Awaitable[dict | None] | dict | None] | None = None,
     ) -> str:
         """Execute a single step within a larger task.
 
@@ -320,7 +332,27 @@ class MainAgent:
         accumulated_tool_context = ""
         for iteration in range(_MAX_TOOL_ITERATIONS):
             prompt = step_prompt + accumulated_tool_context
-            response = await self._slot_manager.send_to_main(prompt, max_tokens=2048)
+            try:
+                response = await self._slot_manager.send_to_main(prompt, max_tokens=512)
+            except Exception as exc:
+                if on_event is not None:
+                    maybe = on_event(
+                        {
+                            "type": "model_error",
+                            "error": exc.__class__.__name__,
+                            "message": str(exc),
+                        }
+                    )
+                    intervention = await maybe if inspect.isawaitable(maybe) else maybe
+                    if intervention:
+                        return intervention.get("message", "Execution paused by SafetySupervisor.")
+                raise
+
+            if on_event is not None:
+                maybe = on_event({"type": "model_output", "output": response})
+                intervention = await maybe if inspect.isawaitable(maybe) else maybe
+                if intervention:
+                    return intervention.get("message", "Execution paused by SafetySupervisor.")
 
             # No tool registry or no tools → return directly
             if self._tool_registry is None or not tools:
@@ -336,6 +368,19 @@ class MainAgent:
             for tc in tool_calls:
                 tool_name = tc["tool"]
                 tool_args = tc.get("args", {})
+
+                if on_event is not None:
+                    maybe = on_event(
+                        {
+                            "type": "tool_call",
+                            "tool": tool_name,
+                            "args": tool_args,
+                        }
+                    )
+                    intervention = await maybe if inspect.isawaitable(maybe) else maybe
+                    if intervention:
+                        return intervention.get("message", "Execution paused by SafetySupervisor.")
+
                 tool = self._tool_registry.get(tool_name)
                 if tool is None:
                     result_dict = {"ok": False, "error": f"Unknown tool: {tool_name!r}"}
@@ -348,6 +393,21 @@ class MainAgent:
                         # Avoid leaking internal paths or credentials to the model.
                         result_dict = {"ok": False, "error": "Tool execution failed"}
 
+                if on_event is not None:
+                    maybe = on_event(
+                        {
+                            "type": "tool_result",
+                            "tool": tool_name,
+                            "args": tool_args,
+                            "ok": bool(result_dict.get("ok")),
+                            "output": result_dict.get("output"),
+                            "error": result_dict.get("error"),
+                        }
+                    )
+                    intervention = await maybe if inspect.isawaitable(maybe) else maybe
+                    if intervention:
+                        return intervention.get("message", "Execution paused by SafetySupervisor.")
+
                 result_json = json.dumps(
                     {"tool": tool_name, **result_dict},
                     ensure_ascii=False,
@@ -358,6 +418,8 @@ class MainAgent:
                 )
 
             accumulated_tool_context += "\n" + "\n".join(tool_result_lines) + "\nassistant:"
+            if len(accumulated_tool_context) > self._MAX_TOOL_CONTEXT_CHARS:
+                accumulated_tool_context = accumulated_tool_context[-self._MAX_TOOL_CONTEXT_CHARS:]
 
         # Iteration limit reached — return last response
         return response

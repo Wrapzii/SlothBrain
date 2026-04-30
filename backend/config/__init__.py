@@ -40,6 +40,9 @@ class AppConfig(BaseSettings):
     # llama-server process management
     llama_server_path: str = ""
     llama_server_args: list[str] = []
+    # Optional hard cap for effective per-slot context budget.
+    # Set to 0 to disable and rely on /slots metadata.
+    llama_slot_context_cap: int = 0
     max_restarts_per_hour: int = 3
     enable_server_watchdog: bool = True
 
@@ -57,6 +60,16 @@ class AppConfig(BaseSettings):
     # Safety supervisor settings
     supervisor_poll_interval: float = 15.0   # seconds between supervision polls
     supervisor_step_timeout: float = 120.0   # seconds before a step is declared stalled
+    supervisor_slowdown_monitor_enabled: bool = True
+    supervisor_slowdown_threshold_tps: float = 20.0
+    supervisor_slowdown_consecutive_polls: int = 3
+    supervisor_slowdown_restart_enabled: bool = False
+    supervisor_slowdown_cooldown_seconds: float = 300.0
+    supervisor_max_repeated_tool_calls: int = 3
+    supervisor_max_failed_tool_calls: int = 3
+    supervisor_max_no_progress_steps: int = 3
+    supervisor_max_empty_responses: int = 2
+    supervisor_max_give_up_signals: int = 1
 
     # Tool system settings
     # Root directory that file/patch/diff tools are confined to.
@@ -70,8 +83,9 @@ class AppConfig(BaseSettings):
     # When True, the code_exec tool is available. Disabled by default because
     # exec() is not a full sandbox and should only be used in trusted environments.
     code_exec_enabled: bool = False
-    # Default tool profile for the main agent ("full" gives access to every tool).
-    main_tool_profile: str = "full"
+    # Default tool profile for the main agent.
+    # "minimal" keeps prompts small; set to "full" only when tool-heavy tasks need it.
+    main_tool_profile: str = "minimal"
 
     # Discord integration (optional – leave empty to disable DiscordTool)
     discord_webhook_url: str = ""
@@ -117,11 +131,52 @@ class AppConfig(BaseSettings):
             raise ValueError("max_restarts_per_hour must be at least 1")
         return v
 
+    @field_validator("llama_slot_context_cap")
+    @classmethod
+    def _validate_slot_context_cap(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError("llama_slot_context_cap must be >= 0")
+        return v
+
     @field_validator("max_pending_approvals")
     @classmethod
     def _validate_max_pending_approvals(cls, v: int) -> int:
         if v < 1:
             raise ValueError("max_pending_approvals must be at least 1")
+        return v
+
+    @field_validator("supervisor_slowdown_threshold_tps")
+    @classmethod
+    def _validate_slowdown_threshold(cls, v: float) -> float:
+        if v <= 0:
+            raise ValueError("supervisor_slowdown_threshold_tps must be > 0")
+        return v
+
+    @field_validator("supervisor_slowdown_consecutive_polls")
+    @classmethod
+    def _validate_slowdown_polls(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError("supervisor_slowdown_consecutive_polls must be at least 1")
+        return v
+
+    @field_validator("supervisor_slowdown_cooldown_seconds")
+    @classmethod
+    def _validate_slowdown_cooldown(cls, v: float) -> float:
+        if v < 0:
+            raise ValueError("supervisor_slowdown_cooldown_seconds must be >= 0")
+        return v
+
+    @field_validator(
+        "supervisor_max_repeated_tool_calls",
+        "supervisor_max_failed_tool_calls",
+        "supervisor_max_no_progress_steps",
+        "supervisor_max_empty_responses",
+        "supervisor_max_give_up_signals",
+    )
+    @classmethod
+    def _validate_supervisor_positive_thresholds(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError("supervisor detection thresholds must be at least 1")
         return v
 
     model_config = {"env_prefix": "SLOTHBRAIN_", "env_file": ".env", "extra": "ignore"}

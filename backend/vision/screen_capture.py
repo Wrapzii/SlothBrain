@@ -16,8 +16,11 @@ class ScreenInfo(NamedTuple):
     image_bytes: bytes   # PNG bytes
 
 
-def capture_screen(monitor: int = 1) -> ScreenInfo:
-    """Capture the primary monitor and return PNG bytes + dimensions.
+def capture_screen(monitor: int = 0) -> ScreenInfo:
+    """Capture a monitor and return PNG bytes + dimensions.
+
+    With ``mss``, ``monitor=0`` captures the virtual desktop (all monitors),
+    while ``monitor>=1`` captures a specific monitor index.
 
     Uses ``mss`` if available, falls back to ``pyautogui.screenshot``.
     Raises ``RuntimeError`` if neither backend is available.
@@ -26,7 +29,14 @@ def capture_screen(monitor: int = 1) -> ScreenInfo:
         import mss
         import mss.tools
         with mss.mss() as sct:
-            mon = sct.monitors[monitor]
+            monitors = sct.monitors
+            if not monitors:
+                raise RuntimeError("No monitors detected for screenshot capture.")
+            if monitor < 0 or monitor >= len(monitors):
+                raise ValueError(
+                    f"Invalid monitor index {monitor}. Valid range is 0..{len(monitors) - 1}."
+                )
+            mon = monitors[monitor]
             shot = sct.grab(mon)
             png = mss.tools.to_png(shot.rgb, shot.size)
             return ScreenInfo(

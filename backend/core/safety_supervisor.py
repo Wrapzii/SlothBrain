@@ -1,45 +1,27 @@
 """Safety supervisor for the agentic loop.
 
-A lightweight *pure-Python* watchdog that monitors running ``AgenticLoop``
-instances.  It does **not** depend on the LLM being healthy; it only calls the
-Judge LLM opportunistically (best-effort) when a free slot is available.
-
-Architecture
-------------
-- ``SafetySupervisor`` runs a single asyncio background task (``_run``) that
-  polls every ``poll_interval`` seconds.
-- Each loop run registers a ``LoopHandle`` with the supervisor at start-up and
-  deregisters when it finishes.
-- The loop calls ``LoopHandle.heartbeat()`` at the *start* of every step to
-  signal liveness.
-- If a step runs for longer than ``step_timeout`` seconds the supervisor marks
-  it as stalled, restores the last checkpoint, and optionally calls the Judge.
-- The Judge returns one of five actions:
-    nudge             – send a reminder to the loop to continue
-    reset_context     – clear accumulated context back to the checkpoint
-    retry_step        – retry just the current step
-    end_task          – stop the loop cleanly
-    escalate_to_user  – stop and surface the situation to the human operator
-- The loop checks for pending interventions via ``LoopHandle.pop_intervention()``
-  and applies the recovery action immediately.
-
-TODO: Wrap _call_judge in asyncio.wait_for to prevent a slow Judge from blocking
-      the supervisor while other handles need servicing. See BUGS.md BUG-001.
-TODO: Add a supervisor metrics endpoint (stall counts, intervention distribution).
+Pure-Python watchdog for detecting model/runtime failure modes without relying
+on an additional LLM judge. The supervisor now classifies failures directly
+from execution events (tool calls/results and model outputs), plus heartbeat and
+throughput monitoring.
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import re
 import time
+from dataclasses import dataclass
+from collections import deque
 from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
     from backend.core.checkpoint_manager import CheckpointManager, TaskCheckpoint
     from backend.core.llama_client import LlamaClient
+    from backend.core.server_manager import ServerManager
 
 logger = logging.getLogger(__name__)
 
@@ -53,91 +35,58 @@ _DEFAULT_STEP_TIMEOUT: float = 120.0
 # How often the supervisor polls active loops.
 _DEFAULT_POLL_INTERVAL: float = 15.0
 
-# Valid Judge actions (sorted by ascending severity so the keyword scan below
-# always matches the *least* severe option when multiple appear).
-_VALID_JUDGE_ACTIONS = (
-    "nudge",
-    "reset_context",
-    "retry_step",
-    "end_task",
-    "escalate_to_user",
-)
-
-_JUDGE_SYSTEM_PROMPT = (
-    "You are an AI task supervisor. A running agent appears to be stuck or has "
-    "produced an error. Review the recent history and checkpoint summary, then "
-    "decide the best recovery action.\n\n"
-    "You MUST respond with a single valid JSON object and nothing else:\n"
-    '{"action": "<action>", "message": "<brief explanation>"}\n\n'
-    "Valid action values (choose exactly one):\n"
-    "  nudge            – send a gentle reminder to continue the current step\n"
-    "  reset_context    – clear accumulated context and retry from the checkpoint\n"
-    "  retry_step       – retry only the current step without clearing context\n"
-    "  end_task         – the task cannot be completed; stop cleanly\n"
-    "  escalate_to_user – the situation requires human input\n\n"
-    "Severity order (prefer lower severity when uncertain): "
-    "nudge < retry_step < reset_context < end_task < escalate_to_user"
+_GIVE_UP_PATTERNS = (
+    "i can't",
+    "cannot continue",
+    "i am stuck",
+    "i'm stuck",
+    "unable to proceed",
+    "give up",
 )
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Response parsing
-# ──────────────────────────────────────────────────────────────────────────────
+@dataclass
+class SlowdownSnapshot:
+    tokens_per_sec: float
+    metric_name: str
 
 
-def _parse_judge_response(response: str) -> dict:
-    """Extract action and message from the Judge LLM response.
+def _extract_tps_from_metrics(metrics_text: str) -> SlowdownSnapshot | None:
+    """Best-effort parser for llama.cpp Prometheus metrics token throughput.
 
-    Tries JSON parsing first (preferred — the prompt requests JSON output).
-    Falls back to regex key extraction and ultimately to a keyword scan so
-    the supervisor never crashes on unexpected model output.
-
-    Returns a dict with keys ``action`` and ``message``.
+    We accept several common metric names seen across llama.cpp builds and use
+    the first finite value encountered.
     """
-    # ── Attempt 1: JSON parse ─────────────────────────────────────────────
-    # The model may wrap JSON in a markdown code fence; try to extract it.
-    # Fall back to the full stripped response if no fence/object is found.
-    stripped = response.strip()
-    fence_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", stripped, re.DOTALL)
-    if fence_match:
-        json_candidate = fence_match.group(1)
-    else:
-        obj_match = re.search(r"\{[^{}]*\}", stripped, re.DOTALL)
-        json_candidate = obj_match.group(0) if obj_match else stripped
-
-    try:
-        data = json.loads(json_candidate)
-        action = str(data.get("action", "nudge")).strip().lower()
-        if action not in _VALID_JUDGE_ACTIONS:
-            action = "nudge"
-        message = str(data.get("message", "")).strip()[:400]
-        return {"action": action, "message": message}
-    except (json.JSONDecodeError, AttributeError, TypeError):
-        pass
-
-    # ── Attempt 2: Regex key extraction ──────────────────────────────────
-    lower = response.lower()
-    action = "nudge"
-    action_match = re.search(r'"?action"?\s*:\s*"?(\w+)"?', lower)
-    if action_match:
-        candidate = action_match.group(1).strip()
-        if candidate in _VALID_JUDGE_ACTIONS:
-            action = candidate
-    else:
-        # ── Attempt 3: Keyword scan in severity order ─────────────────────
-        for keyword in _VALID_JUDGE_ACTIONS:
-            if keyword.replace("_", " ") in lower or keyword in lower:
-                action = keyword
-                break
-
-    message = response.strip()
-    msg_match = re.search(
-        r'"?message"?\s*:\s*"?(.+)"?', response, re.IGNORECASE | re.DOTALL
+    candidates = (
+        "llama_tokens_per_second",
+        "llamacpp_tokens_per_second",
+        "tokens_per_second",
+        "generation_tokens_per_second",
     )
-    if msg_match:
-        message = msg_match.group(1).strip().rstrip('"').strip()[:400]
 
-    return {"action": action, "message": message}
+    for raw in metrics_text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        name = parts[0]
+        for metric in candidates:
+            if metric in name:
+                try:
+                    value = float(parts[-1])
+                except ValueError:
+                    continue
+                if value >= 0:
+                    return SlowdownSnapshot(tokens_per_sec=value, metric_name=name)
+    return None
+
+
+def _fingerprint_payload(payload: dict) -> str:
+    """Stable short hash for tool call argument comparisons."""
+    canonical = json.dumps(payload, sort_keys=True, ensure_ascii=True, default=str)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -161,6 +110,18 @@ class LoopHandle:
         self._intervention: dict | None = None
         self._lock = asyncio.Lock()
         self._active: bool = True
+        self._tool_call_history: deque[str] = deque(maxlen=16)
+        self._progress_fingerprints: deque[str] = deque(maxlen=10)
+        self._consecutive_failed_tools: int = 0
+        self._consecutive_empty_or_malformed: int = 0
+        self._give_up_signal_count: int = 0
+        self._last_detected_key: str = ""
+
+        self._max_repeated_tool_calls: int = 3
+        self._max_failed_tool_calls: int = 3
+        self._max_no_progress_steps: int = 3
+        self._max_empty_or_malformed: int = 2
+        self._max_give_up_signals: int = 1
 
     # ------------------------------------------------------------------
     # Called by the loop
@@ -182,6 +143,111 @@ class LoopHandle:
         self.task = task
         # Keep only the 4 most recent context lines to bound memory
         self.recent_context = list(context[-4:]) if context else []
+
+    def configure_detection_thresholds(
+        self,
+        *,
+        max_repeated_tool_calls: int,
+        max_failed_tool_calls: int,
+        max_no_progress_steps: int,
+        max_empty_or_malformed: int,
+        max_give_up_signals: int,
+    ) -> None:
+        self._max_repeated_tool_calls = max(1, max_repeated_tool_calls)
+        self._max_failed_tool_calls = max(1, max_failed_tool_calls)
+        self._max_no_progress_steps = max(1, max_no_progress_steps)
+        self._max_empty_or_malformed = max(1, max_empty_or_malformed)
+        self._max_give_up_signals = max(1, max_give_up_signals)
+
+    def observe_model_output(self, output: str, malformed: bool = False) -> dict | None:
+        text = (output or "").strip()
+        lowered = text.lower()
+
+        if malformed or not text:
+            self._consecutive_empty_or_malformed += 1
+        else:
+            self._consecutive_empty_or_malformed = 0
+
+        if any(p in lowered for p in _GIVE_UP_PATTERNS):
+            self._give_up_signal_count += 1
+
+        if self._consecutive_empty_or_malformed >= self._max_empty_or_malformed:
+            return self._build_detection_intervention(
+                "no_response",
+                "Model returned empty or malformed output repeatedly; restoring checkpoint.",
+            )
+
+        if self._give_up_signal_count >= self._max_give_up_signals:
+            return self._build_detection_intervention(
+                "model_gave_up",
+                "Model indicated it is stuck or unable to proceed; restoring checkpoint.",
+            )
+
+        return None
+
+    def observe_tool_call(self, tool_name: str, args: dict | None) -> dict | None:
+        fp = f"{tool_name}:{_fingerprint_payload(args or {})}"
+        self._tool_call_history.append(fp)
+
+        if len(self._tool_call_history) < self._max_repeated_tool_calls:
+            return None
+
+        tail = list(self._tool_call_history)[-self._max_repeated_tool_calls :]
+        if len(set(tail)) == 1:
+            return self._build_detection_intervention(
+                "looping_tool_calls",
+                f"Detected repeated tool loop for '{tool_name}' with near-identical arguments.",
+            )
+        return None
+
+    def observe_tool_result(self, ok: bool, output: object, error: str | None) -> dict | None:
+        if not ok:
+            self._consecutive_failed_tools += 1
+        else:
+            self._consecutive_failed_tools = 0
+
+        if self._consecutive_failed_tools >= self._max_failed_tool_calls:
+            return self._build_detection_intervention(
+                "failed_actions",
+                "Multiple consecutive tool failures detected without progress.",
+            )
+
+        # Best-effort no-change fingerprinting from successful tool outputs.
+        if ok:
+            marker = _fingerprint_payload({"output": output, "error": error})
+            self._progress_fingerprints.append(marker)
+            if len(self._progress_fingerprints) >= self._max_no_progress_steps:
+                tail = list(self._progress_fingerprints)[-self._max_no_progress_steps :]
+                if len(set(tail)) == 1:
+                    return self._build_detection_intervention(
+                        "stalled_progress",
+                        "Consecutive tool results show no meaningful state change; restoring checkpoint.",
+                    )
+
+        return None
+
+    def observe_step_result(self, step_result: str) -> dict | None:
+        marker = _fingerprint_payload({"step_result": (step_result or "").strip()[:300]})
+        self._progress_fingerprints.append(marker)
+        if len(self._progress_fingerprints) >= self._max_no_progress_steps:
+            tail = list(self._progress_fingerprints)[-self._max_no_progress_steps :]
+            if len(set(tail)) == 1:
+                return self._build_detection_intervention(
+                    "stalled_progress",
+                    "Recent step outputs are effectively unchanged; restoring checkpoint.",
+                )
+        return None
+
+    def _build_detection_intervention(self, category: str, message: str) -> dict:
+        key = f"{category}:{self.current_step}"
+        if key == self._last_detected_key:
+            return {}
+        self._last_detected_key = key
+        return {
+            "action": "reset_context",
+            "category": category,
+            "message": message,
+        }
 
     async def pop_intervention(self) -> dict | None:
         """Atomically retrieve and clear any pending supervisor intervention.
@@ -252,11 +318,35 @@ class SafetySupervisor:
         checkpoint_manager: "CheckpointManager",
         poll_interval: float = _DEFAULT_POLL_INTERVAL,
         step_timeout: float = _DEFAULT_STEP_TIMEOUT,
+        server_manager: "ServerManager | None" = None,
+        slowdown_monitor_enabled: bool = True,
+        slowdown_threshold_tps: float = 20.0,
+        slowdown_consecutive_polls: int = 3,
+        slowdown_restart_enabled: bool = False,
+        slowdown_cooldown_seconds: float = 300.0,
+        max_repeated_tool_calls: int = 3,
+        max_failed_tool_calls: int = 3,
+        max_no_progress_steps: int = 3,
+        max_empty_or_malformed: int = 2,
+        max_give_up_signals: int = 1,
     ) -> None:
         self._client = llama_client
         self._cp = checkpoint_manager
         self._poll_interval = poll_interval
         self._step_timeout = step_timeout
+        self._server_manager = server_manager
+        self._slowdown_monitor_enabled = slowdown_monitor_enabled
+        self._slowdown_threshold_tps = slowdown_threshold_tps
+        self._slowdown_consecutive_polls = slowdown_consecutive_polls
+        self._slowdown_restart_enabled = slowdown_restart_enabled
+        self._slowdown_cooldown_seconds = slowdown_cooldown_seconds
+        self._slowdown_breach_count: int = 0
+        self._last_slowdown_action_ts: float = 0.0
+        self._max_repeated_tool_calls = max_repeated_tool_calls
+        self._max_failed_tool_calls = max_failed_tool_calls
+        self._max_no_progress_steps = max_no_progress_steps
+        self._max_empty_or_malformed = max_empty_or_malformed
+        self._max_give_up_signals = max_give_up_signals
         self._handles: dict[str, LoopHandle] = {}
         self._task: Optional["asyncio.Task[None]"] = None
         self._running: bool = False
@@ -294,6 +384,13 @@ class SafetySupervisor:
     def register(self, run_id: str) -> LoopHandle:
         """Register a new loop run and return its ``LoopHandle``."""
         handle = LoopHandle(run_id=run_id)
+        handle.configure_detection_thresholds(
+            max_repeated_tool_calls=self._max_repeated_tool_calls,
+            max_failed_tool_calls=self._max_failed_tool_calls,
+            max_no_progress_steps=self._max_no_progress_steps,
+            max_empty_or_malformed=self._max_empty_or_malformed,
+            max_give_up_signals=self._max_give_up_signals,
+        )
         self._handles[run_id] = handle
         logger.debug("SafetySupervisor: registered run %s", run_id)
         return handle
@@ -337,6 +434,8 @@ class SafetySupervisor:
     async def _poll(self) -> None:
         """Check all active handles and handle any stalls.  Called by _run and
         exposed for testing as ``_run_once``."""
+        await self._monitor_throughput_slowdown()
+
         stalled = [
             h
             for h in list(self._handles.values())
@@ -361,68 +460,73 @@ class SafetySupervisor:
     async def _handle_stall(self, handle: LoopHandle) -> None:
         """Restore the last checkpoint and inject a recovery intervention."""
         cp = self._cp.restore_last(handle.run_id)
-        intervention = await self._call_judge(handle, cp)
+        cp_suffix = ""
+        if cp is not None:
+            cp_suffix = f" Last checkpoint is step {cp.step_num}."
+        intervention = {
+            "action": "reset_context",
+            "category": "stalled_step",
+            "message": (
+                "Step timed out without heartbeat progress; restoring the last clean checkpoint."
+                + cp_suffix
+            ),
+        }
         await handle.set_intervention(intervention)
 
-    async def _call_judge(
-        self,
-        handle: LoopHandle,
-        checkpoint: "Optional[TaskCheckpoint]",
-    ) -> dict:
-        """Ask the Judge LLM for a recovery decision.
-
-        Constructs a structured prompt requesting JSON output, then parses the
-        response with ``_parse_judge_response`` (JSON-first, regex fallback).
-
-        Falls back to ``nudge`` on any error so the supervisor never crashes
-        the loop.
-
-        TODO: Add asyncio.wait_for with a configurable timeout (e.g. 30 s) to
-              prevent a slow Judge from blocking supervision of other handles.
-              See BUGS.md BUG-001.
-        """
-        context_str = "\n".join(handle.recent_context) or "(no context yet)"
-        cp_info = ""
-        if checkpoint:
-            cp_info = (
-                f"Last good checkpoint: step {checkpoint.step_num}, "
-                f"{len(checkpoint.executed_steps)} step(s) completed."
-            )
-
-        prompt = (
-            f"system: {_JUDGE_SYSTEM_PROMPT}\n\n"
-            f"Task: {handle.task}\n"
-            f"Currently on step: {handle.current_step}\n"
-            f"Time without progress: {handle.seconds_since_heartbeat():.0f}s\n"
-            f"{cp_info}\n"
-            f"Recent context:\n{context_str}\n"
-            'Respond with only a JSON object: {"action": "...", "message": "..."}\n'
-            "assistant:"
-        )
+    async def _monitor_throughput_slowdown(self) -> None:
+        """Detect sustained low llama throughput and report/restart defensively."""
+        if not self._slowdown_monitor_enabled:
+            return
 
         try:
-            # slot_id=-1 → llama.cpp picks any free slot (non-blocking)
-            response = await self._client.complete(
-                prompt=prompt,
-                slot_id=-1,
-                max_tokens=128,
-                temperature=0.3,
-            )
-            decision = _parse_judge_response(response)
-            logger.info(
-                "Judge decision for run %s: %s – %s",
-                handle.run_id,
-                decision["action"],
-                decision["message"][:80],
-            )
-            return decision
+            metrics_text = await self._client.get_metrics()
         except Exception as exc:
-            logger.warning(
-                "Judge call failed for run %s (%s); defaulting to nudge",
-                handle.run_id,
-                exc.__class__.__name__,
-            )
-            return {
-                "action": "nudge",
-                "message": "Step appears stalled; nudging to continue.",
-            }
+            logger.debug("Slowdown monitor skipped (metrics unavailable): %s", exc.__class__.__name__)
+            self._slowdown_breach_count = 0
+            return
+
+        snapshot = _extract_tps_from_metrics(metrics_text)
+        if snapshot is None:
+            self._slowdown_breach_count = 0
+            return
+
+        tps = snapshot.tokens_per_sec
+        if tps >= self._slowdown_threshold_tps:
+            self._slowdown_breach_count = 0
+            return
+
+        self._slowdown_breach_count += 1
+        logger.warning(
+            "SafetySupervisor slowdown sample %d/%d: %.2f tok/s (< %.2f) via %s",
+            self._slowdown_breach_count,
+            self._slowdown_consecutive_polls,
+            tps,
+            self._slowdown_threshold_tps,
+            snapshot.metric_name,
+        )
+
+        if self._slowdown_breach_count < self._slowdown_consecutive_polls:
+            return
+
+        now = time.monotonic()
+        in_cooldown = (now - self._last_slowdown_action_ts) < self._slowdown_cooldown_seconds
+        if in_cooldown:
+            return
+
+        self._last_slowdown_action_ts = now
+        self._slowdown_breach_count = 0
+
+        logger.error(
+            "Detected sustained llama slowdown: %.2f tok/s below threshold %.2f",
+            tps,
+            self._slowdown_threshold_tps,
+        )
+
+        if self._slowdown_restart_enabled and self._server_manager is not None:
+            try:
+                await self._server_manager.restart(actor="safety_supervisor_slowdown")
+                logger.warning("SafetySupervisor triggered llama-server restart after slowdown detection")
+            except Exception as exc:
+                logger.error("Slowdown restart failed: %s: %s", exc.__class__.__name__, exc)
+
+    # The former LLM Judge path has been intentionally removed.

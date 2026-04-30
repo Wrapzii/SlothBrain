@@ -57,6 +57,9 @@ logger = logging.getLogger(__name__)
 # Maximum watcher-requested retries for a single step before moving on.
 _MAX_STEP_RETRIES = 2
 
+# Guardrail: cap persisted step context to avoid prompt/context blow-up.
+_MAX_STEP_CONTEXT_CHARS = 1200
+
 
 class AgenticStep:
     """Represents the state of one step in the agentic execution loop."""
@@ -334,11 +337,44 @@ class AgenticLoop:
                             # Fall through to normal execution
 
                 # ── Execute step ─────────────────────────────────────────
+                async def _on_step_event(event: dict) -> dict | None:
+                    if handle is None:
+                        return None
+                    et = event.get("type")
+                    detected: dict | None = None
+                    if et == "model_output":
+                        detected = handle.observe_model_output(
+                            output=str(event.get("output", "")),
+                            malformed=False,
+                        )
+                    elif et == "model_error":
+                        detected = handle.observe_model_output(
+                            output="",
+                            malformed=True,
+                        )
+                    elif et == "tool_call":
+                        detected = handle.observe_tool_call(
+                            tool_name=str(event.get("tool", "")),
+                            args=event.get("args") if isinstance(event.get("args"), dict) else {},
+                        )
+                    elif et == "tool_result":
+                        detected = handle.observe_tool_result(
+                            ok=bool(event.get("ok")),
+                            output=event.get("output"),
+                            error=event.get("error") if isinstance(event.get("error"), str) else None,
+                        )
+
+                    if detected:
+                        await handle.set_intervention(detected)
+                        return detected
+                    return None
+
                 try:
                     result = await self._main.execute_step(
                         step=description,
                         task=task,
                         context=context,
+                        on_event=_on_step_event,
                     )
                     step.result = result
                 except Exception as exc:
@@ -348,7 +384,22 @@ class AgenticLoop:
                         attempt + 1,
                         exc,
                     )
+                    if (
+                        isinstance(exc, ValueError)
+                        and "context window exceeded" in str(exc).lower()
+                    ):
+                        final_action = "abort"
+                        step.result = (
+                            "Execution aborted: llama.cpp context window exceeded. "
+                            "Reduce context growth or reset task state."
+                        )
+                        break
                     step.result = f"Execution error: {exc.__class__.__name__}"
+
+                if handle is not None:
+                    post_detection = handle.observe_step_result(step.result)
+                    if post_detection:
+                        await handle.set_intervention(post_detection)
 
                 # ── Optional screenshot ───────────────────────────────────
                 if self._screenshot_fn is not None:
@@ -419,7 +470,8 @@ class AgenticLoop:
                 step.status = "complete"
 
             step.finish()
-            context.append(f"Step {step_num} – {description}:\n{step.result}")
+            result_snippet = step.result[:_MAX_STEP_CONTEXT_CHARS]
+            context.append(f"Step {step_num} – {description}:\n{result_snippet}")
             executed.append(step)
 
             await emit("step_complete", step.to_dict())

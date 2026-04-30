@@ -42,12 +42,11 @@ PROFILES: dict[str, frozenset[str] | str] = {
         "memory_search",
     }),
 
-    # Minimal — status checks, memory search, agent listing only.
-    # Default for newly spawned sub-agents.
+    # Minimal — memory recall only.  Keeps execute_step to a single LLM call
+    # for simple tasks by not exposing tools that trigger unnecessary round-trips.
+    # Use 'orchestration' profile when agent management tools are needed.
     "minimal": frozenset({
         "memory_search",
-        "session",
-        "agent_list",
     }),
 
     # RAG / knowledge retrieval only.

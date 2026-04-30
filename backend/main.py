@@ -36,6 +36,52 @@ from backend.tools.registry import ToolRegistry
 
 logger = logging.getLogger(__name__)
 
+
+async def _apply_effective_slot_context_budget() -> None:
+    """Clamp watcher/main context sizes to the effective per-slot budget.
+
+    Some llama.cpp configurations split total --ctx-size across -np slots.
+    This keeps internal agent context settings aligned with the actual
+    available per-slot context to avoid overflow thrashing.
+    """
+    budget: int | None = None
+
+    manual_cap = int(getattr(settings, "llama_slot_context_cap", 0) or 0)
+    if manual_cap > 0:
+        budget = manual_cap
+
+    try:
+        slot_info = await slot_manager.get_slot_info()
+        slots = slot_info.get("slots", []) if isinstance(slot_info, dict) else []
+        n_ctx_values = [
+            int(s.get("n_ctx", 0))
+            for s in slots
+            if isinstance(s, dict) and int(s.get("n_ctx", 0)) > 0
+        ]
+        if n_ctx_values:
+            inferred = min(n_ctx_values)
+            budget = inferred if budget is None else min(budget, inferred)
+    except Exception as exc:
+        logger.debug("Could not infer slot context budget from /slots: %s", exc.__class__.__name__)
+
+    if budget is None or budget <= 0:
+        return
+
+    old_watcher = settings.watcher_context_size
+    old_main = settings.main_context_size
+    settings.watcher_context_size = min(old_watcher, budget)
+    settings.main_context_size = min(old_main, budget)
+
+    if settings.watcher_context_size != old_watcher or settings.main_context_size != old_main:
+        logger.warning(
+            "Context sizes clamped to effective slot budget=%d (watcher: %d->%d, main: %d->%d)",
+            budget,
+            old_watcher,
+            settings.watcher_context_size,
+            old_main,
+            settings.main_context_size,
+        )
+
 # ---------------------------------------------------------------------------
 # Singletons – populated during lifespan startup
 # ---------------------------------------------------------------------------
@@ -75,6 +121,7 @@ async def lifespan(app: FastAPI):  # type: ignore[type-arg]
 
     await slot_manager.assign_watcher(settings.watcher_slot)
     await slot_manager.assign_main(settings.main_slot)
+    await _apply_effective_slot_context_budget()
 
     rolling_context = RollingContext(
         llama_client=llama_client,
@@ -126,6 +173,17 @@ async def lifespan(app: FastAPI):  # type: ignore[type-arg]
         checkpoint_manager=checkpoint_manager,
         poll_interval=settings.supervisor_poll_interval,
         step_timeout=settings.supervisor_step_timeout,
+        server_manager=server_manager,
+        slowdown_monitor_enabled=settings.supervisor_slowdown_monitor_enabled,
+        slowdown_threshold_tps=settings.supervisor_slowdown_threshold_tps,
+        slowdown_consecutive_polls=settings.supervisor_slowdown_consecutive_polls,
+        slowdown_restart_enabled=settings.supervisor_slowdown_restart_enabled,
+        slowdown_cooldown_seconds=settings.supervisor_slowdown_cooldown_seconds,
+        max_repeated_tool_calls=settings.supervisor_max_repeated_tool_calls,
+        max_failed_tool_calls=settings.supervisor_max_failed_tool_calls,
+        max_no_progress_steps=settings.supervisor_max_no_progress_steps,
+        max_empty_or_malformed=settings.supervisor_max_empty_responses,
+        max_give_up_signals=settings.supervisor_max_give_up_signals,
     )
     safety_supervisor.start()
 
@@ -270,13 +328,39 @@ def _register_tools(
 # ---------------------------------------------------------------------------
 app = FastAPI(title="SlothBrain", lifespan=lifespan)
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=settings.cors_allowed_origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# Only one agentic task may hold slot 1 at a time.  Concurrent requests are
+# rejected with 503 rather than silently queuing up and thrashing the KV cache.
+_agentic_lock: asyncio.Lock = asyncio.Lock()
+
+
+async def _run_agentic_with_cancel(
+    http_request: Request,
+    loop_coro,
+) -> dict:
+    """Run *loop_coro* and cancel it if the HTTP client disconnects.
+
+    Without this guard, timed-out or closed client connections leave an
+    orphaned coroutine running on the backend that keeps consuming inference
+    slots and thrashes the KV cache alongside any new requests.
+    """
+    task = asyncio.ensure_future(loop_coro)
+    try:
+        while not task.done():
+            # Poll for client disconnect every 0.5 s.
+            done, _ = await asyncio.wait({task}, timeout=0.5)
+            if done:
+                break
+            if await http_request.is_disconnected():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                raise HTTPException(status_code=499, detail="Client disconnected")
+        return task.result()
+    except asyncio.CancelledError:
+        task.cancel()
+        raise
 
 
 @app.middleware("http")
@@ -308,7 +392,7 @@ async def protect_api(request: Request, call_next):
 # ---------------------------------------------------------------------------
 class ChatRequest(BaseModel):
     message: str
-    agent: str = "auto"  # "auto" | "watcher" | "main"
+    max_steps: int = 10
 
 
 class ModeRequest(BaseModel):
@@ -401,6 +485,14 @@ def _raise_service_unavailable(exc: Exception, context: str) -> None:
     ) from exc
 
 
+async def _ensure_llama_available(context: str) -> None:
+    """Perform a quick preflight check so API callers get a clean 503 early."""
+    try:
+        await llama_client.health()
+    except (httpx.HTTPError, RuntimeError, ValueError) as exc:
+        _raise_service_unavailable(exc, context)
+
+
 def _parse_bearer_token(authorization_header: str | None) -> str:
     if not authorization_header:
         return ""
@@ -441,22 +533,43 @@ async def get_status() -> dict:
 
 
 @app.post("/api/chat")
-async def chat(request: ChatRequest) -> dict:
-    agent_choice = request.agent.lower()
-    try:
-        if agent_choice == "watcher":
-            response = await watcher_agent.process(request.message)
-            return {"agent": "watcher", "response": response, "handoff": False}
-        if agent_choice == "main":
-            response = await main_agent.process(request.message)
-            return {"agent": "main", "response": response, "handoff": False}
-        return await handoff_manager.route(request.message)
-    except (httpx.HTTPError, RuntimeError, ValueError) as exc:
-        _raise_service_unavailable(exc, "Chat service")
+async def chat(http_request: Request, request: ChatRequest) -> dict:
+    """Backward-compatible chat endpoint that now always runs agentic mode."""
+    from backend.agents.agentic_loop import AgenticLoop
+
+    await _ensure_llama_available("Agentic loop")
+
+    if _agentic_lock.locked():
+        raise HTTPException(
+            status_code=503,
+            detail="Another agentic task is already running. Please wait.",
+        )
+
+    async with _agentic_lock:
+        loop = AgenticLoop(
+            main_agent=main_agent,
+            watcher_agent=watcher_agent,
+            max_steps=_clamp_steps(request.max_steps),
+            checkpoint_manager=checkpoint_manager,
+            supervisor=safety_supervisor,
+        )
+        try:
+            result = await _run_agentic_with_cancel(
+                http_request, loop.run(task=request.message)
+            )
+        except (httpx.HTTPError, RuntimeError, ValueError) as exc:
+            _raise_service_unavailable(exc, "Agentic loop")
+    # Keep a short response shape for older clients.
+    return {
+        "agent": "agentic",
+        "response": result.get("summary", ""),
+        "handoff": False,
+        "result": result,
+    }
 
 
 @app.post("/api/chat/agentic")
-async def agentic_chat(request: AgenticRequest) -> dict:
+async def agentic_chat(http_request: Request, request: AgenticRequest) -> dict:
     """Run a multi-step agentic task loop and return the full result.
 
     The MainAgent plans the task, executes each step in sequence, and the
@@ -466,17 +579,28 @@ async def agentic_chat(request: AgenticRequest) -> dict:
     """
     from backend.agents.agentic_loop import AgenticLoop
 
-    loop = AgenticLoop(
-        main_agent=main_agent,
-        watcher_agent=watcher_agent,
-        max_steps=_clamp_steps(request.max_steps),
-        checkpoint_manager=checkpoint_manager,
-        supervisor=safety_supervisor,
-    )
-    try:
-        result = await loop.run(task=request.task)
-    except (httpx.HTTPError, RuntimeError, ValueError) as exc:
-        _raise_service_unavailable(exc, "Agentic loop")
+    await _ensure_llama_available("Agentic loop")
+
+    if _agentic_lock.locked():
+        raise HTTPException(
+            status_code=503,
+            detail="Another agentic task is already running. Please wait.",
+        )
+
+    async with _agentic_lock:
+        loop = AgenticLoop(
+            main_agent=main_agent,
+            watcher_agent=watcher_agent,
+            max_steps=_clamp_steps(request.max_steps),
+            checkpoint_manager=checkpoint_manager,
+            supervisor=safety_supervisor,
+        )
+        try:
+            result = await _run_agentic_with_cancel(
+                http_request, loop.run(task=request.task)
+            )
+        except (httpx.HTTPError, RuntimeError, ValueError) as exc:
+            _raise_service_unavailable(exc, "Agentic loop")
     audit_log.record(
         action="agentic_task",
         actor="api",
