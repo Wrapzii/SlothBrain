@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 from backend.tools.base import Tool
 
 if TYPE_CHECKING:
-    pass
+    from backend.core.semantic_router import SemanticRouter
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +37,22 @@ class ToolRegistry:
 
     def __init__(self) -> None:
         self._tools: dict[str, Tool] = {}
+        self._semantic_router: "SemanticRouter | None" = None
+
+    # ------------------------------------------------------------------
+    # Semantic router
+    # ------------------------------------------------------------------
+
+    def set_semantic_router(self, router: "SemanticRouter") -> None:
+        """Attach a :class:`~backend.core.semantic_router.SemanticRouter`.
+
+        Once attached the router is kept in sync: every subsequent
+        :meth:`register` call also indexes the new tool.  Already-registered
+        tools are indexed immediately so the router is immediately usable.
+        """
+        self._semantic_router = router
+        if self._tools:
+            router.index_tools(list(self._tools.values()))
 
     # ------------------------------------------------------------------
     # Registration
