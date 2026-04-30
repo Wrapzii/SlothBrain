@@ -31,6 +31,7 @@ class UITool(Tool):
     * ``PRESS <key>`` — key combo (e.g. ``PRESS ctrl+c``)
     * ``SCROLL <cell> <UP|DOWN> [n]``
     * ``DRAG <from_cell> <to_cell>``
+    * ``RUN "<command>"`` — launch an app/command via OS shell
     * ``DONE`` — signal task complete
     """
 
@@ -54,6 +55,22 @@ class UITool(Tool):
                 "description": "Whether to take a screenshot after executing the command.",
                 "default": False,
             },
+            "monitor": {
+                "type": "integer",
+                "description": (
+                    "Monitor index for follow-up screenshots. 0 = all monitors, "
+                    "1..N = specific monitor."
+                ),
+                "default": 0,
+            },
+            "include_image": {
+                "type": "boolean",
+                "description": (
+                    "Whether follow-up screenshots should include annotated_png_b64. "
+                    "Defaults to false to keep payloads small."
+                ),
+                "default": False,
+            },
         },
         "required": ["command"],
     }
@@ -61,13 +78,24 @@ class UITool(Tool):
     def __init__(self, controller: "DesktopController") -> None:
         self._controller = controller
 
-    async def execute(self, command: str = "", capture_after: bool = False, **kwargs: Any) -> ToolResult:
+    async def execute(
+        self,
+        command: str = "",
+        capture_after: bool = False,
+        monitor: int = 0,
+        include_image: bool = False,
+        **kwargs: Any,
+    ) -> ToolResult:
         if not command:
             return ToolResult(ok=False, error="'command' argument is required")
         try:
             if capture_after:
                 result = await asyncio.to_thread(
-                    self._controller.execute_command_then_capture, command
+                    self._controller.execute_command_then_capture,
+                    command,
+                    monitor,
+                    include_image,
+                    True,
                 )
             else:
                 result = await asyncio.to_thread(

@@ -40,6 +40,8 @@ _MAX_FALLBACK_STEP_LENGTH = 300
 # Maximum tool-call iterations per execute_step call to prevent infinite loops.
 _MAX_TOOL_ITERATIONS = 5
 _TOOL_QUERY_RE = re.compile(r"\b(tool|tools|capabilit(?:y|ies)|access)\b", re.IGNORECASE)
+_URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
+_FETCH_INTENT_RE = re.compile(r"\b(fetch|get|retrieve|download|read|visit|open)\b", re.IGNORECASE)
 _TOOL_BLOCK_RE = re.compile(
     r"</?(?:tool_call|tool_result|fetch|fetch_result|verify|sweep|think|sloth)>"
     r"|thinking\s+process:"
@@ -47,6 +49,45 @@ _TOOL_BLOCK_RE = re.compile(
     r"|\bsimulated content\b",
     re.IGNORECASE,
 )
+
+# Tool payload guardrails for websocket/event safety.
+_MAX_EVENT_TEXT_CHARS = 600
+_MAX_LIST_ITEMS = 20
+_MAX_MODEL_RESPONSE_PREVIEW_CHARS = 240
+_HEAVY_B64_KEYS = {
+    "annotated_png_b64",
+    "image_b64",
+    "png_b64",
+    "jpeg_b64",
+    "jpg_b64",
+}
+
+
+def _truncate_text(value: str, limit: int = _MAX_EVENT_TEXT_CHARS) -> str:
+    if len(value) <= limit:
+        return value
+    return value[:limit] + f" ...[truncated {len(value) - limit} chars]"
+
+
+def _sanitize_tool_payload(value):
+    """Return a compact, JSON-serializable tool payload for events/prompts."""
+    if isinstance(value, dict):
+        out: dict = {}
+        for k, v in value.items():
+            if k in _HEAVY_B64_KEYS and isinstance(v, str):
+                out[k] = f"[omitted base64 payload: {len(v)} chars]"
+                continue
+            out[k] = _sanitize_tool_payload(v)
+        return out
+    if isinstance(value, list):
+        trimmed = value[:_MAX_LIST_ITEMS]
+        result = [_sanitize_tool_payload(v) for v in trimmed]
+        if len(value) > _MAX_LIST_ITEMS:
+            result.append(f"...[{len(value) - _MAX_LIST_ITEMS} more items]")
+        return result
+    if isinstance(value, str):
+        return _truncate_text(value)
+    return value
 
 
 def _sanitize_direct_response(text: str) -> str:
@@ -319,6 +360,16 @@ class MainAgent:
         - ``approach``: brief description of the overall strategy.
         - ``steps``: list of step description strings (max 10).
         """
+        # Fast-path: URL fetch tasks should be handled with web_fetch only,
+        # not desktop UI automation steps.
+        url_match = _URL_RE.search(task or "")
+        if url_match and _FETCH_INTENT_RE.search(task or ""):
+            url = url_match.group(0)
+            return {
+                "approach": "Use web_fetch directly and summarize the response.",
+                "steps": [f"Use web_fetch to fetch {url} and report key findings."],
+            }
+
         # NOTE: The plan prompt MUST share the same system-prompt prefix as
         # execute_step so llama.cpp can reuse the KV cache between planning and
         # execution calls on the same slot.  Using a different system prompt
@@ -451,18 +502,26 @@ class MainAgent:
                 # No tool calls — final answer
                 return response
 
-            # Execute each tool call and accumulate results
-            tool_result_lines: list[str] = [response]
+            # Execute each tool call and accumulate results.
+            # Keep only a short response preview to avoid prompt/KV blow-up.
+            response_preview = _truncate_text(
+                response.replace("\n", " ").strip(),
+                _MAX_MODEL_RESPONSE_PREVIEW_CHARS,
+            )
+            tool_result_lines: list[str] = [
+                f"<model_response_preview>{response_preview}</model_response_preview>"
+            ]
             for tc in tool_calls:
                 tool_name = tc["tool"]
                 tool_args = tc.get("args", {})
 
                 if on_event is not None:
+                    safe_args = _sanitize_tool_payload(tool_args)
                     maybe = on_event(
                         {
                             "type": "tool_call",
                             "tool": tool_name,
-                            "args": tool_args,
+                            "args": safe_args,
                         }
                     )
                     intervention = await maybe if inspect.isawaitable(maybe) else maybe
@@ -482,14 +541,16 @@ class MainAgent:
                         result_dict = {"ok": False, "error": "Tool execution failed"}
 
                 if on_event is not None:
+                    safe_output = _sanitize_tool_payload(result_dict.get("output"))
+                    safe_error = _sanitize_tool_payload(result_dict.get("error"))
                     maybe = on_event(
                         {
                             "type": "tool_result",
                             "tool": tool_name,
-                            "args": tool_args,
+                            "args": safe_args,
                             "ok": bool(result_dict.get("ok")),
-                            "output": result_dict.get("output"),
-                            "error": result_dict.get("error"),
+                            "output": safe_output,
+                            "error": safe_error,
                         }
                     )
                     intervention = await maybe if inspect.isawaitable(maybe) else maybe
@@ -497,7 +558,12 @@ class MainAgent:
                         return intervention.get("message", "Execution paused by SafetySupervisor.")
 
                 result_json = json.dumps(
-                    {"tool": tool_name, **result_dict},
+                    {
+                        "tool": tool_name,
+                        "ok": bool(result_dict.get("ok")),
+                        "output": safe_output,
+                        "error": safe_error,
+                    },
                     ensure_ascii=False,
                     default=str,
                 )

@@ -23,6 +23,21 @@ logger = logging.getLogger(__name__)
 _CALL_OPEN = "<tool_call>"
 _CALL_CLOSE = "</tool_call>"
 
+_WEB_INTENT_RE = re.compile(r"\b(fetch|download|scrape|crawl|web|url|http|https|page|website)\b", re.IGNORECASE)
+_DESKTOP_INTENT_RE = re.compile(
+    r"\b(screen|screenshot|desktop|window|click|type|press|ui|mouse|keyboard|open app|launch app)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_web_intent(context: str) -> bool:
+    text = context or ""
+    return bool(_WEB_INTENT_RE.search(text) or "http://" in text.lower() or "https://" in text.lower())
+
+
+def _is_desktop_intent(context: str) -> bool:
+    return bool(_DESKTOP_INTENT_RE.search(context or ""))
+
 
 class ToolRegistry:
     """Registry of available :class:`~backend.tools.base.Tool` instances.
@@ -93,13 +108,20 @@ class ToolRegistry:
             return allowed
 
         candidate_names = [t.name for t in allowed]
+        # Only force-include critical desktop tools when the request actually
+        # looks like desktop/UI intent. This prevents web-fetch tasks from
+        # getting screenshot/UI injected and looping through unnecessary actions.
+        effective_critical_tools: list[str] = []
+        if _is_desktop_intent(context) and not _is_web_intent(context):
+            effective_critical_tools = list(self._critical_bypass_tools)
+
         result = self._semantic_router.get_relevant_tools(
             context=context,
             profile="global",
             candidates=candidate_names,
             top_k=self._semantic_top_k,
             min_similarity=self._semantic_min_similarity,
-            critical_tools=list(self._critical_bypass_tools),
+            critical_tools=effective_critical_tools,
         )
         selected = [self._tools[name] for name in result.tool_names if name in self._tools]
         if result.used_fallback:

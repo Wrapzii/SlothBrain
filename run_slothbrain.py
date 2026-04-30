@@ -51,6 +51,8 @@ def main() -> int:
 
     repo_root = Path(__file__).resolve().parent
 
+    # WebSocket buffer sizes for large screenshot payloads (up to 2MB base64)
+    # Default 1MB was causing "message too big" errors during agent vision tasks
     cmd = [
         sys.executable,
         "-m",
@@ -60,6 +62,10 @@ def main() -> int:
         args.host,
         "--port",
         str(args.port),
+        "--ws-max-size",
+        "16777216",  # 16 MB
+        "--ws-max-queue",
+        "32",
     ]
     if args.reload:
         cmd.append("--reload")

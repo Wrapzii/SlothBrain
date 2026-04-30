@@ -33,16 +33,35 @@ class ScreenshotTool(Tool):
     )
     parameters_schema: dict = {
         "type": "object",
-        "properties": {},
+        "properties": {
+            "monitor": {
+                "type": "integer",
+                "description": (
+                    "Monitor index to capture. 0 = virtual desktop (all monitors), "
+                    "1..N = specific monitor."
+                ),
+                "default": 0,
+            },
+            "include_image": {
+                "type": "boolean",
+                "description": "Whether to include annotated_png_b64 in output.",
+                "default": False,
+            },
+        },
         "required": [],
     }
 
     def __init__(self, controller: "DesktopController") -> None:
         self._controller = controller
 
-    async def execute(self, **kwargs: Any) -> ToolResult:
+    async def execute(self, monitor: int = 0, include_image: bool = False, **kwargs: Any) -> ToolResult:
         try:
-            result = await asyncio.to_thread(self._controller.capture)
+            result = await asyncio.to_thread(
+                self._controller.capture,
+                monitor,
+                include_image,
+                True,
+            )
             return ToolResult(
                 ok=True,
                 output={

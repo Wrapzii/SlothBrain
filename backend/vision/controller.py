@@ -99,7 +99,12 @@ class DesktopController:
     # Screen capture helpers
     # ------------------------------------------------------------------
 
-    def capture(self) -> dict:
+    def capture(
+        self,
+        monitor: int = 0,
+        include_image: bool = True,
+        include_cells: bool = True,
+    ) -> dict:
         """Capture the screen and return a structured dict.
 
         Keys:
@@ -107,13 +112,13 @@ class DesktopController:
         """
         import base64
 
-        info = capture_screen()
+        info = capture_screen(monitor=monitor)
         self._last_screen = info
         grid = ScreenGrid(info.width, info.height, self._cols, self._rows)
         self._last_grid = grid
 
         cells: dict[str, str] = {}
-        if self._ocr:
+        if self._ocr and include_cells:
             for cell in grid.all_cells():
                 region_png = grid.extract_cell_image(info.image_bytes, cell.label)
                 text = ocr_cell_bytes(region_png)
@@ -122,11 +127,13 @@ class DesktopController:
 
         state_text = self._build_state_text(info, grid, cells)
 
-        try:
-            annotated = grid.annotate_image(info.image_bytes)
-            annotated_b64 = base64.b64encode(annotated).decode()
-        except Exception:
-            annotated_b64 = base64.b64encode(info.image_bytes).decode()
+        annotated_b64 = ""
+        if include_image:
+            try:
+                annotated = grid.annotate_image(info.image_bytes)
+                annotated_b64 = base64.b64encode(annotated).decode()
+            except Exception:
+                annotated_b64 = base64.b64encode(info.image_bytes).decode()
 
         return {
             "width": info.width,
@@ -195,7 +202,13 @@ class DesktopController:
             logger.exception("Action execution failed: %s", cmd)
             return {"command": cmd, "executed": False, "error": str(exc), "type": "exec_error"}
 
-    def execute_command_then_capture(self, cmd: str) -> dict:
+    def execute_command_then_capture(
+        self,
+        cmd: str,
+        monitor: int = 0,
+        include_image: bool = False,
+        include_cells: bool = True,
+    ) -> dict:
         """Execute ``cmd``, wait, then take a fresh screenshot.
 
         Returns ``execute_command`` result merged with new ``capture()`` data.
@@ -203,7 +216,11 @@ class DesktopController:
         result = self.execute_command(cmd)
         if result.get("type") not in ("parse_error", "error", "exec_error"):
             time.sleep(self._delay)
-            screen = self.capture()
+            screen = self.capture(
+                monitor=monitor,
+                include_image=include_image,
+                include_cells=include_cells,
+            )
             result["screen"] = screen
         return result
 

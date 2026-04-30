@@ -209,6 +209,23 @@ async def test_main_agent_plan_task():
 
 
 @pytest.mark.asyncio
+async def test_main_agent_plan_task_web_fetch_fast_path():
+    from backend.agents.main_agent import MainAgent
+    from backend.config import AppConfig
+
+    sm = MagicMock()
+    sm.send_to_main = AsyncMock(return_value="should not be called")
+    cfg = AppConfig()
+
+    agent = MainAgent(slot_manager=sm, memory=None, config=cfg)
+    plan = await agent.plan_task("can you fetch https://bytebrew.cc?")
+
+    assert "web_fetch" in plan["steps"][0]
+    assert "https://bytebrew.cc" in plan["steps"][0]
+    sm.send_to_main.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_main_agent_execute_step():
     from backend.agents.main_agent import MainAgent
     from backend.config import AppConfig

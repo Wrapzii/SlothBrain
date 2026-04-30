@@ -42,7 +42,7 @@ class AppConfig(BaseSettings):
     # Set to 0 to disable and rely on /slots metadata.
     llama_slot_context_cap: int = 0
     # Cache /slots responses for this many seconds to reduce llama.cpp log spam.
-    slot_info_cache_ttl_seconds: float = 2.0
+    slot_info_cache_ttl_seconds: float = 5.0
     max_restarts_per_hour: int = 3
     enable_server_watchdog: bool = True
 

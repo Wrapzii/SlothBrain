@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import re
+import subprocess
 import time
 from dataclasses import dataclass, field
 from typing import Literal, Optional, Union
@@ -67,7 +68,12 @@ class DragAction:
     duration: float = 0.4
 
 
-Action = Union[ClickAction, TypeAction, PressAction, ScrollAction, DragAction]
+@dataclass
+class RunAction:
+    command: str
+
+
+Action = Union[ClickAction, TypeAction, PressAction, ScrollAction, DragAction, RunAction]
 
 
 class ActionExecutor:
@@ -121,6 +127,10 @@ class ActionExecutor:
         elif isinstance(action, DragAction):
             pag.moveTo(action.x1, action.y1)
             pag.dragTo(action.x2, action.y2, duration=action.duration, button="left")
+
+        elif isinstance(action, RunAction):
+            # Launch using shell on Windows so bare app names resolve via PATH/App Paths.
+            subprocess.Popen(action.command, shell=True)
 
         else:
             raise TypeError(f"Unknown action type: {type(action)}")
@@ -199,6 +209,14 @@ def parse_action_string(cmd: str, grid) -> Optional[Action]:
         src = grid.cell(m.group(1))
         dst = grid.cell(m.group(2))
         return DragAction(x1=src.center_x, y1=src.center_y, x2=dst.center_x, y2=dst.center_y)
+
+    # RUN "<command>"
+    m = re.match(r'^RUN\s+"(.+)"$', cmd, re.DOTALL)
+    if m:
+        command = m.group(1).strip()
+        if not command:
+            raise ValueError("RUN command cannot be empty")
+        return RunAction(command=command)
 
     raise ValueError(f"Unrecognised action command: {cmd!r}")
 

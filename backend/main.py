@@ -326,11 +326,22 @@ def _register_tools(
 # ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
+# Increase WebSocket buffer sizes to handle large tool results (screenshots up to ~2MB base64)
+# Default is 1MB which was causing "message too big" errors with full-screen JPEG captures
+_WS_MAX_SIZE = 16 * 1024 * 1024  # 16 MB
+_WS_MAX_QUEUE = 32
+
 app = FastAPI(title="SlothBrain", lifespan=lifespan)
 
-# Only one agentic task may hold slot 1 at a time.  Concurrent requests are
-# rejected with 503 rather than silently queuing up and thrashing the KV cache.
-_agentic_lock: asyncio.Lock = asyncio.Lock()
+# Configure WebSocket parameters for larger payloads
+import uvicorn
+# Note: These will be applied when the app is started via uvicorn with:
+# uvicorn.run(..., ws_max_size=_WS_MAX_SIZE, ws_max_queue=_WS_MAX_QUEUE)
+
+# Only one inference task (direct or agentic) may run at a time.
+# This avoids slot thrashing and recurrent-model slowdown when clients send
+# overlapping requests (e.g. rapid consecutive messages).
+_inference_lock: asyncio.Lock = asyncio.Lock()
 
 
 async def _run_agentic_with_cancel(
@@ -572,11 +583,18 @@ async def chat(http_request: Request, request: ChatRequest) -> dict:
     use_agentic = _should_use_agentic_mode(request.message, request.max_steps, request.mode)
 
     if not use_agentic:
+        if _inference_lock.locked():
+            raise HTTPException(
+                status_code=503,
+                detail="Another inference request is already running. Please wait.",
+            )
+
         await _ensure_llama_available("Direct chat")
-        try:
-            response = await main_agent.process_direct(user_input=request.message)
-        except (httpx.HTTPError, RuntimeError, ValueError) as exc:
-            _raise_service_unavailable(exc, "Direct chat")
+        async with _inference_lock:
+            try:
+                response = await main_agent.process_direct(user_input=request.message)
+            except (httpx.HTTPError, RuntimeError, ValueError) as exc:
+                _raise_service_unavailable(exc, "Direct chat")
         return {
             "agent": "direct",
             "response": response,
@@ -591,10 +609,10 @@ async def chat(http_request: Request, request: ChatRequest) -> dict:
 
     await _ensure_llama_available("Agentic loop")
 
-    if _agentic_lock.locked():
+    if _inference_lock.locked():
         raise HTTPException(
             status_code=503,
-            detail="Another agentic task is already running. Please wait.",
+            detail="Another inference request is already running. Please wait.",
         )
 
     task_message = request.message.strip()
@@ -603,7 +621,7 @@ async def chat(http_request: Request, request: ChatRequest) -> dict:
             task_message = task_message[len(prefix):].strip()
             break
 
-    async with _agentic_lock:
+    async with _inference_lock:
         loop = AgenticLoop(
             main_agent=main_agent,
             max_steps=_clamp_steps(request.max_steps),
@@ -628,11 +646,18 @@ async def chat(http_request: Request, request: ChatRequest) -> dict:
 @app.post("/api/chat/direct")
 async def direct_chat(request: ChatRequest) -> dict:
     """Explicit direct chat endpoint (single-shot, no task planning loop)."""
+    if _inference_lock.locked():
+        raise HTTPException(
+            status_code=503,
+            detail="Another inference request is already running. Please wait.",
+        )
+
     await _ensure_llama_available("Direct chat")
-    try:
-        response = await main_agent.process_direct(user_input=request.message)
-    except (httpx.HTTPError, RuntimeError, ValueError) as exc:
-        _raise_service_unavailable(exc, "Direct chat")
+    async with _inference_lock:
+        try:
+            response = await main_agent.process_direct(user_input=request.message)
+        except (httpx.HTTPError, RuntimeError, ValueError) as exc:
+            _raise_service_unavailable(exc, "Direct chat")
     return {
         "agent": "direct",
         "response": response,
@@ -656,13 +681,13 @@ async def agentic_chat(http_request: Request, request: AgenticRequest) -> dict:
 
     await _ensure_llama_available("Agentic loop")
 
-    if _agentic_lock.locked():
+    if _inference_lock.locked():
         raise HTTPException(
             status_code=503,
-            detail="Another agentic task is already running. Please wait.",
+            detail="Another inference request is already running. Please wait.",
         )
 
-    async with _agentic_lock:
+    async with _inference_lock:
         loop = AgenticLoop(
             main_agent=main_agent,
             max_steps=_clamp_steps(request.max_steps),
@@ -1038,7 +1063,7 @@ async def ws_status(websocket: WebSocket) -> None:
                 "pending_approvals": len(approval_queue.list_pending()),
             }
             await websocket.send_text(json.dumps(payload))
-            await asyncio.sleep(2)
+            await asyncio.sleep(5)
     except WebSocketDisconnect:
         pass
     except Exception as exc:
@@ -1094,6 +1119,10 @@ async def ws_agent_progress(websocket: WebSocket) -> None:
 
         from backend.agents.agentic_loop import AgenticLoop
 
+        if _inference_lock.locked():
+            await _send({"type": "error", "message": "Another inference request is already running. Please wait."})
+            return
+
         loop = AgenticLoop(
             main_agent=main_agent,
             max_steps=max_steps,
@@ -1105,16 +1134,17 @@ async def ws_agent_progress(websocket: WebSocket) -> None:
             action="agentic_task_ws", actor="api", details=task[:100]
         )
 
-        try:
-            result = await loop.run(task=task, on_progress=_send)
-        except (httpx.HTTPError, RuntimeError, ValueError) as exc:
-            await _send(
-                {
-                    "type": "error",
-                    "message": f"Service unavailable: {exc.__class__.__name__}",
-                }
-            )
-            return
+        async with _inference_lock:
+            try:
+                result = await loop.run(task=task, on_progress=_send)
+            except (httpx.HTTPError, RuntimeError, ValueError) as exc:
+                await _send(
+                    {
+                        "type": "error",
+                        "message": f"Service unavailable: {exc.__class__.__name__}",
+                    }
+                )
+                return
 
         await _send({"type": "result", **result})
 

@@ -12,8 +12,10 @@ try:
     import pyarrow  # noqa: F401
     from sentence_transformers import SentenceTransformer
     _DEPS_AVAILABLE = True
-except ImportError:
+    _DEPS_ERROR: Exception | None = None
+except ImportError as exc:
     _DEPS_AVAILABLE = False
+    _DEPS_ERROR = exc
 
 
 class LanceDBMemory:
@@ -44,7 +46,8 @@ class LanceDBMemory:
         if not _DEPS_AVAILABLE:
             raise ImportError(
                 "LanceDBMemory requires lancedb, sentence-transformers, numpy, pandas, and pyarrow. "
-                "Install them with: pip install lancedb sentence-transformers numpy pandas pyarrow"
+                "Install them with: pip install lancedb sentence-transformers numpy pandas pyarrow. "
+                f"Original import error: {_DEPS_ERROR}"
             )
         self._db_path = db_path
         self._embedding_model_name = embedding_model

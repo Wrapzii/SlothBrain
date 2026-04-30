@@ -10,6 +10,7 @@ from backend.vision.action_executor import (
     PressAction,
     ScrollAction,
     DragAction,
+    RunAction,
     _ClickAndType,
     parse_action_string,
 )
@@ -73,6 +74,12 @@ def test_parse_drag(grid):
     dst = grid.cell("J8")
     assert action.x1 == src.center_x
     assert action.x2 == dst.center_x
+
+
+def test_parse_run(grid):
+    action = parse_action_string('RUN "discord"', grid)
+    assert isinstance(action, RunAction)
+    assert action.command == "discord"
 
 
 def test_parse_screenshot_returns_none(grid):
