@@ -14,7 +14,7 @@ PROFILES: dict[str, frozenset[str] | str] = {
     "full": "*",
 
     # Coding tasks: file I/O, shell, code execution, diffs, patches,
-    # web access, and memory retrieval.
+    # web access, memory retrieval, and workspace indexing.
     "coding": frozenset({
         "file",
         "shell",
@@ -24,6 +24,7 @@ PROFILES: dict[str, frozenset[str] | str] = {
         "web_fetch",
         "web_search",
         "memory_search",
+        "workspace_index",
     }),
 
     # Messaging-focused agents: Discord I/O + conversation history.

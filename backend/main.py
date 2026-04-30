@@ -179,6 +179,7 @@ def _register_tools(
     from backend.tools.impl.session_tool import SessionTool
     from backend.tools.impl.scheduler_tool import SchedulerTool
     from backend.tools.impl.discord_tool import DiscordTool
+    from backend.tools.impl.workspace_index_tool import WorkspaceIndexTool
     from backend.tools.plugin_loader import load_plugins
 
     # Vision / desktop
@@ -206,8 +207,28 @@ def _register_tools(
             "CodeExecTool not registered (set SLOTHBRAIN_CODE_EXEC_ENABLED=true to enable)"
         )
 
-    # File system
-    registry.register(FileTool(config=config))
+    # File system + workspace indexing
+    workspace_index_tool: WorkspaceIndexTool | None = None
+    if getattr(config, "workspace_index_enabled", True):
+        try:
+            from backend.memory.workspace_indexer import WorkspaceIndexer
+            ws_db_path = (
+                getattr(config, "workspace_index_db_path", "")
+                or getattr(config, "lancedb_path", "./data/lancedb")
+            )
+            ws_indexer = WorkspaceIndexer(
+                db_path=ws_db_path,
+                embedding_model=getattr(config, "embedding_model", "all-MiniLM-L6-v2"),
+            )
+            workspace_index_tool = WorkspaceIndexTool(indexer=ws_indexer)
+            registry.register(workspace_index_tool)
+        except ImportError as exc:
+            logger.warning("WorkspaceIndexTool not registered (missing deps): %s", exc)
+            workspace_index_tool = WorkspaceIndexTool(indexer=None)
+    else:
+        workspace_index_tool = WorkspaceIndexTool(indexer=None)
+
+    registry.register(FileTool(config=config, workspace_index=workspace_index_tool))
     registry.register(PatchTool(config=config))
     registry.register(DiffTool(config=config))
 
