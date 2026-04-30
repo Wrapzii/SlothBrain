@@ -31,7 +31,6 @@ System stats and slot info.
   "ram_total_mb": 16384.0,
   "mode": "idle",
   "slots": {
-    "watcher": 0,
     "main": 1,
     "slots": [{"id": 0, ...}, {"id": 1, ...}]
   }
@@ -54,15 +53,15 @@ Single-turn conversation.
 ```json
 {
   "message": "What is the capital of France?",
-  "agent": "auto"
+  "mode": "auto"
 }
 ```
-`agent`: `"auto"` | `"watcher"` | `"main"` (default: `"auto"`)
+`mode`: `"auto"` | `"direct"` | `"agentic"` (default: `"auto"`)
 
 **Response**
 ```json
 {
-  "agent": "watcher",
+  "agent": "direct",
   "response": "The capital of France is Paris.",
   "handoff": false
 }
@@ -91,7 +90,6 @@ Run a fully autonomous multi-step task.
       "step_num": 1,
       "description": "...",
       "result": "...",
-      "watcher_feedback": "...",
       "status": "complete",
       "screenshots": [],
       "retries": 0,
@@ -138,7 +136,7 @@ Get all configuration values.
 Update configuration. Critical fields (KV cache, large context increases) may return a `pending_approval` response instead of applying immediately.
 
 **Writable fields:**
-`llama_host`, `llama_port`, `watcher_slot`, `main_slot`, `watcher_context_size`,
+`llama_host`, `llama_port`, `main_slot`,
 `main_context_size`, `idle_kv_quant`, `active_kv_quant`, `vram_threshold_mb`,
 `ram_threshold_mb`, `embedding_model`, `llama_server_path`, `llama_server_args`,
 `max_context_size`, `max_slots`, `max_restarts_per_hour`,

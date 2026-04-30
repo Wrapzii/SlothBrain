@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+from unittest.mock import AsyncMock
+
+import pytest
 from fastapi.testclient import TestClient
 
 from backend.main import app
 from backend.config import settings
+from backend.main import _should_use_agentic_mode
+from backend.agents.main_agent import MainAgent
 
 
 def _restore_settings(snapshot: dict) -> None:
@@ -81,3 +86,54 @@ def test_api_key_required_when_configured() -> None:
             assert allowed.status_code == 200
     finally:
         _restore_settings(snapshot)
+
+
+def test_auto_mode_routes_tool_intent_to_agentic() -> None:
+    assert _should_use_agentic_mode(
+        "can you try web_fetch on https://bytebrew.cc and tell me what it is?",
+        max_steps=1,
+        mode="auto",
+    ) is True
+
+
+def test_auto_mode_keeps_simple_prompt_direct() -> None:
+    assert _should_use_agentic_mode(
+        "hello there",
+        max_steps=1,
+        mode="auto",
+    ) is False
+
+
+@pytest.mark.asyncio
+async def test_direct_mode_sanitizes_pseudo_tool_markup() -> None:
+    slot_manager = AsyncMock()
+    slot_manager.send_to_main = AsyncMock(
+        return_value=(
+            "<sweep>thinking</sweep>\n"
+            "<fetch>url: https://example.com</fetch>\n"
+            "<fetch_result>...</fetch_result>"
+        )
+    )
+    agent = MainAgent(slot_manager=slot_manager, memory=None, config=settings)
+
+    response = await agent.process_direct("can you use web_fetch?")
+
+    assert "cannot execute tools in direct mode" in response.lower()
+
+
+@pytest.mark.asyncio
+async def test_direct_mode_sanitizes_think_sloth_markup() -> None:
+    slot_manager = AsyncMock()
+    slot_manager.send_to_main = AsyncMock(
+        return_value=(
+            "<sloth>\nThinking Process:\n"
+            "1. Simulated Content\n"
+            "2. Self-Correction/Verification\n"
+            "</think>"
+        )
+    )
+    agent = MainAgent(slot_manager=slot_manager, memory=None, config=settings)
+
+    response = await agent.process_direct("can you try web_fetch on https://bytebrew.cc and tell me what it is?")
+
+    assert "cannot execute tools in direct mode" in response.lower()

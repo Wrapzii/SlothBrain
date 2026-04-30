@@ -10,11 +10,9 @@ class AppConfig(BaseSettings):
     llama_port: int = 8080
 
     # Slot assignments
-    watcher_slot: int = 0
     main_slot: int = 1
 
     # Context sizes
-    watcher_context_size: int = 4096
     main_context_size: int = 32768
 
     # KV cache quantisation
@@ -43,6 +41,8 @@ class AppConfig(BaseSettings):
     # Optional hard cap for effective per-slot context budget.
     # Set to 0 to disable and rely on /slots metadata.
     llama_slot_context_cap: int = 0
+    # Cache /slots responses for this many seconds to reduce llama.cpp log spam.
+    slot_info_cache_ttl_seconds: float = 2.0
     max_restarts_per_hour: int = 3
     enable_server_watchdog: bool = True
 
@@ -83,9 +83,12 @@ class AppConfig(BaseSettings):
     # When True, the code_exec tool is available. Disabled by default because
     # exec() is not a full sandbox and should only be used in trusted environments.
     code_exec_enabled: bool = False
-    # Default tool profile for the main agent.
-    # "minimal" keeps prompts small; set to "full" only when tool-heavy tasks need it.
-    main_tool_profile: str = "minimal"
+    # Semantic tool routing
+    semantic_tool_routing_enabled: bool = True
+    semantic_tool_routing_embedding_model: str = ""
+    semantic_tool_routing_top_k: int = 8
+    semantic_tool_routing_min_similarity: float = 0.2
+    semantic_tool_routing_critical_tools: list[str] = ["screenshot", "ui"]
 
     # Discord integration (optional – leave empty to disable DiscordTool)
     discord_webhook_url: str = ""
@@ -138,6 +141,13 @@ class AppConfig(BaseSettings):
             raise ValueError("llama_slot_context_cap must be >= 0")
         return v
 
+    @field_validator("slot_info_cache_ttl_seconds")
+    @classmethod
+    def _validate_slot_info_cache_ttl_seconds(cls, v: float) -> float:
+        if v < 0:
+            raise ValueError("slot_info_cache_ttl_seconds must be >= 0")
+        return v
+
     @field_validator("max_pending_approvals")
     @classmethod
     def _validate_max_pending_approvals(cls, v: int) -> int:
@@ -177,6 +187,20 @@ class AppConfig(BaseSettings):
     def _validate_supervisor_positive_thresholds(cls, v: int) -> int:
         if v < 1:
             raise ValueError("supervisor detection thresholds must be at least 1")
+        return v
+
+    @field_validator("semantic_tool_routing_top_k")
+    @classmethod
+    def _validate_semantic_top_k(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError("semantic_tool_routing_top_k must be at least 1")
+        return v
+
+    @field_validator("semantic_tool_routing_min_similarity")
+    @classmethod
+    def _validate_semantic_similarity(cls, v: float) -> float:
+        if not (-1.0 <= v <= 1.0):
+            raise ValueError("semantic_tool_routing_min_similarity must be between -1 and 1")
         return v
 
     model_config = {"env_prefix": "SLOTHBRAIN_", "env_file": ".env", "extra": "ignore"}

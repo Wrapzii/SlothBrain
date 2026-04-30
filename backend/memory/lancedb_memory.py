@@ -8,6 +8,8 @@ from typing import Any
 try:
     import lancedb
     import numpy as np
+    import pandas  # noqa: F401
+    import pyarrow  # noqa: F401
     from sentence_transformers import SentenceTransformer
     _DEPS_AVAILABLE = True
 except ImportError:
@@ -41,8 +43,8 @@ class LanceDBMemory:
     def __init__(self, db_path: str, embedding_model: str) -> None:
         if not _DEPS_AVAILABLE:
             raise ImportError(
-                "lancedb and sentence-transformers are required for LanceDBMemory. "
-                "Install them with: pip install lancedb sentence-transformers"
+                "LanceDBMemory requires lancedb, sentence-transformers, numpy, pandas, and pyarrow. "
+                "Install them with: pip install lancedb sentence-transformers numpy pandas pyarrow"
             )
         self._db_path = db_path
         self._embedding_model_name = embedding_model

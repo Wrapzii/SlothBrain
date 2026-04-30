@@ -54,7 +54,6 @@ class SubAgent:
         context_size_override: int | None = None,
         max_tokens_override: int | None = None,
         task_description: str = "",
-        tool_profile: str = "minimal",
     ) -> None:
         self.agent_id = agent_id
         self.preset_id: str = preset["id"]
@@ -65,8 +64,6 @@ class SubAgent:
         self.temperature: float = float(preset.get("temperature", 0.7))
         self.max_tokens: int = max_tokens_override or int(preset.get("max_tokens", 1024))
         self.task_description: str = task_description
-        # Tool access profile for this sub-agent
-        self.tool_profile: str = preset.get("tool_profile", tool_profile)
         self._client = llama_client
         self._memory = memory
         if task_description:
@@ -88,7 +85,6 @@ class SubAgent:
             "temperature": self.temperature,
             "max_tokens": self.max_tokens,
             "task_description": self.task_description,
-            "tool_profile": self.tool_profile,
         }
 
     async def process(

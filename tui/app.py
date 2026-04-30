@@ -9,6 +9,7 @@ Run with:
 from __future__ import annotations
 
 import asyncio
+import re
 from typing import ClassVar, Optional
 
 from textual.app import App, ComposeResult
@@ -42,6 +43,17 @@ import tui.api as api
 
 def _fmt(val: object) -> str:
     return str(val) if val is not None else "—"
+
+
+_TOOL_INTENT_RE = re.compile(
+    r"(\bweb_fetch\b|\buse\b.{0,20}\btool\b|\btry\b.{0,20}\btool\b|\bfetch\b\s+https?://)",
+    re.IGNORECASE,
+)
+
+
+def _should_use_agentic_chat(message: str) -> bool:
+    msg = (message or "").strip().lower()
+    return msg.startswith("/task ") or bool(_TOOL_INTENT_RE.search(message or ""))
 
 
 # ---------------------------------------------------------------------------
@@ -219,10 +231,10 @@ class DashboardTab(Container):
 class ChatTab(Container):
     def compose(self) -> ComposeResult:
         yield Label("[b]Chat[/b]")
-        yield Label("Agentic mode only: tasks are planned and executed step-by-step.", id="agentic-label")
+        yield Label("Direct by default. Use /task <goal> for full agentic execution.", id="agentic-label")
         yield Log(id="chat-log", highlight=True)
         with Horizontal(id="chat-input-row"):
-            yield Input(placeholder="Describe a task (Enter to run)", id="chat-input")
+            yield Input(placeholder="Message (or /task <goal>)", id="chat-input")
             yield Button("Run", variant="primary", id="chat-send")
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
@@ -243,13 +255,91 @@ class ChatTab(Container):
         send_btn = self.query_one("#chat-send", Button)
         send_btn.disabled = True
         log = self.query_one("#chat-log", Log)
-        log.write_line(f"[You → agentic] {msg}")
+        use_agentic = _should_use_agentic_chat(msg)
+        mode_label = "agentic" if use_agentic else "direct"
+        log.write_line(f"[You → {mode_label}] {msg}")
         log.write_line("[thinking…]")
         self.run_worker(self._send_async(msg, log), exclusive=False, name="chat-request")
 
     async def _send_async(self, msg: str, log: Log) -> None:
+        use_agentic = _should_use_agentic_chat(msg)
+        if not use_agentic:
+            try:
+                result = await api.send_chat(msg, max_steps=1, mode="direct")
+                response = str(result.get("response", "")).strip() or "(no response returned)"
+                log.write_line(f"[direct] {response}")
+            except Exception as exc:
+                log.write_line(f"[error] {exc}")
+            finally:
+                inp = self.query_one("#chat-input", Input)
+                inp.disabled = False
+                send_btn = self.query_one("#chat-send", Button)
+                send_btn.disabled = False
+                inp.focus()
+            return
+
+        task_msg = msg[6:].strip() if msg.lower().startswith("/task ") else msg
+        task_msg = task_msg or msg
         try:
-            result = await api.send_agentic_chat(msg)
+            result: dict | None = None
+            async for event in api.stream_agentic_chat(task_msg):
+                et = event.get("type")
+                if et == "planning":
+                    log.write_line("[agentic] planning steps...")
+                elif et == "plan_ready":
+                    total = event.get("total_steps", 0)
+                    log.write_line(f"[agentic] plan ready: {total} step(s)")
+                elif et == "step_start":
+                    sn = event.get("step_num")
+                    total = event.get("total_steps")
+                    desc = str(event.get("description", "")).strip()
+                    log.write_line(f"[step {sn}/{total}] {desc}")
+                elif et == "tool_call":
+                    tool = event.get("tool", "unknown")
+                    args = event.get("args", {})
+                    log.write_line(f"[tool → {tool}] args={args}")
+                elif et == "tool_result":
+                    tool = event.get("tool", "unknown")
+                    ok = bool(event.get("ok"))
+                    if ok:
+                        out = str(event.get("output", ""))[:220]
+                        log.write_line(f"[tool ✓ {tool}] {out}")
+                    else:
+                        err = str(event.get("error", "tool failed"))
+                        log.write_line(f"[tool ✗ {tool}] {err}")
+                elif et == "model_error":
+                    err = str(event.get("error", "ModelError"))
+                    msg_txt = str(event.get("message", ""))
+                    log.write_line(f"[model error] {err}: {msg_txt}")
+                elif et == "step_retry":
+                    sn = event.get("step_num")
+                    attempt = event.get("attempt")
+                    fb = str(event.get("feedback", ""))
+                    log.write_line(f"[step {sn}] retry #{attempt}: {fb}")
+                elif et == "step_monitored":
+                    sn = event.get("step_num")
+                    action = event.get("action", "continue")
+                    fb = str(event.get("feedback", ""))
+                    if fb:
+                        log.write_line(f"[watcher step {sn}] {action}: {fb}")
+                elif et == "step_complete":
+                    sn = event.get("step_num")
+                    status = event.get("status", "complete")
+                    log.write_line(f"[step {sn}] {status}")
+                elif et == "verifying":
+                    log.write_line("[agentic] verifying completion...")
+                elif et == "complete":
+                    verified = bool(event.get("verified", False))
+                    summary = str(event.get("summary", ""))
+                    log.write_line(f"[agentic] complete; verified={verified} | {summary}")
+                elif et == "result":
+                    result = event
+                elif et == "error":
+                    raise RuntimeError(str(event.get("message", "Unknown websocket error")))
+
+            if result is None:
+                result = await api.send_agentic_chat(task_msg)
+
             summary = result.get("summary") or "(no summary returned)"
             completed = result.get("completed", False)
             verified = result.get("completion_verified", False)
@@ -260,6 +350,18 @@ class ChatTab(Container):
             log.write_line(f"[agentic:{', '.join(status_bits)}] {summary}")
         except Exception as exc:
             log.write_line(f"[error] {exc}")
+            try:
+                result = await api.send_agentic_chat(task_msg)
+                summary = result.get("summary") or "(no summary returned)"
+                completed = result.get("completed", False)
+                verified = result.get("completion_verified", False)
+                status_bits = [
+                    "completed" if completed else "incomplete",
+                    "verified" if verified else "unverified",
+                ]
+                log.write_line(f"[agentic:{', '.join(status_bits)}] {summary}")
+            except Exception as fallback_exc:
+                log.write_line(f"[error] fallback request failed: {fallback_exc}")
         finally:
             inp = self.query_one("#chat-input", Input)
             inp.disabled = False
@@ -483,12 +585,10 @@ class SettingsTab(Container):
         yield Input(id="s-host", placeholder="127.0.0.1")
         yield Label("Server Port")
         yield Input(id="s-port", placeholder="8080")
-        yield Label("Watcher Slot")
-        yield Input(id="s-watcher-slot", placeholder="0")
         yield Label("Main Slot")
         yield Input(id="s-main-slot", placeholder="1")
-        yield Label("Context Size")
-        yield Input(id="s-ctx", placeholder="4096")
+        yield Label("Main Context Size")
+        yield Input(id="s-ctx", placeholder="32768")
         with Horizontal(id="settings-buttons"):
             yield Button("Load", id="s-load", variant="default")
             yield Button("Save", id="s-save", variant="primary")
@@ -506,18 +606,16 @@ class SettingsTab(Container):
             return
         self.query_one("#s-host", Input).value = _fmt(cfg.get("llama_host", "127.0.0.1"))
         self.query_one("#s-port", Input).value = _fmt(cfg.get("llama_port", "8080"))
-        self.query_one("#s-watcher-slot", Input).value = _fmt(cfg.get("watcher_slot", "0"))
         self.query_one("#s-main-slot", Input).value = _fmt(cfg.get("main_slot", "1"))
-        self.query_one("#s-ctx", Input).value = _fmt(cfg.get("context_size", "4096"))
+        self.query_one("#s-ctx", Input).value = _fmt(cfg.get("main_context_size", "32768"))
         self.query_one("#s-status", Label).update("Settings loaded.")
 
     async def _save(self) -> None:
         data: dict = {
             "llama_host": self.query_one("#s-host", Input).value,
             "llama_port": int(self.query_one("#s-port", Input).value or "8080"),
-            "watcher_slot": int(self.query_one("#s-watcher-slot", Input).value or "0"),
             "main_slot": int(self.query_one("#s-main-slot", Input).value or "1"),
-            "context_size": int(self.query_one("#s-ctx", Input).value or "4096"),
+            "main_context_size": int(self.query_one("#s-ctx", Input).value or "32768"),
         }
         try:
             await api.update_settings(data)

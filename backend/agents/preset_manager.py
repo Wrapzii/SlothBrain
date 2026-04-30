@@ -63,14 +63,13 @@ class PresetManager:
             "context_size": int(data["context_size"]),
             "temperature": float(data["temperature"]),
             "max_tokens": int(data["max_tokens"]),
-            "tool_profile": str(data.get("tool_profile", "minimal")),
         }
         self._save(preset)
         return preset
 
     def update_preset(self, preset_id: str, data: dict[str, Any]) -> dict:
         existing = self._load(preset_id)
-        updatable = {"name", "description", "system_prompt", "context_size", "temperature", "max_tokens", "tool_profile"}
+        updatable = {"name", "description", "system_prompt", "context_size", "temperature", "max_tokens"}
         for field in updatable:
             if field in data:
                 existing[field] = data[field]

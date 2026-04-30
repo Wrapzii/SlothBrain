@@ -4,6 +4,7 @@ import asyncio
 import ipaddress
 import json
 import logging
+import re
 from contextlib import asynccontextmanager
 from functools import lru_cache
 from typing import Any
@@ -14,11 +15,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from backend.agents.handoff import HandoffManager
 from backend.agents.main_agent import MainAgent
 from backend.agents.preset_manager import PresetManager
 from backend.agents.registry import AgentRegistry
-from backend.agents.watcher import WatcherAgent
 from backend.benchmarks.benchmark import BenchmarkSuite
 from backend.config import settings
 from backend.core.approval_queue import ApprovalQueue
@@ -29,16 +28,21 @@ from backend.core.resource_manager import ResourceManager
 from backend.core.safety_supervisor import SafetySupervisor
 from backend.core.server_manager import ServerManager
 from backend.core.slot_manager import SlotManager
+from backend.core.semantic_router import SemanticRouter
 from backend.memory.lancedb_memory import LanceDBMemory
-from backend.memory.rolling_context import RollingContext
 from backend.tools.registry import ToolRegistry
 
 
 logger = logging.getLogger(__name__)
 
+_AUTO_AGENTIC_TOOL_INTENT_RE = re.compile(
+    r"(\bweb_fetch\b|\buse\b.{0,20}\btool\b|\btry\b.{0,20}\btool\b|\bfetch\b\s+https?://)",
+    re.IGNORECASE,
+)
+
 
 async def _apply_effective_slot_context_budget() -> None:
-    """Clamp watcher/main context sizes to the effective per-slot budget.
+    """Clamp main context size to the effective per-slot budget.
 
     Some llama.cpp configurations split total --ctx-size across -np slots.
     This keeps internal agent context settings aligned with the actual
@@ -67,17 +71,13 @@ async def _apply_effective_slot_context_budget() -> None:
     if budget is None or budget <= 0:
         return
 
-    old_watcher = settings.watcher_context_size
     old_main = settings.main_context_size
-    settings.watcher_context_size = min(old_watcher, budget)
     settings.main_context_size = min(old_main, budget)
 
-    if settings.watcher_context_size != old_watcher or settings.main_context_size != old_main:
+    if settings.main_context_size != old_main:
         logger.warning(
-            "Context sizes clamped to effective slot budget=%d (watcher: %d->%d, main: %d->%d)",
+            "Context size clamped to effective slot budget=%d (main: %d->%d)",
             budget,
-            old_watcher,
-            settings.watcher_context_size,
             old_main,
             settings.main_context_size,
         )
@@ -88,11 +88,8 @@ async def _apply_effective_slot_context_budget() -> None:
 llama_client: LlamaClient
 slot_manager: SlotManager
 resource_manager: ResourceManager
-rolling_context: RollingContext
 memory: LanceDBMemory
-watcher_agent: WatcherAgent
 main_agent: MainAgent
-handoff_manager: HandoffManager
 benchmark_suite: BenchmarkSuite
 preset_manager: PresetManager
 agent_registry: AgentRegistry
@@ -106,8 +103,8 @@ tool_registry: ToolRegistry
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):  # type: ignore[type-arg]
-    global llama_client, slot_manager, resource_manager, rolling_context
-    global memory, watcher_agent, main_agent, handoff_manager, benchmark_suite
+    global llama_client, slot_manager, resource_manager
+    global memory, main_agent, benchmark_suite
     global preset_manager, agent_registry, server_manager, audit_log, approval_queue
     global checkpoint_manager, safety_supervisor, tool_registry
 
@@ -117,17 +114,11 @@ async def lifespan(app: FastAPI):  # type: ignore[type-arg]
 
     llama_client = LlamaClient(host=settings.llama_host, port=settings.llama_port)
     slot_manager = SlotManager(llama_client=llama_client)
+    slot_manager.set_slot_info_cache_ttl(settings.slot_info_cache_ttl_seconds)
     resource_manager = ResourceManager(config=settings, llama_client=llama_client)
 
-    await slot_manager.assign_watcher(settings.watcher_slot)
     await slot_manager.assign_main(settings.main_slot)
     await _apply_effective_slot_context_budget()
-
-    rolling_context = RollingContext(
-        llama_client=llama_client,
-        slot_id=settings.watcher_slot,
-        max_tokens=settings.watcher_context_size,
-    )
 
     try:
         memory = LanceDBMemory(
@@ -138,18 +129,11 @@ async def lifespan(app: FastAPI):  # type: ignore[type-arg]
         print(f"[WARNING] LanceDB unavailable – memory disabled: {exc}")
         memory = None  # type: ignore[assignment]
 
-    watcher_agent = WatcherAgent(
-        slot_manager=slot_manager,
-        rolling_context=rolling_context,
-        memory=memory,  # type: ignore[arg-type]
-        config=settings,
-    )
     main_agent = MainAgent(
         slot_manager=slot_manager,
         memory=memory,  # type: ignore[arg-type]
         config=settings,
     )
-    handoff_manager = HandoffManager(watcher=watcher_agent, main_agent=main_agent)
     benchmark_suite = BenchmarkSuite(llama_client=llama_client, config=settings)
 
     preset_manager = PresetManager()
@@ -162,7 +146,23 @@ async def lifespan(app: FastAPI):  # type: ignore[type-arg]
     main_agent.set_registry(agent_registry)
 
     # ── Tool system ──────────────────────────────────────────────────────────
-    tool_registry = ToolRegistry()
+    semantic_model = (
+        settings.semantic_tool_routing_embedding_model.strip()
+        or settings.embedding_model
+    )
+    semantic_router = SemanticRouter(
+        embedding_model=semantic_model,
+        top_k=settings.semantic_tool_routing_top_k,
+        min_similarity=settings.semantic_tool_routing_min_similarity,
+        enabled=settings.semantic_tool_routing_enabled,
+        critical_tools=settings.semantic_tool_routing_critical_tools,
+    )
+    tool_registry = ToolRegistry(
+        semantic_router=semantic_router,
+        semantic_top_k=settings.semantic_tool_routing_top_k,
+        semantic_min_similarity=settings.semantic_tool_routing_min_similarity,
+        critical_bypass_tools=settings.semantic_tool_routing_critical_tools,
+    )
     _register_tools(tool_registry, settings, audit_log, memory, agent_registry, llama_client)
     main_agent.set_tool_registry(tool_registry)
 
@@ -393,6 +393,7 @@ async def protect_api(request: Request, call_next):
 class ChatRequest(BaseModel):
     message: str
     max_steps: int = 10
+    mode: str = "auto"  # "auto" | "direct" | "agentic"
 
 
 class ModeRequest(BaseModel):
@@ -402,9 +403,7 @@ class ModeRequest(BaseModel):
 class SettingsUpdate(BaseModel):
     llama_host: str | None = None
     llama_port: int | None = None
-    watcher_slot: int | None = None
     main_slot: int | None = None
-    watcher_context_size: int | None = None
     main_context_size: int | None = None
     idle_kv_quant: str | None = None
     active_kv_quant: str | None = None
@@ -420,6 +419,11 @@ class SettingsUpdate(BaseModel):
     require_approval_kv_cache_change: bool | None = None
     require_approval_large_context_increase: bool | None = None
     require_approval_emergency_stop: bool | None = None
+    semantic_tool_routing_enabled: bool | None = None
+    semantic_tool_routing_embedding_model: str | None = None
+    semantic_tool_routing_top_k: int | None = None
+    semantic_tool_routing_min_similarity: float | None = None
+    semantic_tool_routing_critical_tools: list[str] | None = None
 
 
 class BenchmarkRequest(BaseModel):
@@ -433,7 +437,6 @@ class PresetCreate(BaseModel):
     context_size: int = 8192
     temperature: float = 0.7
     max_tokens: int = 1024
-    tool_profile: str = "minimal"
 
 
 class PresetUpdate(BaseModel):
@@ -443,7 +446,6 @@ class PresetUpdate(BaseModel):
     context_size: int | None = None
     temperature: float | None = None
     max_tokens: int | None = None
-    tool_profile: str | None = None
 
 
 class AgentChatRequest(BaseModel):
@@ -455,7 +457,6 @@ class SpawnRequest(BaseModel):
     context_size: int | None = None   # override preset default
     max_tokens: int | None = None     # override preset default
     task_description: str = ""
-    tool_profile: str = "minimal"     # tool access profile for this sub-agent
 
 
 class AgenticRequest(BaseModel):
@@ -513,6 +514,39 @@ def _is_loopback_host(host: str | None) -> bool:
         return False
 
 
+def _should_use_agentic_mode(message: str, max_steps: int, mode: str) -> bool:
+    """Decide whether /api/chat should run the full agentic loop.
+
+    Rules:
+    - mode=direct forces direct response.
+    - mode=agentic forces agentic loop.
+    - mode=auto uses simple heuristics so normal chat is direct by default.
+    """
+    normalized_mode = (mode or "auto").strip().lower()
+    if normalized_mode == "direct":
+        return False
+    if normalized_mode == "agentic":
+        return True
+
+    msg = (message or "").strip()
+    lower = msg.lower()
+
+    # Explicit trigger prefixes for power users.
+    if lower.startswith("/task ") or lower.startswith("/agentic "):
+        return True
+
+    # If caller requests multiple steps, treat as an agentic task.
+    if max_steps > 1:
+        return True
+
+    # Tool-intent prompts should run through agentic mode so tool execution is real.
+    if _AUTO_AGENTIC_TOOL_INTENT_RE.search(msg):
+        return True
+
+    # Otherwise default to direct chat for quick responsiveness.
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Existing endpoints
 # ---------------------------------------------------------------------------
@@ -528,13 +562,31 @@ async def get_status() -> dict:
         slot_info = await slot_manager.get_slot_info()
     except Exception as exc:
         logger.warning("Failed to fetch slot info: %s", exc.__class__.__name__)
-        slot_info = {"watcher": settings.watcher_slot, "main": settings.main_slot, "slots": []}
+        slot_info = {"main": settings.main_slot, "slots": []}
     return {**stats, "slots": slot_info}
 
 
 @app.post("/api/chat")
 async def chat(http_request: Request, request: ChatRequest) -> dict:
-    """Backward-compatible chat endpoint that now always runs agentic mode."""
+    """Chat endpoint with auto-routing between direct and agentic modes."""
+    use_agentic = _should_use_agentic_mode(request.message, request.max_steps, request.mode)
+
+    if not use_agentic:
+        await _ensure_llama_available("Direct chat")
+        try:
+            response = await main_agent.process_direct(user_input=request.message)
+        except (httpx.HTTPError, RuntimeError, ValueError) as exc:
+            _raise_service_unavailable(exc, "Direct chat")
+        return {
+            "agent": "direct",
+            "response": response,
+            "handoff": False,
+            "result": {
+                "mode": "direct",
+                "completed": True,
+            },
+        }
+
     from backend.agents.agentic_loop import AgenticLoop
 
     await _ensure_llama_available("Agentic loop")
@@ -545,21 +597,26 @@ async def chat(http_request: Request, request: ChatRequest) -> dict:
             detail="Another agentic task is already running. Please wait.",
         )
 
+    task_message = request.message.strip()
+    for prefix in ("/task", "/agentic"):
+        if task_message.lower().startswith(prefix):
+            task_message = task_message[len(prefix):].strip()
+            break
+
     async with _agentic_lock:
         loop = AgenticLoop(
             main_agent=main_agent,
-            watcher_agent=watcher_agent,
             max_steps=_clamp_steps(request.max_steps),
             checkpoint_manager=checkpoint_manager,
             supervisor=safety_supervisor,
         )
         try:
             result = await _run_agentic_with_cancel(
-                http_request, loop.run(task=request.message)
+                http_request, loop.run(task=task_message)
             )
         except (httpx.HTTPError, RuntimeError, ValueError) as exc:
             _raise_service_unavailable(exc, "Agentic loop")
-    # Keep a short response shape for older clients.
+
     return {
         "agent": "agentic",
         "response": result.get("summary", ""),
@@ -568,14 +625,32 @@ async def chat(http_request: Request, request: ChatRequest) -> dict:
     }
 
 
+@app.post("/api/chat/direct")
+async def direct_chat(request: ChatRequest) -> dict:
+    """Explicit direct chat endpoint (single-shot, no task planning loop)."""
+    await _ensure_llama_available("Direct chat")
+    try:
+        response = await main_agent.process_direct(user_input=request.message)
+    except (httpx.HTTPError, RuntimeError, ValueError) as exc:
+        _raise_service_unavailable(exc, "Direct chat")
+    return {
+        "agent": "direct",
+        "response": response,
+        "handoff": False,
+        "result": {
+            "mode": "direct",
+            "completed": True,
+        },
+    }
+
+
 @app.post("/api/chat/agentic")
 async def agentic_chat(http_request: Request, request: AgenticRequest) -> dict:
     """Run a multi-step agentic task loop and return the full result.
 
-    The MainAgent plans the task, executes each step in sequence, and the
-    WatcherAgent monitors progress and verifies completion.  The
-    SafetySupervisor watches for stalls and the CheckpointManager saves state
-    before every step so the loop can recover cleanly on failure.
+    The MainAgent plans the task and executes each step in sequence.
+    The SafetySupervisor watches for stalls and the CheckpointManager saves
+    state before every step so the loop can recover cleanly on failure.
     """
     from backend.agents.agentic_loop import AgenticLoop
 
@@ -590,7 +665,6 @@ async def agentic_chat(http_request: Request, request: AgenticRequest) -> dict:
     async with _agentic_lock:
         loop = AgenticLoop(
             main_agent=main_agent,
-            watcher_agent=watcher_agent,
             max_steps=_clamp_steps(request.max_steps),
             checkpoint_manager=checkpoint_manager,
             supervisor=safety_supervisor,
@@ -766,7 +840,6 @@ async def spawn_agent(preset_id: str, body: SpawnRequest = SpawnRequest()) -> di
             context_size_override=body.context_size,
             max_tokens_override=body.max_tokens,
             task_description=body.task_description,
-            tool_profile=body.tool_profile,
         )
         audit_log.record(action="agent_spawned", actor="api", after=agent.info())
         return agent.info()
@@ -778,11 +851,11 @@ async def spawn_agent(preset_id: str, body: SpawnRequest = SpawnRequest()) -> di
 # Tool Registry
 # ---------------------------------------------------------------------------
 @app.get("/api/tools")
-async def list_tools(profile: str = "full") -> dict:
-    """List all tools available in the given profile."""
-    tools = tool_registry.get_tools_for_profile(profile)
+async def list_tools() -> dict:
+    """List tools currently available to semantic routing."""
+    tools = tool_registry.get_tools()
     return {
-        "profile": profile,
+        "profile": "semantic_only",
         "tools": [
             {
                 "name": t.name,
@@ -957,7 +1030,7 @@ async def ws_status(websocket: WebSocket) -> None:
                 slot_info = await slot_manager.get_slot_info()
             except Exception as exc:
                 logger.warning("ws/status slot fetch failed: %s", exc.__class__.__name__)
-                slot_info = {"watcher": settings.watcher_slot, "main": settings.main_slot, "slots": []}
+                slot_info = {"main": settings.main_slot, "slots": []}
             payload = {
                 **stats,
                 "slots": slot_info,
@@ -1023,7 +1096,6 @@ async def ws_agent_progress(websocket: WebSocket) -> None:
 
         loop = AgenticLoop(
             main_agent=main_agent,
-            watcher_agent=watcher_agent,
             max_steps=max_steps,
             checkpoint_manager=checkpoint_manager,
             supervisor=safety_supervisor,

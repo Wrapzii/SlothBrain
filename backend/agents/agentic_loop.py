@@ -25,9 +25,6 @@ The loop uses three collaborating components:
     end_task         – abort the loop cleanly
     escalate_to_user – abort and surface the problem to the operator
 
-The watcher (``WatcherAgent``) observes every completed step result and
-returns ``continue | retry | done | abort``.
-
 An optional ``on_progress`` callback streams structured events to callers for
 real-time client updates.
 
@@ -48,13 +45,12 @@ from typing import TYPE_CHECKING, Awaitable, Callable, Optional
 
 if TYPE_CHECKING:
     from backend.agents.main_agent import MainAgent
-    from backend.agents.watcher import WatcherAgent
     from backend.core.checkpoint_manager import CheckpointManager
     from backend.core.safety_supervisor import LoopHandle, SafetySupervisor
 
 logger = logging.getLogger(__name__)
 
-# Maximum watcher-requested retries for a single step before moving on.
+# Maximum retries for a single step before moving on.
 _MAX_STEP_RETRIES = 2
 
 # Guardrail: cap persisted step context to avoid prompt/context blow-up.
@@ -68,7 +64,6 @@ class AgenticStep:
         self.step_num = step_num
         self.description = description
         self.result: str = ""
-        self.watcher_feedback: str = ""
         self.status: str = "pending"  # pending | running | complete | failed
         self.screenshots: list[str] = []  # base64-encoded PNG strings
         self.retries: int = 0
@@ -84,7 +79,6 @@ class AgenticStep:
             "step_num": self.step_num,
             "description": self.description,
             "result": self.result,
-            "watcher_feedback": self.watcher_feedback,
             "status": self.status,
             "screenshots": self.screenshots,
             "retries": self.retries,
@@ -104,16 +98,13 @@ class AgenticLoop:
        c. Any pending supervisor intervention is applied first.
        d. MainAgent **executes** the step with accumulated context.
        e. Optional screenshot is captured.
-       f. WatcherAgent **monitors** the result.
-       g. Supervisor intervention (if any) is merged with watcher decision.
-    3. WatcherAgent **verifies** the overall task is complete.
+         f. Supervisor observes step output and can intervene.
+     3. Loop returns summary based on executed steps.
 
     Parameters
     ----------
     main_agent:
         The ``MainAgent`` instance responsible for planning and execution.
-    watcher_agent:
-        The ``WatcherAgent`` instance that monitors progress.
     max_steps:
         Hard cap on the number of steps executed (default 10).
     screenshot_fn:
@@ -127,14 +118,12 @@ class AgenticLoop:
     def __init__(
         self,
         main_agent: "MainAgent",
-        watcher_agent: "WatcherAgent",
         max_steps: int = 10,
         screenshot_fn: Optional[Callable[[], Awaitable[dict]]] = None,
         checkpoint_manager: Optional["CheckpointManager"] = None,
         supervisor: Optional["SafetySupervisor"] = None,
     ) -> None:
         self._main = main_agent
-        self._watcher = watcher_agent
         self._max_steps = max_steps
         self._screenshot_fn = screenshot_fn
         self._cp = checkpoint_manager
@@ -338,9 +327,19 @@ class AgenticLoop:
 
                 # ── Execute step ─────────────────────────────────────────
                 async def _on_step_event(event: dict) -> dict | None:
+                    et = event.get("type")
+
+                    # Forward detailed execution events to UI/websocket clients.
+                    if et in ("tool_call", "tool_result", "model_error"):
+                        await emit(et, event)
+                    elif et == "model_output":
+                        await emit(
+                            "model_output",
+                            {"output_preview": str(event.get("output", ""))[:300]},
+                        )
+
                     if handle is None:
                         return None
-                    et = event.get("type")
                     detected: dict | None = None
                     if et == "model_output":
                         detected = handle.observe_model_output(
@@ -377,6 +376,8 @@ class AgenticLoop:
                         on_event=_on_step_event,
                     )
                     step.result = result
+                    if not (step.result or "").strip():
+                        step.result = "Execution error: empty model response"
                 except Exception as exc:
                     logger.error(
                         "execute_step error (step %d, attempt %d): %s",
@@ -414,35 +415,6 @@ class AgenticLoop:
                     except Exception:
                         pass  # screenshots are best-effort
 
-                # ── Watcher assessment ────────────────────────────────────
-                try:
-                    assessment = await self._watcher.monitor_step(
-                        task=task,
-                        step_description=description,
-                        step_result=step.result,
-                        step_num=step_num,
-                        total_steps=len(step_descriptions),
-                        context=context,
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        "monitor_step failed: %s", exc.__class__.__name__
-                    )
-                    assessment = {"action": "continue", "feedback": ""}
-
-                step.watcher_feedback = assessment.get("feedback", "")
-                final_action = assessment.get("action", "continue")
-
-                await emit(
-                    "step_monitored",
-                    {
-                        "step_num": step_num,
-                        "action": final_action,
-                        "feedback": step.watcher_feedback,
-                        "result_preview": step.result[:300],
-                    },
-                )
-
                 if final_action == "abort":
                     break
 
@@ -453,15 +425,13 @@ class AgenticLoop:
                         {
                             "step_num": step_num,
                             "attempt": attempt + 2,
-                            "feedback": step.watcher_feedback,
+                            "feedback": "Retry requested",
                         },
                     )
-                    context.append(
-                        f"Step {step_num} retry feedback: {step.watcher_feedback}"
-                    )
+                    context.append(f"Step {step_num} retry requested.")
                     continue  # retry this step
 
-                # "continue" or "done" – move to next step
+                # continue – move to next step
                 break
 
             if final_action in ("abort", "escalate"):
@@ -477,9 +447,7 @@ class AgenticLoop:
             await emit("step_complete", step.to_dict())
 
             if final_action in ("abort", "escalate"):
-                # Use watcher feedback as the human-readable reason when
-                # available (supervisor end_task/escalate use step.result).
-                reason = step.watcher_feedback or step.result
+                reason = step.result
                 if final_action == "escalate":
                     await emit("escalated", {"step_num": step_num, "reason": reason})
                 else:
@@ -492,26 +460,12 @@ class AgenticLoop:
                     start_time,
                 )
 
-            if final_action == "done":
-                break  # watcher declared task already complete
-
             idx += 1  # advance to next step
 
-        # ── 3. Verify ────────────────────────────────────────────────────────
+        # ── 3. Finalize ─────────────────────────────────────────────────────
         await emit("verifying", {"steps_completed": len(executed)})
-        try:
-            verification = await self._watcher.verify_completion(
-                task=task,
-                steps_summary=context,
-            )
-            verified: bool = verification.get("complete", True)
-            summary: str = verification.get("feedback", "Task complete.")
-        except Exception as exc:
-            logger.warning(
-                "verify_completion failed: %s", exc.__class__.__name__
-            )
-            verified = len(executed) > 0
-            summary = "Task execution complete."
+        verified = len(executed) > 0 and all(s.status == "complete" for s in executed)
+        summary = "Task execution complete." if verified else "Task execution finished with failures."
 
         result_dict = _build_result(task, executed, verified, summary, start_time)
         await emit(
@@ -583,8 +537,7 @@ class AgenticLoop:
 
         if action == "retry_step":
             # Emit the retry event so the UI shows it, but don't increment
-            # step.retries here – that counter is managed by the watcher retry
-            # path so it accurately reflects watcher-requested retries.
+            # step.retries is only incremented by the outer retry loop.
             await emit(
                 "step_retry",
                 {
@@ -628,7 +581,6 @@ def _dict_to_step(d: dict) -> "AgenticStep":
         description=d.get("description", ""),
     )
     step.result = d.get("result", "")
-    step.watcher_feedback = d.get("watcher_feedback", "")
     step.status = d.get("status", "complete")
     step.screenshots = d.get("screenshots", [])
     step.retries = d.get("retries", 0)

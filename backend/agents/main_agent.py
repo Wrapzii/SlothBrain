@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 import logging
@@ -27,11 +28,42 @@ _FALLBACK_SYSTEM_PROMPT = (
     "Use the provided context and memory to give comprehensive answers."
 )
 
+_DIRECT_SYSTEM_PROMPT = (
+    "You are SlothBrain in direct chat mode. Reply to the user directly and concisely. "
+    "Do not describe internal planning, verification, steps, watcher checks, or task-loop status. "
+    "If asked about capabilities, list them plainly from known system features."
+)
+
 # Maximum characters to keep when falling back to a single-step plan.
 _MAX_FALLBACK_STEP_LENGTH = 300
 
 # Maximum tool-call iterations per execute_step call to prevent infinite loops.
 _MAX_TOOL_ITERATIONS = 5
+_TOOL_QUERY_RE = re.compile(r"\b(tool|tools|capabilit(?:y|ies)|access)\b", re.IGNORECASE)
+_TOOL_BLOCK_RE = re.compile(
+    r"</?(?:tool_call|tool_result|fetch|fetch_result|verify|sweep|think|sloth)>"
+    r"|thinking\s+process:"
+    r"|\bself-correction/verification\b"
+    r"|\bsimulated content\b",
+    re.IGNORECASE,
+)
+
+
+def _sanitize_direct_response(text: str) -> str:
+    """Strip pseudo-tool markup from direct responses.
+
+    Direct mode should not claim tool execution. If model output includes tool
+    protocol style tags, replace with a clear and truthful user-facing message.
+    """
+    stripped = (text or "").strip()
+    if not stripped:
+        return stripped
+    if _TOOL_BLOCK_RE.search(stripped):
+        return (
+            "I cannot execute tools in direct mode. "
+            "Use /task <goal> to run agentic mode and perform real tool calls."
+        )
+    return stripped
 
 
 def _load_protected_prompt() -> str:
@@ -138,18 +170,15 @@ class MainAgent:
         # Injected after construction so we avoid circular imports
         self._registry: AgentRegistry | None = None
         self._tool_registry: "ToolRegistry | None" = None
-        self._tool_profile: str = getattr(config, "main_tool_profile", "full")
         # Guardrail: cap injected tool transcript size to avoid runaway prompt growth.
         self._MAX_TOOL_CONTEXT_CHARS = 6000
     def set_registry(self, registry: "AgentRegistry") -> None:
         """Inject the AgentRegistry so MainAgent can spawn sub-agents."""
         self._registry = registry
 
-    def set_tool_registry(self, tool_registry: "ToolRegistry", profile: str | None = None) -> None:
-        """Inject the ToolRegistry and optional tool profile override."""
+    def set_tool_registry(self, tool_registry: "ToolRegistry") -> None:
+        """Inject the ToolRegistry."""
         self._tool_registry = tool_registry
-        if profile is not None:
-            self._tool_profile = profile
 
     # ------------------------------------------------------------------
     # Sub-agent delegation
@@ -186,7 +215,6 @@ class MainAgent:
     async def process(
         self,
         user_input: str,
-        context_from_watcher: str = "",
     ) -> str:
         memory_results: list[dict] = []
         if self._memory is not None:
@@ -200,14 +228,10 @@ class MainAgent:
             snippets = "\n".join(f"- {r['text']}" for r in memory_results)
             memory_context = f"\n\nRelevant past context:\n{snippets}"
 
-        watcher_section = ""
-        if context_from_watcher:
-            watcher_section = f"\n\nWatcher initial assessment:\n{context_from_watcher}"
-
         full_prompt = (
             f"system: {self.system_prompt}"
             f"{memory_context}"
-            f"{watcher_section}\n\n"
+            "\n\n"
             f"user: {user_input}\nassistant:"
         )
 
@@ -225,6 +249,61 @@ class MainAgent:
                 logger.warning("MainAgent memory store failed: %s", exc.__class__.__name__)
 
         return response
+
+    async def process_direct(self, user_input: str) -> str:
+        """Single-shot direct chat path (no task-planning framing).
+
+        This path intentionally avoids the heavy agentic-loop prompt style so
+        normal chat requests return plain user-facing answers.
+        """
+        if _TOOL_QUERY_RE.search(user_input):
+            return self._describe_direct_capabilities()
+
+        prompt = (
+            f"system: {_DIRECT_SYSTEM_PROMPT}\n\n"
+            f"user: {user_input}\n"
+            "assistant:"
+        )
+
+        response = await self._slot_manager.send_to_main(prompt, max_tokens=900)
+        response = _sanitize_direct_response(response)
+
+        if self._memory is not None:
+            try:
+                asyncio.create_task(
+                    self._memory.store(
+                        text=f"user: {user_input}\nassistant: {response}",
+                        metadata={"agent": "main", "slot": self.slot_id, "mode": "direct"},
+                    )
+                )
+            except Exception:
+                # Never block direct responses on memory write scheduling.
+                pass
+
+        return response
+
+    def _describe_direct_capabilities(self) -> str:
+        """Return a deterministic capabilities summary from registered tools."""
+        if self._tool_registry is None:
+            return (
+                "I currently do not have a tool registry attached, so only plain text chat is available right now."
+            )
+
+        tools = self._tool_registry.get_tools()
+        if not tools:
+            return (
+                "I currently have no external tools enabled. "
+                "I can still provide direct text answers."
+            )
+
+        lines = [
+            f"I currently have access to {len(tools)} tool(s):"
+        ]
+        for tool in sorted(tools, key=lambda t: t.name):
+            lines.append(f"- {tool.name}: {tool.description}")
+
+        lines.append("Use /task <goal> to run agentic mode where tools can be invoked during step execution.")
+        return "\n".join(lines)
 
     # ------------------------------------------------------------------
     # Agentic-loop helpers
@@ -304,7 +383,16 @@ class MainAgent:
         tools_section = ""
         tools: list = []
         if self._tool_registry is not None:
-            tools = self._tool_registry.get_tools_for_profile(self._tool_profile)
+            routing_context_parts = [
+                f"task: {task}",
+                f"step: {step}",
+            ]
+            if context:
+                routing_context_parts.append("recent_context:")
+                routing_context_parts.extend(context[-3:])
+            routing_context = "\n".join(routing_context_parts)
+
+            tools = self._tool_registry.get_tools(context=routing_context)
             if tools:
                 tools_block = self._tool_registry.render_tool_descriptions(tools)
                 tools_section = (

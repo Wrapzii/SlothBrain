@@ -65,8 +65,27 @@ async def emergency_stop() -> dict:
 
 # --- Chat ---
 
+async def send_chat(message: str, max_steps: int = 1, mode: str = "auto") -> dict:
+    return await post("/api/chat", {"message": message, "max_steps": max_steps, "mode": mode})
+
+
+async def send_direct_chat(message: str) -> dict:
+    return await post("/api/chat/direct", {"message": message})
+
 async def send_agentic_chat(task: str, max_steps: int = 10) -> dict:
     return await post("/api/chat/agentic", {"task": task, "max_steps": max_steps})
+
+
+async def stream_agentic_chat(task: str, max_steps: int = 10, base: str = BASE) -> AsyncIterator[dict]:
+    """Yield live agentic-loop events over the progress websocket."""
+    import json
+    import websockets  # type: ignore
+
+    ws_url = base.replace("http://", "ws://").replace("https://", "wss://") + "/ws/agent-progress"
+    async with websockets.connect(ws_url) as ws:
+        await ws.send(json.dumps({"task": task, "max_steps": max_steps}))
+        async for msg in ws:
+            yield json.loads(msg)
 
 
 async def chat_with_agent(agent_id: str, message: str) -> dict:

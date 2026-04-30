@@ -4,21 +4,16 @@ import argparse
 import asyncio
 from dataclasses import dataclass
 
-from backend.agents.handoff import HandoffManager
 from backend.agents.main_agent import MainAgent
-from backend.agents.watcher import WatcherAgent
 from backend.config import settings
 from backend.core.llama_client import LlamaClient
 from backend.core.resource_manager import ResourceManager
 from backend.core.slot_manager import SlotManager
 from backend.memory.lancedb_memory import LanceDBMemory
-from backend.memory.rolling_context import RollingContext
 
 
 @dataclass
 class RuntimeState:
-    handoff: HandoffManager
-    watcher: WatcherAgent
     main_agent: MainAgent
     resources: ResourceManager
 
@@ -28,14 +23,7 @@ async def build_runtime() -> RuntimeState:
     slot_manager = SlotManager(llama_client=llama_client)
     resource_manager = ResourceManager(config=settings, llama_client=llama_client)
 
-    await slot_manager.assign_watcher(settings.watcher_slot)
     await slot_manager.assign_main(settings.main_slot)
-
-    rolling_context = RollingContext(
-        llama_client=llama_client,
-        slot_id=settings.watcher_slot,
-        max_tokens=settings.watcher_context_size,
-    )
 
     memory: LanceDBMemory | None
     try:
@@ -46,21 +34,12 @@ async def build_runtime() -> RuntimeState:
     except ImportError:
         memory = None
 
-    watcher = WatcherAgent(
-        slot_manager=slot_manager,
-        rolling_context=rolling_context,
-        memory=memory,  # type: ignore[arg-type]
-        config=settings,
-    )
     main_agent = MainAgent(
         slot_manager=slot_manager,
         memory=memory,  # type: ignore[arg-type]
         config=settings,
     )
-    handoff = HandoffManager(watcher=watcher, main_agent=main_agent)
     return RuntimeState(
-        handoff=handoff,
-        watcher=watcher,
         main_agent=main_agent,
         resources=resource_manager,
     )
@@ -70,7 +49,7 @@ def _print_help() -> None:
     print("Commands:")
     print("  /help                   Show commands")
     print("  /quit                   Exit")
-    print("  /agent auto|watcher|main  Set routing")
+    print("  /agent main             Set routing")
     print("  /mode idle|active       Set resource mode")
     print("  /status                 Show resource status")
 
@@ -99,8 +78,8 @@ async def repl(default_agent: str) -> None:
             break
         if user_input.startswith("/agent "):
             next_agent = user_input.split(" ", 1)[1].strip().lower()
-            if next_agent not in {"auto", "watcher", "main"}:
-                print("Invalid agent. Use auto, watcher, or main.")
+            if next_agent != "main":
+                print("Invalid agent. Use main.")
                 continue
             agent = next_agent
             continue
@@ -118,15 +97,11 @@ async def repl(default_agent: str) -> None:
             continue
 
         try:
-            if agent == "watcher":
-                response = await runtime.watcher.process(user_input)
-                print(f"watcher> {response}")
-            elif agent == "main":
+            if agent == "main":
                 response = await runtime.main_agent.process(user_input)
                 print(f"main> {response}")
             else:
-                routed = await runtime.handoff.route(user_input)
-                print(f"{routed['agent']}> {routed['response']}")
+                print("Only main agent routing is available.")
         except Exception as exc:
             print(f"error: {exc}")
 
@@ -135,8 +110,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="SlothBrain terminal interface")
     parser.add_argument(
         "--agent",
-        default="auto",
-        choices=["auto", "watcher", "main"],
+        default="main",
+        choices=["main"],
         help="Default routing strategy for chat messages",
     )
     args = parser.parse_args()

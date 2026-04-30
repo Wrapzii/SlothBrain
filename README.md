@@ -10,7 +10,7 @@
 ## 🎯 Project Goals
 
 - **Self-healing workflows** — stalled or crashed agent tasks are automatically detected and recovered by the `SafetySupervisor` + `CheckpointManager`.
-- **Hierarchical agent management** — a `MainAgent` plans and delegates; a `WatcherAgent` monitors; dynamically-spawned `SubAgent` instances handle specialised sub-tasks.
+- **Hierarchical agent management** — a `MainAgent` plans and delegates; dynamically-spawned `SubAgent` instances handle specialised sub-tasks, while the Python `SafetySupervisor` watches for stalls and recovery conditions.
 - **Self-completing tasks** — the `AgenticLoop` plans, executes, monitors, and verifies complex multi-step tasks without human intervention.
 - **Research, code generation & app development** — agents write and execute code, manage files, and build software end-to-end.
 - **Desktop / GUI control** — the `DesktopController` + `ActionExecutor` layer lets agents read screen state (OCR), click, type, and interact with any application.
@@ -31,28 +31,25 @@
 │                                                                      │
 │  ┌──────────────────────────────────────────────────────────────┐  │
 │  │                       AgenticLoop                             │  │
-│  │  plan → checkpoint → execute → watcher-monitor → verify      │  │
+│  │  plan → checkpoint → execute → finalize                      │  │
 │  │      SafetySupervisor (heartbeat / Judge / recovery)          │  │
 │  │      CheckpointManager (in-memory snapshots per run)          │  │
 │  └──────────────────────────────────────────────────────────────┘  │
 │                                                                      │
 │  ┌─────────────────────┐    ┌───────────────────────────────────┐  │
-│  │   HandoffManager    │    │         ResourceManager            │  │
-│  │  ┌──────────────┐   │    │  idle / active mode                │  │
-│  │  │ WatcherAgent │   │    │  auto RAM-threshold mode switch    │  │
-│  │  │   Slot 0     │   │    └───────────────────────────────────┘  │
-│  │  └──────┬───────┘   │                                            │
-│  │         │handoff?   │    ┌───────────────────────────────────┐  │
-│  │  ┌──────▼───────┐   │    │           SlotManager              │  │
-│  │  │  MainAgent   │   │    │  per-slot KV-cache / history       │  │
-│  │  │   Slot 1     │   │    └───────────────────────────────────┘  │
-│  │  └──────┬───────┘   │                                            │
-│  │         │spawns     │    ┌───────────────────────────────────┐  │
-│  │  ┌──────▼───────┐   │    │          AgentRegistry              │  │
-│  │  │  SubAgent(s) │   │    │  preset-driven dynamic agents      │  │
-│  │  │  slot=-1     │   │    └───────────────────────────────────┘  │
-│  │  └──────────────┘   │                                            │
+│  │      MainAgent      │    │         ResourceManager            │  │
+│  │       Slot 1        │    │  idle / active mode                │  │
+│  │     spawns          │    │  auto RAM-threshold mode switch    │  │
+│  │    SubAgent(s)      │    └───────────────────────────────────┘  │
 │  └─────────────────────┘    ┌───────────────────────────────────┐  │
+│                              │           SlotManager              │  │
+│                              │  per-slot KV-cache / history       │  │
+│                              └───────────────────────────────────┘  │
+│                              ┌───────────────────────────────────┐  │
+│                              │          AgentRegistry             │  │
+│                              │  preset-driven dynamic agents      │  │
+│                              └───────────────────────────────────┘  │
+│                              ┌───────────────────────────────────┐  │
 │                              │         LanceDBMemory              │  │
 │  ┌─────────────────────┐    │  sentence-transformers embeds      │  │
 │  │   RollingContext    │    │  ANN search over all sessions      │  │
@@ -93,6 +90,8 @@
 pip install -r requirements.txt
 ```
 
+For memory and workspace indexing, the runtime also needs the LanceDB data stack that backs `.to_pandas()` query paths. The pinned requirements include `lancedb`, `sentence-transformers`, `numpy`, `pandas`, and `pyarrow`.
+
 ### Start SlothBrain
 
 ```bash
@@ -114,9 +113,7 @@ All settings can be changed via the **Settings** tab in the UI or by setting env
 |---|---|---|
 | `llama_host` | `127.0.0.1` | llama.cpp server host |
 | `llama_port` | `8080` | llama.cpp server port |
-| `watcher_slot` | `0` | Slot ID for the Watcher agent |
 | `main_slot` | `1` | Slot ID for the Main agent |
-| `watcher_context_size` | `4096` | Context window for Watcher |
 | `main_context_size` | `32768` | Context window for Main agent |
 | `idle_kv_quant` | `q4` | KV cache quantization in idle mode |
 | `active_kv_quant` | `q8` | KV cache quantization in active mode |
@@ -144,9 +141,11 @@ Run:
 python run_slothbrain.py
 ```
 
-In the TUI Chat tab, chat runs in **Agentic** mode only:
-- The task is planned and executed step-by-step.
-- The Watcher monitors each step and provides feedback/retries.
+In the TUI Chat tab, chat is **Direct** by default for quick replies.
+
+- Send a normal message for a fast single-shot response.
+- Prefix with `/task ` to run full **Agentic** mode.
+- In Agentic mode, the task is planned and executed step-by-step.
 - The final task summary is shown in the chat panel.
 
 ### Resource Modes
@@ -166,7 +165,7 @@ curl -X POST http://localhost:8000/api/chat/agentic \
   -d '{"task": "Research the latest Python async features and write a summary", "max_steps": 5}'
 ```
 
-The loop automatically: plans steps → saves checkpoints → executes → monitors with Watcher → verifies completion. If a step stalls for > 120 s the `SafetySupervisor` fires the Judge LLM which decides whether to nudge, retry, reset context, end the task, or escalate to you.
+The loop automatically: plans steps → saves checkpoints → executes → finalizes. If a step stalls for > 120 s the `SafetySupervisor` fires the Judge LLM which decides whether to nudge, retry, reset context, end the task, or escalate to you.
 
 ### REST API
 
@@ -218,9 +217,11 @@ curl -X POST http://localhost:8000/api/benchmark -d '{"type": "all"}'
 
 SlothBrain uses **LanceDB** + **sentence-transformers** for persistent long-term memory:
 
-- Every conversation turn (watcher + main) is embedded and stored with metadata.
+- Every conversation turn is embedded and stored with metadata.
 - On new requests, the Main agent performs an ANN search to retrieve relevant past sessions.
 - The `RollingContext` class keeps per-slot message history and automatically summarizes when the token estimate exceeds `summarize_at` (default 3000 tokens).
+
+If memory is disabled at startup, verify that the full LanceDB runtime stack is installed: `lancedb`, `sentence-transformers`, `numpy`, `pandas`, and `pyarrow`.
 
 Memory is stored at `./data/lancedb` (configurable). Delete this directory to reset memory.
 
@@ -239,7 +240,7 @@ pytest backend/tests/ -v
 ```
 SlothBrain/
 ├── backend/
-│   ├── agents/          # MainAgent, WatcherAgent, AgenticLoop, SubAgent, HandoffManager
+│   ├── agents/          # MainAgent, AgenticLoop, SubAgent
 │   ├── benchmarks/      # Speed, VRAM, and slot-interference benchmarks
 │   ├── config/          # AppConfig (pydantic-settings, .env support)
 │   ├── core/            # LlamaClient, SlotManager, ResourceManager,

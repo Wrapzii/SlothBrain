@@ -78,30 +78,30 @@ class BenchmarkSuite:
         prompt = "Explain the concept of neural networks in detail."
         try:
             start = time.perf_counter()
-            watcher_task = self._client.complete(
+            main_task_a = self._client.complete(
                 prompt=prompt,
-                slot_id=self._config.watcher_slot,
+                slot_id=self._config.main_slot,
                 max_tokens=128,
             )
-            main_task = self._client.complete(
+            main_task_b = self._client.complete(
                 prompt=prompt,
                 slot_id=self._config.main_slot,
                 max_tokens=128,
             )
             results = await asyncio.gather(
-                watcher_task, main_task, return_exceptions=True
+                main_task_a, main_task_b, return_exceptions=True
             )
             elapsed = time.perf_counter() - start
-            watcher_ok = not isinstance(results[0], Exception)
-            main_ok = not isinstance(results[1], Exception)
-            if not watcher_ok:
-                logger.error("Slot interference watcher request failed: %s", results[0])
-            if not main_ok:
-                logger.error("Slot interference main request failed: %s", results[1])
+            request_a_ok = not isinstance(results[0], Exception)
+            request_b_ok = not isinstance(results[1], Exception)
+            if not request_a_ok:
+                logger.error("Slot interference request A failed: %s", results[0])
+            if not request_b_ok:
+                logger.error("Slot interference request B failed: %s", results[1])
             return {
                 "total_elapsed_seconds": round(elapsed, 3),
-                "watcher_status": "ok" if watcher_ok else "error",
-                "main_status": "ok" if main_ok else "error",
+                "request_a_status": "ok" if request_a_ok else "error",
+                "request_b_status": "ok" if request_b_ok else "error",
                 "interference_detected": elapsed > 30,
                 "status": "ok",
             }

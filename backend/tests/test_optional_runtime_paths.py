@@ -5,30 +5,9 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from backend.agents.main_agent import MainAgent
-from backend.agents.watcher import WatcherAgent
 from backend.config import settings
 from backend.core.audit_log import AuditLog
 from backend.core.server_manager import ServerManager
-
-
-@pytest.mark.asyncio
-async def test_watcher_agent_skips_memory_when_disabled() -> None:
-    slot_manager = MagicMock()
-    slot_manager.send_to_watcher = AsyncMock(return_value="hello")
-    rolling_context = MagicMock()
-    rolling_context.add_message = AsyncMock()
-    rolling_context.get_context_prompt.return_value = "user: hi\n"
-
-    agent = WatcherAgent(
-        slot_manager=slot_manager,
-        rolling_context=rolling_context,
-        memory=None,
-        config=settings,
-    )
-
-    response = await agent.process("hi")
-
-    assert response == "hello"
 
 
 @pytest.mark.asyncio
