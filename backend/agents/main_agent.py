@@ -13,6 +13,7 @@ from backend.memory.lancedb_memory import LanceDBMemory
 if TYPE_CHECKING:
     from backend.agents.registry import AgentRegistry
     from backend.agents.sub_agent import SubAgent
+    from backend.tools.registry import ToolRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +28,9 @@ _FALLBACK_SYSTEM_PROMPT = (
 
 # Maximum characters to keep when falling back to a single-step plan.
 _MAX_FALLBACK_STEP_LENGTH = 300
+
+# Maximum tool-call iterations per execute_step call to prevent infinite loops.
+_MAX_TOOL_ITERATIONS = 5
 
 
 def _load_protected_prompt() -> str:
@@ -132,10 +136,18 @@ class MainAgent:
         self.system_prompt = _load_protected_prompt()
         # Injected after construction so we avoid circular imports
         self._registry: AgentRegistry | None = None
+        self._tool_registry: "ToolRegistry | None" = None
+        self._tool_profile: str = getattr(config, "main_tool_profile", "full")
 
     def set_registry(self, registry: "AgentRegistry") -> None:
         """Inject the AgentRegistry so MainAgent can spawn sub-agents."""
         self._registry = registry
+
+    def set_tool_registry(self, tool_registry: "ToolRegistry", profile: str | None = None) -> None:
+        """Inject the ToolRegistry and optional tool profile override."""
+        self._tool_registry = tool_registry
+        if profile is not None:
+            self._tool_profile = profile
 
     # ------------------------------------------------------------------
     # Sub-agent delegation
@@ -256,6 +268,12 @@ class MainAgent:
     ) -> str:
         """Execute a single step within a larger task.
 
+        If a ToolRegistry is attached, the model may issue ``<tool_call>``
+        blocks in its response.  Each block is parsed, the tool executed, and
+        the result injected back into context before the model is called again.
+        This loop repeats until no tool calls remain or the iteration limit is
+        reached.
+
         Parameters
         ----------
         step:
@@ -270,14 +288,75 @@ class MainAgent:
             recent = context[-5:]
             context_section = "\n\nContext from previous steps:\n" + "\n".join(recent)
 
+        # Build tool descriptions block if tools are available
+        tools_section = ""
+        tools: list = []
+        if self._tool_registry is not None:
+            tools = self._tool_registry.get_tools_for_profile(self._tool_profile)
+            if tools:
+                tools_block = self._tool_registry.render_tool_descriptions(tools)
+                tools_section = (
+                    f"\n\n{tools_block}\n\n"
+                    "To use a tool, emit a <tool_call> block with JSON:\n"
+                    "<tool_call>\n"
+                    '{"tool": "<name>", "args": {<arguments>}}\n'
+                    "</tool_call>\n"
+                    "The tool result will be provided and you may continue.\n"
+                    "When no more tools are needed, provide your final answer."
+                )
+
         step_prompt = (
             f"system: {self.system_prompt}\n\n"
             "You are executing a multi-step task one step at a time.\n"
             f"Overall task: {task}\n"
             f"Current step: {step}"
-            f"{context_section}\n\n"
+            f"{context_section}"
+            f"{tools_section}\n\n"
             "Execute this step thoroughly and report what you did and what you found.\n"
             "assistant:"
         )
 
-        return await self._slot_manager.send_to_main(step_prompt, max_tokens=2048)
+        # Tool-calling loop
+        accumulated_tool_context = ""
+        for iteration in range(_MAX_TOOL_ITERATIONS):
+            prompt = step_prompt + accumulated_tool_context
+            response = await self._slot_manager.send_to_main(prompt, max_tokens=2048)
+
+            # No tool registry or no tools → return directly
+            if self._tool_registry is None or not tools:
+                return response
+
+            tool_calls = self._tool_registry.parse_tool_calls(response)
+            if not tool_calls:
+                # No tool calls — final answer
+                return response
+
+            # Execute each tool call and accumulate results
+            tool_result_lines: list[str] = [response]
+            for tc in tool_calls:
+                tool_name = tc["tool"]
+                tool_args = tc.get("args", {})
+                tool = self._tool_registry.get(tool_name)
+                if tool is None:
+                    result_dict = {"ok": False, "error": f"Unknown tool: {tool_name!r}"}
+                else:
+                    try:
+                        tool_result = await tool.execute(**tool_args)
+                        result_dict = tool_result.to_dict()
+                    except Exception as exc:
+                        logger.warning("Tool %s raised: %s", tool_name, exc)
+                        result_dict = {"ok": False, "error": str(exc)}
+
+                result_json = json.dumps(
+                    {"tool": tool_name, **result_dict},
+                    ensure_ascii=False,
+                    default=str,
+                )
+                tool_result_lines.append(
+                    f"<tool_result>\n{result_json}\n</tool_result>"
+                )
+
+            accumulated_tool_context += "\n" + "\n".join(tool_result_lines) + "\nassistant:"
+
+        # Iteration limit reached — return last response
+        return response

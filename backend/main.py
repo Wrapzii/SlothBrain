@@ -31,6 +31,7 @@ from backend.core.server_manager import ServerManager
 from backend.core.slot_manager import SlotManager
 from backend.memory.lancedb_memory import LanceDBMemory
 from backend.memory.rolling_context import RollingContext
+from backend.tools.registry import ToolRegistry
 
 
 logger = logging.getLogger(__name__)
@@ -54,6 +55,7 @@ audit_log: AuditLog
 approval_queue: ApprovalQueue
 checkpoint_manager: CheckpointManager
 safety_supervisor: SafetySupervisor
+tool_registry: ToolRegistry
 
 
 @asynccontextmanager
@@ -61,7 +63,7 @@ async def lifespan(app: FastAPI):  # type: ignore[type-arg]
     global llama_client, slot_manager, resource_manager, rolling_context
     global memory, watcher_agent, main_agent, handoff_manager, benchmark_suite
     global preset_manager, agent_registry, server_manager, audit_log, approval_queue
-    global checkpoint_manager, safety_supervisor
+    global checkpoint_manager, safety_supervisor, tool_registry
 
     audit_log = AuditLog()
     approval_queue = ApprovalQueue(max_entries=settings.max_pending_approvals)
@@ -112,6 +114,11 @@ async def lifespan(app: FastAPI):  # type: ignore[type-arg]
     # Give the MainAgent a reference to the registry so it can spawn sub-agents
     main_agent.set_registry(agent_registry)
 
+    # ── Tool system ──────────────────────────────────────────────────────────
+    tool_registry = ToolRegistry()
+    _register_tools(tool_registry, settings, audit_log, memory, agent_registry, llama_client)
+    main_agent.set_tool_registry(tool_registry)
+
     # Safety infrastructure for the agentic loop
     checkpoint_manager = CheckpointManager()
     safety_supervisor = SafetySupervisor(
@@ -131,6 +138,104 @@ async def lifespan(app: FastAPI):  # type: ignore[type-arg]
     safety_supervisor.stop()
     server_manager.stop_watchdog()
     agent_registry.destroy_all()
+    # Stop the scheduler background loop if it was started
+    try:
+        from backend.tools.impl.scheduler_tool import SchedulerTool
+        sched = tool_registry.get("scheduler")
+        if isinstance(sched, SchedulerTool):
+            sched.stop()
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Tool registration helper
+# ---------------------------------------------------------------------------
+
+def _register_tools(
+    registry: "ToolRegistry",
+    config: Any,
+    audit_log: Any,
+    memory: Any,
+    agent_registry: Any,
+    llama_client: Any,
+) -> None:
+    """Construct and register all built-in tools into *registry*."""
+    from backend.tools.impl.screenshot_tool import ScreenshotTool
+    from backend.tools.impl.ui_tool import UITool
+    from backend.tools.impl.image_analysis_tool import ImageAnalysisTool
+    from backend.tools.impl.web_fetch_tool import WebFetchTool
+    from backend.tools.impl.web_search_tool import WebSearchTool
+    from backend.tools.impl.shell_tool import ShellTool
+    from backend.tools.impl.process_tool import ProcessTool
+    from backend.tools.impl.code_exec_tool import CodeExecTool
+    from backend.tools.impl.file_tool import FileTool
+    from backend.tools.impl.patch_tool import PatchTool
+    from backend.tools.impl.diff_tool import DiffTool
+    from backend.tools.impl.memory_search_tool import MemorySearchTool
+    from backend.tools.impl.session_graph_tool import SessionGraphTool
+    from backend.tools.impl.sub_agent_tool import SubAgentTool
+    from backend.tools.impl.agent_list_tool import AgentListTool
+    from backend.tools.impl.session_tool import SessionTool
+    from backend.tools.impl.scheduler_tool import SchedulerTool
+    from backend.tools.impl.discord_tool import DiscordTool
+    from backend.tools.plugin_loader import load_plugins
+
+    # Vision / desktop
+    try:
+        from backend.vision.controller import DesktopController
+        controller = DesktopController()
+        registry.register(ScreenshotTool(controller=controller))
+        registry.register(UITool(controller=controller))
+        registry.register(ImageAnalysisTool(llama_client=llama_client, controller=controller))
+    except Exception as exc:
+        logger.warning("Desktop tools unavailable: %s", exc)
+
+    # Web
+    registry.register(WebFetchTool())
+    registry.register(WebSearchTool(searxng_url=getattr(config, "searxng_url", "")))
+
+    # Shell / process / code
+    registry.register(ShellTool(config=config, audit_log=audit_log))
+    registry.register(ProcessTool(config=config, audit_log=audit_log))
+    registry.register(CodeExecTool())
+
+    # File system
+    registry.register(FileTool(config=config))
+    registry.register(PatchTool(config=config))
+    registry.register(DiffTool(config=config))
+
+    # Memory / knowledge
+    registry.register(MemorySearchTool(memory=memory))
+    registry.register(SessionGraphTool(memory=memory))
+
+    # Agent orchestration
+    registry.register(SubAgentTool(registry=agent_registry))
+    registry.register(AgentListTool(registry=agent_registry))
+    registry.register(SessionTool(registry=agent_registry))
+
+    # Scheduler
+    sched = SchedulerTool()
+    registry.register(sched)
+    sched.start()
+
+    # Discord (optional — skipped if no credentials configured)
+    webhook = getattr(config, "discord_webhook_url", "")
+    bot_token = getattr(config, "discord_bot_token", "")
+    channel_id = getattr(config, "discord_channel_id", "")
+    if webhook or bot_token:
+        registry.register(
+            DiscordTool(
+                webhook_url=webhook,
+                bot_token=bot_token,
+                channel_id=channel_id,
+            )
+        )
+
+    # Dynamic plugins
+    loaded = load_plugins(registry)
+    if loaded:
+        logger.info("Loaded %d plugin tool(s)", loaded)
 
 
 # ---------------------------------------------------------------------------
@@ -217,6 +322,7 @@ class PresetCreate(BaseModel):
     context_size: int = 8192
     temperature: float = 0.7
     max_tokens: int = 1024
+    tool_profile: str = "minimal"
 
 
 class PresetUpdate(BaseModel):
@@ -226,6 +332,7 @@ class PresetUpdate(BaseModel):
     context_size: int | None = None
     temperature: float | None = None
     max_tokens: int | None = None
+    tool_profile: str | None = None
 
 
 class AgentChatRequest(BaseModel):
@@ -237,6 +344,7 @@ class SpawnRequest(BaseModel):
     context_size: int | None = None   # override preset default
     max_tokens: int | None = None     # override preset default
     task_description: str = ""
+    tool_profile: str = "minimal"     # tool access profile for this sub-agent
 
 
 class AgenticRequest(BaseModel):
@@ -507,11 +615,32 @@ async def spawn_agent(preset_id: str, body: SpawnRequest = SpawnRequest()) -> di
             context_size_override=body.context_size,
             max_tokens_override=body.max_tokens,
             task_description=body.task_description,
+            tool_profile=body.tool_profile,
         )
         audit_log.record(action="agent_spawned", actor="api", after=agent.info())
         return agent.info()
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+# ---------------------------------------------------------------------------
+# Tool Registry
+# ---------------------------------------------------------------------------
+@app.get("/api/tools")
+async def list_tools(profile: str = "full") -> dict:
+    """List all tools available in the given profile."""
+    tools = tool_registry.get_tools_for_profile(profile)
+    return {
+        "profile": profile,
+        "tools": [
+            {
+                "name": t.name,
+                "description": t.description,
+                "parameters_schema": t.parameters_schema,
+            }
+            for t in tools
+        ],
+    }
 
 
 # ---------------------------------------------------------------------------

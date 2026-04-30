@@ -57,6 +57,27 @@ class AppConfig(BaseSettings):
     # Safety supervisor settings
     supervisor_poll_interval: float = 15.0   # seconds between supervision polls
     supervisor_step_timeout: float = 120.0   # seconds before a step is declared stalled
+
+    # Tool system settings
+    # Root directory that file/patch/diff tools are confined to.
+    tool_workspace_root: str = "./workspace"
+    # Allowlisted command prefixes for the shell/process tools.
+    # An empty list disables the shell tool unless allow_unrestricted_shell is True.
+    shell_allowlist: list[str] = []
+    # When True, the shell and process tools accept any command (no allowlist check).
+    # Enable only in trusted local environments.
+    allow_unrestricted_shell: bool = False
+    # Default tool profile for the main agent ("full" gives access to every tool).
+    main_tool_profile: str = "full"
+
+    # Discord integration (optional – leave empty to disable DiscordTool)
+    discord_webhook_url: str = ""
+    discord_bot_token: str = ""
+    discord_channel_id: str = ""
+
+    # Web search: set to a SearXNG base URL to use it instead of DuckDuckGo
+    searxng_url: str = ""
+
     cors_allowed_origins: list[str] = [
         "http://localhost:5173",
         "http://127.0.0.1:5173",
