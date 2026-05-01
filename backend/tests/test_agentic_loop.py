@@ -163,6 +163,57 @@ async def test_loop_respects_max_steps():
 
 
 @pytest.mark.asyncio
+async def test_loop_llm_only_skips_planning_and_tools_and_context():
+    from backend.agents.agentic_loop import AgenticDebugOptions
+
+    main = MagicMock()
+    main.plan_task = AsyncMock(return_value={"approach": "x", "steps": ["A", "B"]})
+    main.execute_step = AsyncMock(return_value="llm response")
+
+    loop = AgenticLoop(
+        main_agent=main,
+        debug_options=AgenticDebugOptions(
+            enabled=True,
+            llm_only=True,
+            planning_enabled=False,
+            rolling_context_enabled=False,
+            tool_calls_enabled=False,
+        ),
+    )
+
+    result = await loop.run(task="Do one thing")
+
+    main.plan_task.assert_not_called()
+    assert result["total_steps"] == 1
+    kwargs = main.execute_step.call_args.kwargs
+    assert kwargs["tool_calls_enabled"] is False
+    assert kwargs["include_rolling_context"] is False
+    assert kwargs["context"] == []
+
+
+@pytest.mark.asyncio
+async def test_loop_passes_semantic_and_allowed_tools_to_execute_step():
+    from backend.agents.agentic_loop import AgenticDebugOptions
+
+    main = _make_main_agent(plan_steps=["Step A"], step_result="done")
+
+    loop = AgenticLoop(
+        main_agent=main,
+        debug_options=AgenticDebugOptions(
+            enabled=True,
+            semantic_routing_enabled=False,
+            allowed_tools=["web_fetch", "file"],
+        ),
+    )
+
+    await loop.run(task="Test task")
+
+    kwargs = main.execute_step.call_args.kwargs
+    assert kwargs["semantic_routing_enabled"] is False
+    assert kwargs["allowed_tool_names"] == ["web_fetch", "file"]
+
+
+@pytest.mark.asyncio
 async def test_loop_screenshot_fn_called():
     main = _make_main_agent(plan_steps=["Step A"])
 

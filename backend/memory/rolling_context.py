@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 from backend.core.llama_client import LlamaClient
 
 
@@ -36,12 +38,18 @@ class RollingContext:
         slot_id: int,
         max_tokens: int = 4096,
         summarize_at: int = 3000,
+        summary_timeout_seconds: float = 0.25,
+        min_messages_before_resummarize: int = 4,
     ) -> None:
         self._client = llama_client
         self._slot_id = slot_id
         self.max_tokens = max_tokens
         self.summarize_at = summarize_at
+        self.summary_timeout_seconds = max(0.1, float(summary_timeout_seconds))
+        self.min_messages_before_resummarize = max(1, int(min_messages_before_resummarize))
         self.messages: list[dict] = []
+        self._messages_since_summary = 0
+        self._has_summary = False
 
     @property
     def token_estimate(self) -> int:
@@ -49,8 +57,21 @@ class RollingContext:
 
     async def add_message(self, role: str, content: str) -> None:
         self.messages.append({"role": role, "content": content})
-        if self.token_estimate > self.summarize_at:
+        self._messages_since_summary += 1
+        should_summarize = self._summarization_estimate > self.summarize_at
+        if should_summarize and self._has_summary:
+            should_summarize = (
+                self._messages_since_summary >= self.min_messages_before_resummarize
+            )
+
+        if should_summarize:
             await self._summarize()
+
+    @property
+    def _summarization_estimate(self) -> int:
+        # Trigger summarization earlier than token_estimate because role
+        # markers/newlines and tool-heavy prompts consume extra budget.
+        return sum((len(m["content"]) // 2) + 12 for m in self.messages)
 
     async def _summarize(self) -> None:
         conversation = self.get_context_prompt()
@@ -58,13 +79,30 @@ class RollingContext:
             f"Summarize the following conversation concisely, preserving key facts:\n\n"
             f"{conversation}\n\nSummary:"
         )
-        summary = await self._client.complete(
-            prompt=summary_prompt,
-            slot_id=self._slot_id,
-            max_tokens=512,
-            temperature=0.3,
-        )
-        self.messages = [{"role": "system", "content": f"Summary: {summary.strip()}"}]
+        try:
+            summary = await asyncio.wait_for(
+                self._client.complete(
+                    prompt=summary_prompt,
+                    slot_id=self._slot_id,
+                    max_tokens=256,
+                    temperature=0.3,
+                ),
+                timeout=self.summary_timeout_seconds,
+            )
+            summary_text = summary.strip()
+        except Exception:
+            # Fast deterministic fallback keeps add_message non-blocking when
+            # the LLM is slow/unavailable.
+            lines = [
+                f"{m['role']}: {m['content'].strip()}"
+                for m in self.messages[-4:]
+                if m.get("content")
+            ]
+            summary_text = " | ".join(lines)[:600].strip()
+
+        self.messages = [{"role": "system", "content": f"Summary: {summary_text}"}]
+        self._messages_since_summary = 0
+        self._has_summary = True
 
     def get_context_prompt(self) -> str:
         return "".join(f"{m['role']}: {m['content']}\n" for m in self.messages)

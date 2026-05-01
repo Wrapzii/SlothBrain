@@ -7,7 +7,7 @@ from fastapi.testclient import TestClient
 
 from backend.main import app
 from backend.config import settings
-from backend.main import _should_use_agentic_mode
+from backend.main import _build_debug_options, _should_use_agentic_mode
 from backend.agents.main_agent import MainAgent
 
 
@@ -102,6 +102,45 @@ def test_auto_mode_keeps_simple_prompt_direct() -> None:
         max_steps=1,
         mode="auto",
     ) is False
+
+
+def test_build_debug_options_uses_defaults_when_missing() -> None:
+    snapshot = settings.model_dump()
+    try:
+        settings.debug_loop_enabled = True
+        settings.debug_loop_tool_calls_enabled = False
+        settings.debug_loop_allowed_tools = ["web_fetch"]
+
+        options = _build_debug_options(None)
+        assert options.enabled is True
+        assert options.tool_calls_enabled is False
+        assert options.allowed_tools == ["web_fetch"]
+    finally:
+        _restore_settings(snapshot)
+
+
+def test_build_debug_options_allows_request_overrides() -> None:
+    snapshot = settings.model_dump()
+    try:
+        settings.debug_loop_enabled = False
+        settings.debug_loop_tool_calls_enabled = True
+
+        options = _build_debug_options(None)
+        assert options.enabled is False
+
+        from backend.main import AgenticDebugRequest
+
+        override = AgenticDebugRequest(
+            enabled=True,
+            tool_calls_enabled=False,
+            allowed_tools=["file", "patch"],
+        )
+        merged = _build_debug_options(override)
+        assert merged.enabled is True
+        assert merged.tool_calls_enabled is False
+        assert merged.allowed_tools == ["file", "patch"]
+    finally:
+        _restore_settings(snapshot)
 
 
 @pytest.mark.asyncio

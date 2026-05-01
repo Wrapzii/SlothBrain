@@ -103,6 +103,18 @@ class SlotManager:
             stop=_STOP_SEQUENCES,
         )
         response = _sanitize_response(response)
+
+        # Some thinking/reasoning model outputs can be reduced to empty text
+        # after stop-sequence + sanitization trimming. Retry once without
+        # explicit stop sequences to recover a user-visible answer.
+        if not response:
+            retry = await self._client.complete(
+                prompt=prompt,
+                slot_id=self._main_slot,
+                max_tokens=max_tokens,
+            )
+            response = _sanitize_response(retry) or (retry or "").strip()
+
         self._histories.setdefault(self._main_slot, []).append(
             {"role": "assistant", "content": response}
         )

@@ -38,6 +38,7 @@ TODO: Emit a structured audit event if the loop exits with an unhandled
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass, field
 import logging
 import time
 import uuid
@@ -55,6 +56,35 @@ _MAX_STEP_RETRIES = 2
 
 # Guardrail: cap persisted step context to avoid prompt/context blow-up.
 _MAX_STEP_CONTEXT_CHARS = 1200
+
+# Keep previews compact so debug events do not overwhelm clients/logs.
+_MAX_PREVIEW_CHARS = 300
+
+
+def _preview(text: str, limit: int = _MAX_PREVIEW_CHARS) -> str:
+    value = text or ""
+    if len(value) <= limit:
+        return value
+    return value[:limit] + f" ...[truncated {len(value) - limit} chars]"
+
+
+@dataclass
+class AgenticDebugOptions:
+    """Runtime toggles for debug-loop execution.
+
+    Set ``enabled=True`` and flip individual flags to isolate behavior.
+    """
+
+    enabled: bool = False
+    llm_only: bool = False
+    planning_enabled: bool = True
+    rolling_context_enabled: bool = True
+    tool_calls_enabled: bool = True
+    semantic_routing_enabled: bool = True
+    checkpointing_enabled: bool = True
+    supervisor_enabled: bool = True
+    per_event_logging: bool = True
+    allowed_tools: list[str] = field(default_factory=list)
 
 
 class AgenticStep:
@@ -122,12 +152,14 @@ class AgenticLoop:
         screenshot_fn: Optional[Callable[[], Awaitable[dict]]] = None,
         checkpoint_manager: Optional["CheckpointManager"] = None,
         supervisor: Optional["SafetySupervisor"] = None,
+        debug_options: Optional[AgenticDebugOptions] = None,
     ) -> None:
         self._main = main_agent
         self._max_steps = max_steps
         self._screenshot_fn = screenshot_fn
         self._cp = checkpoint_manager
         self._supervisor = supervisor
+        self._debug = debug_options or AgenticDebugOptions()
 
     # ------------------------------------------------------------------
     # Public interface
@@ -158,9 +190,11 @@ class AgenticLoop:
         start_time = time.monotonic()
 
         async def emit(event_type: str, data: dict | None = None) -> None:
+            payload: dict = {"type": event_type, **(data or {})}
+            if self._debug.per_event_logging:
+                logger.info("agentic_event[%s] %s", run_id, _preview(str(payload)))
             if on_progress is None:
                 return
-            payload: dict = {"type": event_type, **(data or {})}
             try:
                 await on_progress(payload)
             except Exception as exc:  # pragma: no cover
@@ -168,7 +202,7 @@ class AgenticLoop:
 
         # Register with supervisor
         handle: Optional["LoopHandle"] = None
-        if self._supervisor is not None:
+        if self._supervisor is not None and self._debug.supervisor_enabled:
             handle = self._supervisor.register(run_id)
 
         await emit("start", {"task": task, "run_id": run_id})
@@ -183,9 +217,9 @@ class AgenticLoop:
             )
         finally:
             # Always deregister and clean up checkpoints
-            if self._supervisor is not None:
+            if self._supervisor is not None and handle is not None:
                 self._supervisor.deregister(run_id)
-            if self._cp is not None:
+            if self._cp is not None and self._debug.checkpointing_enabled:
                 self._cp.clear(run_id)
 
         return result
@@ -203,15 +237,27 @@ class AgenticLoop:
         start_time: float,
     ) -> dict:
         # ── 1. Plan ──────────────────────────────────────────────────────────
-        await emit("planning", {"task": task})
-        try:
-            plan = await self._main.plan_task(task)
-        except Exception as exc:
-            logger.warning(
-                "plan_task failed (%s); falling back to single-step execution",
-                exc.__class__.__name__,
+        plan = {"steps": [task], "approach": "Direct execution"}
+        if self._debug.llm_only:
+            await emit(
+                "planning_skipped",
+                {"reason": "debug_llm_only", "steps": [task]},
             )
-            plan = {"steps": [task], "approach": "Direct execution"}
+        elif not self._debug.planning_enabled:
+            await emit(
+                "planning_skipped",
+                {"reason": "debug_planning_disabled", "steps": [task]},
+            )
+        else:
+            await emit("planning", {"task": task})
+            try:
+                plan = await self._main.plan_task(task)
+            except Exception as exc:
+                logger.warning(
+                    "plan_task failed (%s); falling back to single-step execution",
+                    exc.__class__.__name__,
+                )
+                plan = {"steps": [task], "approach": "Direct execution"}
 
         step_descriptions: list[str] = plan.get("steps") or [task]
         if len(step_descriptions) > self._max_steps:
@@ -238,7 +284,7 @@ class AgenticLoop:
             step_num = idx + 1  # 1-based for display/checkpoints
 
             # ── Checkpoint ───────────────────────────────────────────────
-            if self._cp is not None:
+            if self._cp is not None and self._debug.checkpointing_enabled:
                 self._cp.save(
                     run_id=run_id,
                     task=task,
@@ -255,6 +301,13 @@ class AgenticLoop:
                     task=task,
                     context=context,
                 )
+                await emit(
+                    "heartbeat",
+                    {
+                        "step_num": step_num,
+                        "context_items": len(context),
+                    },
+                )
 
             step = AgenticStep(step_num=step_num, description=description)
             step.status = "running"
@@ -269,6 +322,14 @@ class AgenticLoop:
             )
 
             for attempt in range(_MAX_STEP_RETRIES + 1):
+                await emit(
+                    "loop_iteration",
+                    {
+                        "step_num": step_num,
+                        "attempt": attempt + 1,
+                        "max_attempts": _MAX_STEP_RETRIES + 1,
+                    },
+                )
                 # ── Check for supervisor intervention ─────────────────────
                 if handle is not None:
                     intervention = await handle.pop_intervention()
@@ -288,7 +349,7 @@ class AgenticLoop:
                             # Rebuild loop state from restored checkpoint
                             cp = (
                                 self._cp.restore_last(run_id)
-                                if self._cp is not None
+                                if self._cp is not None and self._debug.checkpointing_enabled
                                 else None
                             )
                             if cp is not None:
@@ -369,13 +430,36 @@ class AgenticLoop:
                     return None
 
                 try:
+                    effective_context = context if self._debug.rolling_context_enabled else []
+                    await emit(
+                        "step_input",
+                        {
+                            "step_num": step_num,
+                            "description": description,
+                            "context_preview": _preview("\n".join(effective_context[-2:])),
+                            "tool_calls_enabled": self._debug.tool_calls_enabled and not self._debug.llm_only,
+                            "semantic_routing_enabled": self._debug.semantic_routing_enabled,
+                            "rolling_context_enabled": self._debug.rolling_context_enabled,
+                        },
+                    )
                     result = await self._main.execute_step(
                         step=description,
                         task=task,
-                        context=context,
+                        context=effective_context,
                         on_event=_on_step_event,
+                        include_rolling_context=self._debug.rolling_context_enabled,
+                        tool_calls_enabled=self._debug.tool_calls_enabled and not self._debug.llm_only,
+                        semantic_routing_enabled=self._debug.semantic_routing_enabled,
+                        allowed_tool_names=self._debug.allowed_tools or None,
                     )
                     step.result = result
+                    await emit(
+                        "step_output",
+                        {
+                            "step_num": step_num,
+                            "output_preview": _preview(result),
+                        },
+                    )
                     if not (step.result or "").strip():
                         step.result = "Execution error: empty model response"
                 except Exception as exc:
@@ -441,7 +525,8 @@ class AgenticLoop:
 
             step.finish()
             result_snippet = step.result[:_MAX_STEP_CONTEXT_CHARS]
-            context.append(f"Step {step_num} – {description}:\n{result_snippet}")
+            if self._debug.rolling_context_enabled:
+                context.append(f"Step {step_num} – {description}:\n{result_snippet}")
             executed.append(step)
 
             await emit("step_complete", step.to_dict())

@@ -233,6 +233,65 @@ Memory is stored at `./data/lancedb` (configurable). Delete this directory to re
 pytest backend/tests/ -v
 ```
 
+Capability contract lane (full-process simulation of core assistant workflows):
+
+```bash
+pytest backend/tests/test_capability_pipeline.py -q
+```
+
+Manual full-stack LLM suite (real llama.cpp + real runtime wiring):
+
+```bash
+SLOTHBRAIN_RUN_MANUAL_LLM_TESTS=1 pytest backend/tests/manual/test_manual_llm_fullstack.py -q -s
+```
+
+Optional strict mode (fail if any optional/runtime-dependent tool is unavailable):
+
+```bash
+SLOTHBRAIN_RUN_MANUAL_LLM_TESTS=1 SLOTHBRAIN_MANUAL_STRICT=1 pytest backend/tests/manual/test_manual_llm_fullstack.py -q -s
+```
+
+This suite validates:
+- tool inventory (`GET /api/tools`)
+- direct per-tool smoke execution (`POST /api/tools/run`)
+- LLM-driven tool call flow through websocket agentic loop (`/ws/agent-progress`)
+
+---
+
+### Comprehensive Validation Suite
+
+Run validation tests to verify critical subsystems with **real LLM I/O visible**:
+
+```bash
+export SLOTHBRAIN_RUN_VALIDATION_TESTS=1
+pytest backend/tests/manual/test_validation_suite.py -v -s
+```
+
+This suite validates with actual LLM execution (not mocks):
+- **Rolling Context** - message accumulation, summarization, token counting
+- **Checkpoints** - save/restore state preservation, multi-step recovery
+- **Memory Cache** - vector embedding, semantic search ranking, retrieval accuracy
+- **Slot Manager** - per-slot isolation, history tracking, cache performance
+- **Context Tree** - message ordering, parent-child relationships, structure preservation
+- **LLM Quality** - response correctness, format compliance, consistency
+- **Integration** - full pipeline correctness (context + checkpoints + memory)
+- **Performance** - operation latency under load
+
+Every test includes:
+- **INPUT**: visible data fed to the system
+- **OUTPUT**: what the system produces
+- **VALIDATION**: explicit checks of expected behavior
+
+See [VALIDATION.md](VALIDATION.md) for detailed documentation.
+
+CI runs on every push/PR via [.github/workflows/ci-full-pipeline.yml](.github/workflows/ci-full-pipeline.yml):
+- `backend-tests`: complete backend test suite
+- `capability-contracts`: commit-gated full pipeline capability contracts
+- `real-windows-desktop-e2e`: optional self-hosted Windows lane for real desktop/vision execution
+
+Manual self-hosted workflow for true LLM+tool full-stack validation:
+- [.github/workflows/manual-llm-fullstack.yml](.github/workflows/manual-llm-fullstack.yml)
+
 ---
 
 ## Project Structure

@@ -20,16 +20,17 @@ logger = logging.getLogger(__name__)
 class ScreenshotTool(Tool):
     """Capture the current desktop screen and return OCR-annotated state text.
 
-    The returned ``output`` dict contains:
+    The returned ``output`` dict always contains:
     ``state_text`` — the grid-annotated text description of the screen.
-    ``annotated_png_b64`` — base64-encoded annotated PNG.
     ``width``, ``height`` — screen dimensions in pixels.
+
+    ``annotated_png_b64`` is only included when ``include_image=true``.
     """
 
     name = "screenshot"
     description = (
         "Capture the current desktop screen. Returns the annotated screen state "
-        "as text (suitable for reasoning) and a base64-encoded PNG image."
+        "as text (suitable for reasoning). Optionally include a base64-encoded image."
     )
     parameters_schema: dict = {
         "type": "object",

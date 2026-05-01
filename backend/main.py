@@ -7,7 +7,7 @@ import logging
 import re
 from contextlib import asynccontextmanager
 from functools import lru_cache
-from typing import Any
+from typing import Any, Optional
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect, status
@@ -16,6 +16,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from backend.agents.main_agent import MainAgent
+from backend.agents.agentic_loop import AgenticDebugOptions
 from backend.agents.preset_manager import PresetManager
 from backend.agents.registry import AgentRegistry
 from backend.benchmarks.benchmark import BenchmarkSuite
@@ -48,7 +49,7 @@ async def _apply_effective_slot_context_budget() -> None:
     This keeps internal agent context settings aligned with the actual
     available per-slot context to avoid overflow thrashing.
     """
-    budget: int | None = None
+    budget: Optional[int] = None
 
     manual_cap = int(getattr(settings, "llama_slot_context_cap", 0) or 0)
     if manual_cap > 0:
@@ -219,7 +220,6 @@ def _register_tools(
     llama_client: Any,
 ) -> None:
     """Construct and register all built-in tools into *registry*."""
-    from backend.tools.impl.screenshot_tool import ScreenshotTool
     from backend.tools.impl.ui_tool import UITool
     from backend.tools.impl.image_analysis_tool import ImageAnalysisTool
     from backend.tools.impl.web_fetch_tool import WebFetchTool
@@ -244,9 +244,16 @@ def _register_tools(
     try:
         from backend.vision.controller import DesktopController
         controller = DesktopController()
-        registry.register(ScreenshotTool(controller=controller))
         registry.register(UITool(controller=controller))
-        registry.register(ImageAnalysisTool(llama_client=llama_client, controller=controller))
+        registry.register(
+            ImageAnalysisTool(
+                llama_client=llama_client,
+                controller=controller,
+                backend=getattr(config, "image_analysis_backend", "cpu_ocr"),
+                llama_slot_id=int(getattr(config, "image_analysis_llama_slot_id", 0)),
+                cpu_max_text_chars=int(getattr(config, "image_analysis_cpu_max_text_chars", 4000)),
+            )
+        )
     except Exception as exc:
         logger.warning("Desktop tools unavailable: %s", exc)
 
@@ -266,7 +273,7 @@ def _register_tools(
         )
 
     # File system + workspace indexing
-    workspace_index_tool: WorkspaceIndexTool | None = None
+    workspace_index_tool: Optional[WorkspaceIndexTool] = None
     if getattr(config, "workspace_index_enabled", True):
         try:
             from backend.memory.workspace_indexer import WorkspaceIndexer
@@ -405,6 +412,7 @@ class ChatRequest(BaseModel):
     message: str
     max_steps: int = 10
     mode: str = "auto"  # "auto" | "direct" | "agentic"
+    debug: "Optional[AgenticDebugRequest]" = None
 
 
 class ModeRequest(BaseModel):
@@ -412,29 +420,39 @@ class ModeRequest(BaseModel):
 
 
 class SettingsUpdate(BaseModel):
-    llama_host: str | None = None
-    llama_port: int | None = None
-    main_slot: int | None = None
-    main_context_size: int | None = None
-    idle_kv_quant: str | None = None
-    active_kv_quant: str | None = None
-    vram_threshold_mb: int | None = None
-    ram_threshold_mb: int | None = None
-    embedding_model: str | None = None
-    llama_server_path: str | None = None
-    llama_server_args: list[str] | None = None
-    max_context_size: int | None = None
-    max_slots: int | None = None
-    max_restarts_per_hour: int | None = None
-    require_approval_server_restart: bool | None = None
-    require_approval_kv_cache_change: bool | None = None
-    require_approval_large_context_increase: bool | None = None
-    require_approval_emergency_stop: bool | None = None
-    semantic_tool_routing_enabled: bool | None = None
-    semantic_tool_routing_embedding_model: str | None = None
-    semantic_tool_routing_top_k: int | None = None
-    semantic_tool_routing_min_similarity: float | None = None
-    semantic_tool_routing_critical_tools: list[str] | None = None
+    llama_host: Optional[str] = None
+    llama_port: Optional[int] = None
+    main_slot: Optional[int] = None
+    main_context_size: Optional[int] = None
+    idle_kv_quant: Optional[str] = None
+    active_kv_quant: Optional[str] = None
+    vram_threshold_mb: Optional[int] = None
+    ram_threshold_mb: Optional[int] = None
+    embedding_model: Optional[str] = None
+    llama_server_path: Optional[str] = None
+    llama_server_args: Optional[list[str]] = None
+    max_context_size: Optional[int] = None
+    max_slots: Optional[int] = None
+    max_restarts_per_hour: Optional[int] = None
+    require_approval_server_restart: Optional[bool] = None
+    require_approval_kv_cache_change: Optional[bool] = None
+    require_approval_large_context_increase: Optional[bool] = None
+    require_approval_emergency_stop: Optional[bool] = None
+    semantic_tool_routing_enabled: Optional[bool] = None
+    semantic_tool_routing_embedding_model: Optional[str] = None
+    semantic_tool_routing_top_k: Optional[int] = None
+    semantic_tool_routing_min_similarity: Optional[float] = None
+    semantic_tool_routing_critical_tools: Optional[list[str]] = None
+    debug_loop_enabled: Optional[bool] = None
+    debug_loop_llm_only: Optional[bool] = None
+    debug_loop_planning_enabled: Optional[bool] = None
+    debug_loop_rolling_context_enabled: Optional[bool] = None
+    debug_loop_tool_calls_enabled: Optional[bool] = None
+    debug_loop_semantic_routing_enabled: Optional[bool] = None
+    debug_loop_checkpointing_enabled: Optional[bool] = None
+    debug_loop_supervisor_enabled: Optional[bool] = None
+    debug_loop_per_event_logging: Optional[bool] = None
+    debug_loop_allowed_tools: Optional[list[str]] = None
 
 
 class BenchmarkRequest(BaseModel):
@@ -451,28 +469,47 @@ class PresetCreate(BaseModel):
 
 
 class PresetUpdate(BaseModel):
-    name: str | None = None
-    description: str | None = None
-    system_prompt: str | None = None
-    context_size: int | None = None
-    temperature: float | None = None
-    max_tokens: int | None = None
+    name: Optional[str] = None
+    description: Optional[str] = None
+    system_prompt: Optional[str] = None
+    context_size: Optional[int] = None
+    temperature: Optional[float] = None
+    max_tokens: Optional[int] = None
 
 
 class AgentChatRequest(BaseModel):
     message: str
-    max_tokens: int | None = None     # per-call override
+    max_tokens: Optional[int] = None     # per-call override
 
 
 class SpawnRequest(BaseModel):
-    context_size: int | None = None   # override preset default
-    max_tokens: int | None = None     # override preset default
+    context_size: Optional[int] = None   # override preset default
+    max_tokens: Optional[int] = None     # override preset default
     task_description: str = ""
 
 
 class AgenticRequest(BaseModel):
     task: str
     max_steps: int = 10
+    debug: "Optional[AgenticDebugRequest]" = None
+
+
+class AgenticDebugRequest(BaseModel):
+    enabled: Optional[bool] = None
+    llm_only: Optional[bool] = None
+    planning_enabled: Optional[bool] = None
+    rolling_context_enabled: Optional[bool] = None
+    tool_calls_enabled: Optional[bool] = None
+    semantic_routing_enabled: Optional[bool] = None
+    checkpointing_enabled: Optional[bool] = None
+    supervisor_enabled: Optional[bool] = None
+    per_event_logging: Optional[bool] = None
+    allowed_tools: Optional[list[str]] = None
+
+
+class ToolRunRequest(BaseModel):
+    name: str
+    args: dict[str, Any] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -505,7 +542,7 @@ async def _ensure_llama_available(context: str) -> None:
         _raise_service_unavailable(exc, context)
 
 
-def _parse_bearer_token(authorization_header: str | None) -> str:
+def _parse_bearer_token(authorization_header: Optional[str]) -> str:
     if not authorization_header:
         return ""
     scheme, _, token = authorization_header.partition(" ")
@@ -514,7 +551,7 @@ def _parse_bearer_token(authorization_header: str | None) -> str:
     return token.strip()
 
 
-def _is_loopback_host(host: str | None) -> bool:
+def _is_loopback_host(host: Optional[str]) -> bool:
     if not host:
         return False
     if host in {"localhost", "127.0.0.1", "::1", "testclient"}:
@@ -556,6 +593,28 @@ def _should_use_agentic_mode(message: str, max_steps: int, mode: str) -> bool:
 
     # Otherwise default to direct chat for quick responsiveness.
     return False
+
+
+def _build_debug_options(debug: "Optional[AgenticDebugRequest]") -> AgenticDebugOptions:
+    defaults = AgenticDebugOptions(
+        enabled=settings.debug_loop_enabled,
+        llm_only=settings.debug_loop_llm_only,
+        planning_enabled=settings.debug_loop_planning_enabled,
+        rolling_context_enabled=settings.debug_loop_rolling_context_enabled,
+        tool_calls_enabled=settings.debug_loop_tool_calls_enabled,
+        semantic_routing_enabled=settings.debug_loop_semantic_routing_enabled,
+        checkpointing_enabled=settings.debug_loop_checkpointing_enabled,
+        supervisor_enabled=settings.debug_loop_supervisor_enabled,
+        per_event_logging=settings.debug_loop_per_event_logging,
+        allowed_tools=list(settings.debug_loop_allowed_tools),
+    )
+    if debug is None:
+        return defaults
+
+    payload = debug.model_dump(exclude_none=True)
+    for key, value in payload.items():
+        setattr(defaults, key, value)
+    return defaults
 
 
 # ---------------------------------------------------------------------------
@@ -627,6 +686,7 @@ async def chat(http_request: Request, request: ChatRequest) -> dict:
             max_steps=_clamp_steps(request.max_steps),
             checkpoint_manager=checkpoint_manager,
             supervisor=safety_supervisor,
+            debug_options=_build_debug_options(request.debug),
         )
         try:
             result = await _run_agentic_with_cancel(
@@ -693,6 +753,7 @@ async def agentic_chat(http_request: Request, request: AgenticRequest) -> dict:
             max_steps=_clamp_steps(request.max_steps),
             checkpoint_manager=checkpoint_manager,
             supervisor=safety_supervisor,
+            debug_options=_build_debug_options(request.debug),
         )
         try:
             result = await _run_agentic_with_cancel(
@@ -889,6 +950,41 @@ async def list_tools() -> dict:
             }
             for t in tools
         ],
+    }
+
+
+@app.post("/api/tools/run")
+async def run_tool(request: ToolRunRequest) -> dict:
+    """Execute a single registered tool by name.
+
+    This endpoint is intended for diagnostics, manual validation, and
+    full-pipeline smoke tests. The tool execution path is the same runtime
+    path used by agentic loop tool calls.
+    """
+    tool = tool_registry.get(request.name)
+    if tool is None:
+        raise HTTPException(status_code=404, detail=f"Unknown tool: {request.name!r}")
+
+    try:
+        result = await tool.execute(**request.args)
+    except Exception as exc:
+        logger.warning("/api/tools/run execution failed for %s: %s", request.name, exc)
+        return {
+            "tool": request.name,
+            "ok": False,
+            "output": None,
+            "error": str(exc),
+        }
+
+    result_dict = result.to_dict()
+    audit_log.record(
+        action="tool_run_api",
+        actor="api",
+        details=f"tool={request.name} ok={bool(result_dict.get('ok'))}",
+    )
+    return {
+        "tool": request.name,
+        **result_dict,
     }
 
 
@@ -1096,9 +1192,21 @@ async def ws_agent_progress(websocket: WebSocket) -> None:
 
     await websocket.accept()
 
+    connection_closed = False
+
     async def _send(data: dict) -> None:
         try:
             await websocket.send_text(json.dumps(data))
+        except Exception:
+            pass
+
+    async def _close(code: int = 1000) -> None:
+        nonlocal connection_closed
+        if connection_closed:
+            return
+        connection_closed = True
+        try:
+            await websocket.close(code=code)
         except Exception:
             pass
 
@@ -1108,19 +1216,23 @@ async def ws_agent_progress(websocket: WebSocket) -> None:
             task_data = json.loads(raw)
         except json.JSONDecodeError:
             await _send({"type": "error", "message": "Invalid JSON"})
+            await _close(1000)
             return
 
         task = (task_data.get("task") or "").strip()
         if not task:
             await _send({"type": "error", "message": "No task provided"})
+            await _close(1000)
             return
 
         max_steps = _clamp_steps(int(task_data.get("max_steps", 10)))
+        debug_request = AgenticDebugRequest.model_validate(task_data.get("debug", {}))
 
         from backend.agents.agentic_loop import AgenticLoop
 
         if _inference_lock.locked():
             await _send({"type": "error", "message": "Another inference request is already running. Please wait."})
+            await _close(1000)
             return
 
         loop = AgenticLoop(
@@ -1128,6 +1240,7 @@ async def ws_agent_progress(websocket: WebSocket) -> None:
             max_steps=max_steps,
             checkpoint_manager=checkpoint_manager,
             supervisor=safety_supervisor,
+            debug_options=_build_debug_options(debug_request),
         )
 
         audit_log.record(
@@ -1144,15 +1257,18 @@ async def ws_agent_progress(websocket: WebSocket) -> None:
                         "message": f"Service unavailable: {exc.__class__.__name__}",
                     }
                 )
+                await _close(1000)
                 return
 
         await _send({"type": "result", **result})
+        await _close(1000)
 
     except WebSocketDisconnect:
         pass
     except Exception as exc:
         logger.error("ws/agent-progress error: %s", exc)
         await _send({"type": "error", "message": f"Internal error: {exc.__class__.__name__}"})
+        await _close(1011)
 
 
 # ---------------------------------------------------------------------------

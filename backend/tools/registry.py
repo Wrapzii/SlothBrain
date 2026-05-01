@@ -100,11 +100,21 @@ class ToolRegistry:
         """Return all registered tools."""
         return list(self._tools.values())
 
-    def get_tools(self, context: str = "") -> list[Tool]:
+    def get_tools(
+        self,
+        context: str = "",
+        *,
+        semantic_routing_enabled: bool = True,
+        allow_tool_names: list[str] | None = None,
+    ) -> list[Tool]:
         """Return globally available tools, optionally semantically routed by *context*."""
         allowed = self.all_tools()
 
-        if self._semantic_router is None:
+        if allow_tool_names is not None:
+            allow_set = {name.strip() for name in allow_tool_names if name.strip()}
+            allowed = [tool for tool in allowed if tool.name in allow_set]
+
+        if self._semantic_router is None or not semantic_routing_enabled:
             return allowed
 
         candidate_names = [t.name for t in allowed]

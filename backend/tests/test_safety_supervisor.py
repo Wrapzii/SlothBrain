@@ -6,6 +6,7 @@ import asyncio
 import time
 from unittest.mock import AsyncMock, MagicMock
 
+import httpx
 import pytest
 
 from backend.core.checkpoint_manager import CheckpointManager
@@ -173,6 +174,30 @@ async def test_supervisor_slowdown_triggers_restart_after_consecutive_breaches()
 
     await sup._run_once()
     server_manager.restart.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_supervisor_disables_metrics_monitor_when_endpoint_unsupported() -> None:
+    cp = CheckpointManager()
+    client = MagicMock()
+    req = httpx.Request("GET", "http://127.0.0.1:8080/metrics")
+    resp = httpx.Response(status_code=501, request=req)
+    client.get_metrics = AsyncMock(side_effect=httpx.HTTPStatusError("unsupported", request=req, response=resp))
+
+    sup = SafetySupervisor(
+        llama_client=client,
+        checkpoint_manager=cp,
+        poll_interval=999,
+        step_timeout=999,
+        slowdown_monitor_enabled=True,
+    )
+
+    await sup._run_once()
+    assert sup._metrics_unsupported is True
+    assert client.get_metrics.await_count == 1
+
+    await sup._run_once()
+    assert client.get_metrics.await_count == 1
 
 
 @pytest.mark.asyncio

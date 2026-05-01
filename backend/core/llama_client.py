@@ -4,6 +4,8 @@ import json
 
 import httpx
 
+from backend.config import settings
+
 
 class LlamaClient:
     """Async HTTP client for the llama.cpp inference server REST API.
@@ -20,7 +22,17 @@ class LlamaClient:
 
     def __init__(self, host: str, port: int) -> None:
         self.base_url = f"http://{host}:{port}"
-        self._timeout = httpx.Timeout(120.0)
+        completion_timeout = float(settings.llama_completion_timeout_seconds)
+        # /completion can legitimately take minutes when prompt eval is large.
+        self._completion_timeout = httpx.Timeout(
+            timeout=None,
+            connect=10.0,
+            read=completion_timeout,
+            write=60.0,
+            pool=60.0,
+        )
+        # Keep lightweight probe calls snappy so diagnostics fail fast.
+        self._probe_timeout = httpx.Timeout(10.0)
 
     # Pre-filled closed think block injected when the prompt ends with the
     # assistant response prefix.  Qwen3 / DeepSeek-R1 models in raw completion
@@ -34,11 +46,14 @@ class LlamaClient:
     async def complete(
         self,
         prompt: str,
-        slot_id: int,
+        slot_id: int | None = None,
         max_tokens: int = 512,
         temperature: float = 0.7,
         stop: list[str] | None = None,
     ) -> str:
+        if slot_id is None:
+            slot_id = int(settings.main_slot)
+
         # Inject a pre-filled empty think block so thinking models skip CoT.
         _stripped = prompt.rstrip()
         if any(_stripped.endswith(p) for p in self._ASSISTANT_PREFIXES):
@@ -55,31 +70,47 @@ class LlamaClient:
         if stop:
             payload["stop"] = stop
 
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
+        async with httpx.AsyncClient(timeout=self._completion_timeout) as client:
             response = await client.post(f"{self.base_url}/completion", json=payload)
             if response.status_code >= 400:
                 self._raise_completion_error(response)
             result = response.json()
+        text = self._extract_text(result)
+        if text.strip():
+            return text
 
-        # Handle both response shapes
+        # Compatibility fallback: some servers/models return empty output when
+        # the optional thinking flag is present. Retry once without it.
+        retry_payload = dict(payload)
+        retry_payload.pop("thinking", None)
+        async with httpx.AsyncClient(timeout=self._completion_timeout) as client:
+            retry_response = await client.post(f"{self.base_url}/completion", json=retry_payload)
+            if retry_response.status_code >= 400:
+                self._raise_completion_error(retry_response)
+            retry_result = retry_response.json()
+        return self._extract_text(retry_result)
+
+    @staticmethod
+    def _extract_text(result: dict) -> str:
+        # Handle both response shapes.
         if "choices" in result and result["choices"]:
             return result["choices"][0].get("text", "")
         return result.get("content", "")
 
     async def get_slots(self) -> list[dict]:
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
+        async with httpx.AsyncClient(timeout=self._probe_timeout) as client:
             response = await client.get(f"{self.base_url}/slots")
             response.raise_for_status()
             return response.json()
 
     async def health(self) -> dict:
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
+        async with httpx.AsyncClient(timeout=self._probe_timeout) as client:
             response = await client.get(f"{self.base_url}/health")
             response.raise_for_status()
             return response.json()
 
     async def get_metrics(self) -> str:
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
+        async with httpx.AsyncClient(timeout=self._probe_timeout) as client:
             response = await client.get(f"{self.base_url}/metrics")
             response.raise_for_status()
             return response.text

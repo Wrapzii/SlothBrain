@@ -39,9 +39,22 @@ _MAX_FALLBACK_STEP_LENGTH = 300
 
 # Maximum tool-call iterations per execute_step call to prevent infinite loops.
 _MAX_TOOL_ITERATIONS = 5
+
+# The LlamaClient injects this prefix into every prompt that ends with
+# "assistant:" so that thinking-capable models skip the chain-of-thought
+# phase (see LlamaClient._THINK_SKIP_SUFFIX).  When we reconstruct the
+# accumulated tool context between iterations we MUST echo this prefix back
+# verbatim so the token sequence we send matches what llama.cpp cached.
+# Without this, llama.cpp sees a divergent prompt on every tool-call
+# iteration and is forced to re-evaluate the full prompt from the last
+# checkpoint, causing the KV-cache thrash visible as
+# "Common part does not match fully" in the server logs.
+_ASSISTANT_THINK_SKIP = "<think>\n\n</think>\n\n"
 _TOOL_QUERY_RE = re.compile(r"\b(tool|tools|capabilit(?:y|ies)|access)\b", re.IGNORECASE)
 _URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
+_DOMAIN_RE = re.compile(r"\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}\b", re.IGNORECASE)
 _FETCH_INTENT_RE = re.compile(r"\b(fetch|get|retrieve|download|read|visit|open)\b", re.IGNORECASE)
+_DESKTOP_VISION_TOOLS = {"screenshot", "ui", "image_analysis"}
 _TOOL_BLOCK_RE = re.compile(
     r"</?(?:tool_call|tool_result|fetch|fetch_result|verify|sweep|think|sloth)>"
     r"|thinking\s+process:"
@@ -54,6 +67,8 @@ _TOOL_BLOCK_RE = re.compile(
 _MAX_EVENT_TEXT_CHARS = 600
 _MAX_LIST_ITEMS = 20
 _MAX_MODEL_RESPONSE_PREVIEW_CHARS = 240
+_MAX_TOOL_PROMPT_TEXT_CHARS = 320
+_MAX_TOOL_PROMPT_LIST_ITEMS = 8
 _HEAVY_B64_KEYS = {
     "annotated_png_b64",
     "image_b64",
@@ -87,6 +102,31 @@ def _sanitize_tool_payload(value):
         return result
     if isinstance(value, str):
         return _truncate_text(value)
+    return value
+
+
+def _sanitize_tool_payload_for_prompt(value):
+    """Compact tool payload for model-facing prompt context.
+
+    Keep this significantly smaller than event payloads to avoid large prompt
+    growth and decode slowdowns in multi-iteration tool loops.
+    """
+    if isinstance(value, dict):
+        out: dict = {}
+        for k, v in value.items():
+            if k in _HEAVY_B64_KEYS and isinstance(v, str):
+                out[k] = f"[omitted base64 payload: {len(v)} chars]"
+                continue
+            out[k] = _sanitize_tool_payload_for_prompt(v)
+        return out
+    if isinstance(value, list):
+        trimmed = value[:_MAX_TOOL_PROMPT_LIST_ITEMS]
+        result = [_sanitize_tool_payload_for_prompt(v) for v in trimmed]
+        if len(value) > _MAX_TOOL_PROMPT_LIST_ITEMS:
+            result.append(f"...[{len(value) - _MAX_TOOL_PROMPT_LIST_ITEMS} more items]")
+        return result
+    if isinstance(value, str):
+        return _truncate_text(value, _MAX_TOOL_PROMPT_TEXT_CHARS)
     return value
 
 
@@ -362,12 +402,27 @@ class MainAgent:
         """
         # Fast-path: URL fetch tasks should be handled with web_fetch only,
         # not desktop UI automation steps.
-        url_match = _URL_RE.search(task or "")
-        if url_match and _FETCH_INTENT_RE.search(task or ""):
-            url = url_match.group(0)
+        task_text = task or ""
+        url_match = _URL_RE.search(task_text)
+        domain_match = _DOMAIN_RE.search(task_text)
+        if _FETCH_INTENT_RE.search(task_text) and (url_match or domain_match):
+            if url_match:
+                url = url_match.group(0)
+            else:
+                url = f"https://{domain_match.group(0)}"
             return {
                 "approach": "Use web_fetch directly and summarize the response.",
                 "steps": [f"Use web_fetch to fetch {url} and report key findings."],
+            }
+
+        # Fetch intent without a concrete URL/domain should ask for target
+        # instead of letting the model invent a placeholder URL.
+        if _FETCH_INTENT_RE.search(task_text) and not (url_match or domain_match):
+            return {
+                "approach": "Ask user for a specific URL before running web_fetch.",
+                "steps": [
+                    "Ask the user to provide a full URL or domain to fetch (for example: https://example.com)."
+                ],
             }
 
         # NOTE: The plan prompt MUST share the same system-prompt prefix as
@@ -407,6 +462,11 @@ class MainAgent:
         task: str,
         context: list[str] | None = None,
         on_event: Callable[[dict], Awaitable[dict | None] | dict | None] | None = None,
+        *,
+        include_rolling_context: bool = True,
+        tool_calls_enabled: bool = True,
+        semantic_routing_enabled: bool = True,
+        allowed_tool_names: list[str] | None = None,
     ) -> str:
         """Execute a single step within a larger task.
 
@@ -426,24 +486,37 @@ class MainAgent:
             Accumulated results from previous steps (most recent last).
         """
         context_section = ""
-        if context:
+        if include_rolling_context and context:
             recent = context[-5:]
             context_section = "\n\nContext from previous steps:\n" + "\n".join(recent)
 
         # Build tool descriptions block if tools are available
         tools_section = ""
         tools: list = []
-        if self._tool_registry is not None:
+        if self._tool_registry is not None and tool_calls_enabled:
             routing_context_parts = [
                 f"task: {task}",
                 f"step: {step}",
             ]
-            if context:
+            if include_rolling_context and context:
                 routing_context_parts.append("recent_context:")
                 routing_context_parts.extend(context[-3:])
             routing_context = "\n".join(routing_context_parts)
 
-            tools = self._tool_registry.get_tools(context=routing_context)
+            tools = self._tool_registry.get_tools(
+                context=routing_context,
+                semantic_routing_enabled=semantic_routing_enabled,
+                allow_tool_names=allowed_tool_names,
+            )
+
+            # Guardrail: web-fetch intent should not route through desktop/vision
+            # tools, which can trigger expensive screenshots and unrelated UI actions.
+            web_intent = bool(_FETCH_INTENT_RE.search(routing_context)) and bool(
+                _URL_RE.search(routing_context) or _DOMAIN_RE.search(routing_context)
+            )
+            if web_intent:
+                tools = [t for t in tools if t.name not in _DESKTOP_VISION_TOOLS]
+
             if tools:
                 tools_block = self._tool_registry.render_tool_descriptions(tools)
                 tools_section = (
@@ -453,6 +526,8 @@ class MainAgent:
                     '{"tool": "<name>", "args": {<arguments>}}\n'
                     "</tool_call>\n"
                     "The tool result will be provided and you may continue.\n"
+                    "During tool iterations, keep text very brief and avoid long summaries;\n"
+                    "either emit the next tool_call or a concise final answer.\n"
                     "When no more tools are needed, provide your final answer."
                 )
 
@@ -471,8 +546,15 @@ class MainAgent:
         accumulated_tool_context = ""
         for iteration in range(_MAX_TOOL_ITERATIONS):
             prompt = step_prompt + accumulated_tool_context
+            logger.info(
+                "execute_step iteration=%d tool_calls_enabled=%s semantic_routing_enabled=%s allowed_tools=%s",
+                iteration + 1,
+                tool_calls_enabled,
+                semantic_routing_enabled,
+                allowed_tool_names or [],
+            )
             try:
-                response = await self._slot_manager.send_to_main(prompt, max_tokens=512)
+                response = await self._slot_manager.send_to_main(prompt, max_tokens=256)
             except Exception as exc:
                 if on_event is not None:
                     maybe = on_event(
@@ -493,24 +575,36 @@ class MainAgent:
                 if intervention:
                     return intervention.get("message", "Execution paused by SafetySupervisor.")
 
+            logger.info("execute_step model_output iteration=%d preview=%s", iteration + 1, _truncate_text(response, 160))
+
             # No tool registry or no tools → return directly
             if self._tool_registry is None or not tools:
                 return response
 
             tool_calls = self._tool_registry.parse_tool_calls(response)
+            logger.info("execute_step parsed_tool_calls iteration=%d count=%d", iteration + 1, len(tool_calls))
             if not tool_calls:
                 # No tool calls — final answer
                 return response
 
             # Execute each tool call and accumulate results.
-            # Keep only a short response preview to avoid prompt/KV blow-up.
-            response_preview = _truncate_text(
-                response.replace("\n", " ").strip(),
-                _MAX_MODEL_RESPONSE_PREVIEW_CHARS,
-            )
-            tool_result_lines: list[str] = [
-                f"<model_response_preview>{response_preview}</model_response_preview>"
-            ]
+            #
+            # IMPORTANT – cache coherence for recurrent/SWA models:
+            # The LlamaClient injects "\n<think>\n\n</think>\n\n" into every
+            # prompt that ends with "assistant:".  The llama.cpp server caches
+            # the FULL token sequence including that injected prefix + the model
+            # response.  If we do NOT echo that prefix here, the next iteration's
+            # prompt diverges from the cache immediately after "assistant:",
+            # causing a forced full-context re-evaluation on every tool call.
+            # By reconstructing the context as:
+            #   \n<think>\n\n</think>\n\n<response>\n<tool_result>...\nassistant:
+            # we match what llama.cpp cached, so only the new tokens (tool result
+            # and the fresh assistant turn) need to be evaluated.
+            # Echo the full response so the accumulated context matches the
+            # exact token sequence llama.cpp cached.  The overall
+            # _MAX_TOOL_CONTEXT_CHARS guard trims from the left if needed.
+            response_in_cache = _ASSISTANT_THINK_SKIP + response
+            tool_result_lines: list[str] = [response_in_cache]
             for tc in tool_calls:
                 tool_name = tc["tool"]
                 tool_args = tc.get("args", {})
@@ -561,14 +655,14 @@ class MainAgent:
                     {
                         "tool": tool_name,
                         "ok": bool(result_dict.get("ok")),
-                        "output": safe_output,
-                        "error": safe_error,
+                        "output": _sanitize_tool_payload_for_prompt(result_dict.get("output")),
+                        "error": _sanitize_tool_payload_for_prompt(result_dict.get("error")),
                     },
                     ensure_ascii=False,
                     default=str,
                 )
                 tool_result_lines.append(
-                    f"<tool_result>\n{result_json}\n</tool_result>"
+                    f"\n<tool_result>\n{result_json}\n</tool_result>"
                 )
 
             accumulated_tool_context += "\n" + "\n".join(tool_result_lines) + "\nassistant:"

@@ -65,6 +65,10 @@ class AppConfig(BaseSettings):
     supervisor_slowdown_consecutive_polls: int = 3
     supervisor_slowdown_restart_enabled: bool = False
     supervisor_slowdown_cooldown_seconds: float = 300.0
+    # Timeout budget (seconds) for llama.cpp /completion requests.
+    # Keep this comfortably above worst-case prompt-eval + generation times to
+    # avoid client-side cancellations that invalidate llama.cpp slot checkpoints.
+    llama_completion_timeout_seconds: float = 600.0
     supervisor_max_repeated_tool_calls: int = 3
     supervisor_max_failed_tool_calls: int = 3
     supervisor_max_no_progress_steps: int = 3
@@ -98,6 +102,16 @@ class AppConfig(BaseSettings):
     # Web search: set to a SearXNG base URL to use it instead of DuckDuckGo
     searxng_url: str = ""
 
+    # Image analysis backend
+    # - cpu_ocr: run OCR + metadata extraction on CPU (no llama.cpp vision call)
+    # - llama: force llama.cpp multimodal analysis
+    # - auto: try CPU OCR first, then llama.cpp fallback
+    image_analysis_backend: str = "cpu_ocr"
+    # Use a dedicated slot for llama.cpp vision calls to avoid polluting the
+    # main assistant slot cache state. Set to -1 for "any available slot".
+    image_analysis_llama_slot_id: int = 0
+    image_analysis_cpu_max_text_chars: int = 4000
+
     # Workspace / file-system indexing
     # When True, WorkspaceIndexTool is registered and FileTool auto-triggers
     # background indexing whenever a directory is listed.
@@ -105,6 +119,19 @@ class AppConfig(BaseSettings):
     # Set to a custom path to store the workspace index in a separate location
     # from the main LanceDB memory.  Defaults to a sub-directory of lancedb_path.
     workspace_index_db_path: str = ""
+
+    # Agentic debug loop defaults
+    # Enable to run the loop with runtime-tunable feature toggles and loop telemetry.
+    debug_loop_enabled: bool = False
+    debug_loop_llm_only: bool = False
+    debug_loop_planning_enabled: bool = True
+    debug_loop_rolling_context_enabled: bool = True
+    debug_loop_tool_calls_enabled: bool = True
+    debug_loop_semantic_routing_enabled: bool = True
+    debug_loop_checkpointing_enabled: bool = True
+    debug_loop_supervisor_enabled: bool = True
+    debug_loop_per_event_logging: bool = True
+    debug_loop_allowed_tools: list[str] = []
 
     cors_allowed_origins: list[str] = [
         "http://localhost:5173",
@@ -176,6 +203,13 @@ class AppConfig(BaseSettings):
             raise ValueError("supervisor_slowdown_cooldown_seconds must be >= 0")
         return v
 
+    @field_validator("llama_completion_timeout_seconds")
+    @classmethod
+    def _validate_llama_completion_timeout(cls, v: float) -> float:
+        if v <= 0:
+            raise ValueError("llama_completion_timeout_seconds must be > 0")
+        return v
+
     @field_validator(
         "supervisor_max_repeated_tool_calls",
         "supervisor_max_failed_tool_calls",
@@ -201,6 +235,22 @@ class AppConfig(BaseSettings):
     def _validate_semantic_similarity(cls, v: float) -> float:
         if not (-1.0 <= v <= 1.0):
             raise ValueError("semantic_tool_routing_min_similarity must be between -1 and 1")
+        return v
+
+    @field_validator("image_analysis_backend")
+    @classmethod
+    def _validate_image_analysis_backend(cls, v: str) -> str:
+        allowed = {"cpu_ocr", "llama", "auto"}
+        norm = (v or "").strip().lower()
+        if norm not in allowed:
+            raise ValueError("image_analysis_backend must be one of: cpu_ocr, llama, auto")
+        return norm
+
+    @field_validator("image_analysis_cpu_max_text_chars")
+    @classmethod
+    def _validate_image_analysis_cpu_max_text_chars(cls, v: int) -> int:
+        if v < 256:
+            raise ValueError("image_analysis_cpu_max_text_chars must be at least 256")
         return v
 
     model_config = {"env_prefix": "SLOTHBRAIN_", "env_file": ".env", "extra": "ignore"}

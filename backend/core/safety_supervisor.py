@@ -18,6 +18,8 @@ from dataclasses import dataclass
 from collections import deque
 from typing import TYPE_CHECKING, Optional
 
+import httpx
+
 if TYPE_CHECKING:
     from backend.core.checkpoint_manager import CheckpointManager, TaskCheckpoint
     from backend.core.llama_client import LlamaClient
@@ -342,6 +344,7 @@ class SafetySupervisor:
         self._slowdown_cooldown_seconds = slowdown_cooldown_seconds
         self._slowdown_breach_count: int = 0
         self._last_slowdown_action_ts: float = 0.0
+        self._metrics_unsupported: bool = False
         self._max_repeated_tool_calls = max_repeated_tool_calls
         self._max_failed_tool_calls = max_failed_tool_calls
         self._max_no_progress_steps = max_no_progress_steps
@@ -475,11 +478,23 @@ class SafetySupervisor:
 
     async def _monitor_throughput_slowdown(self) -> None:
         """Detect sustained low llama throughput and report/restart defensively."""
-        if not self._slowdown_monitor_enabled:
+        if not self._slowdown_monitor_enabled or self._metrics_unsupported:
             return
 
         try:
             metrics_text = await self._client.get_metrics()
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code
+            if status in {404, 405, 501}:
+                self._metrics_unsupported = True
+                logger.info(
+                    "Slowdown monitor disabled: llama.cpp /metrics endpoint returned %d",
+                    status,
+                )
+            else:
+                logger.debug("Slowdown monitor skipped (metrics unavailable): HTTP %d", status)
+            self._slowdown_breach_count = 0
+            return
         except Exception as exc:
             logger.debug("Slowdown monitor skipped (metrics unavailable): %s", exc.__class__.__name__)
             self._slowdown_breach_count = 0

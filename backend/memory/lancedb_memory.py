@@ -65,7 +65,10 @@ class LanceDBMemory:
         if self._db is None:
             self._db = lancedb.connect(self._db_path)
         if self._table is None:
-            existing = self._db.table_names()
+            if hasattr(self._db, "list_tables"):
+                existing = self._db.list_tables()
+            else:
+                existing = self._db.table_names()
             if "memories" in existing:
                 self._table = self._db.open_table("memories")
             else:
@@ -77,9 +80,12 @@ class LanceDBMemory:
                     "metadata": "{}",
                     "timestamp": "",
                 }
-                self._table = self._db.create_table("memories", data=[schema])
-                # Remove seed row immediately
-                self._table.delete("text = ''")
+                try:
+                    self._table = self._db.create_table("memories", data=[schema])
+                    # Remove seed row immediately
+                    self._table.delete("text = ''")
+                except Exception:
+                    self._table = self._db.open_table("memories")
         return self._table
 
     async def store(self, text: str, metadata: dict | None = None) -> None:
