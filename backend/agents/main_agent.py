@@ -362,7 +362,26 @@ class MainAgent:
         if _TOOL_QUERY_RE.search(latest_user_input):
             return self._describe_direct_capabilities()
 
+        memory_context = ""
+        if self._memory is not None:
+            try:
+                memory_results = await self._memory.search(latest_user_input, limit=4)
+                snippets: list[str] = []
+                for row in memory_results:
+                    text = str(row.get("text") or "").strip()
+                    if not text:
+                        continue
+                    if len(text) > 260:
+                        text = text[:260] + " ...[truncated]"
+                    snippets.append(f"- {text}")
+                if snippets:
+                    memory_context = "Relevant long-term memory:\n" + "\n".join(snippets)
+            except Exception as exc:
+                logger.warning("MainAgent direct memory search failed: %s", exc.__class__.__name__)
+
         prompt_parts = [f"system: {_DIRECT_SYSTEM_PROMPT}"]
+        if memory_context:
+            prompt_parts.append(memory_context)
         if conversation_context:
             trimmed_context = [line.strip() for line in conversation_context if line and line.strip()]
             if trimmed_context:

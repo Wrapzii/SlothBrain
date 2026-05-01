@@ -296,3 +296,26 @@ async def test_main_agent_execute_step():
     call_prompt = sm.send_to_main.call_args[0][0]
     assert "Bigger task" in call_prompt
     assert "Previous step result" in call_prompt
+
+
+@pytest.mark.asyncio
+async def test_main_agent_process_direct_includes_memory_context():
+    from backend.agents.main_agent import MainAgent
+    from backend.config import AppConfig
+
+    sm = MagicMock()
+    sm.send_to_main = AsyncMock(return_value="ok")
+    cfg = AppConfig()
+
+    memory = MagicMock()
+    memory.search = AsyncMock(return_value=[
+        {"text": "user: find my github directory\nassistant: GitHub directory: C:\\Users\\WhiteWidow\\Documents\\GitHub"}
+    ])
+    memory.store = AsyncMock(return_value=None)
+
+    agent = MainAgent(slot_manager=sm, memory=memory, config=cfg)
+    await agent.process_direct("what do you remember?", conversation_context=[])
+
+    memory.search.assert_awaited_once_with("what do you remember?", limit=4)
+    prompt = sm.send_to_main.call_args.args[0]
+    assert "Relevant long-term memory:" in prompt
