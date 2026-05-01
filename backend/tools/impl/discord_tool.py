@@ -66,10 +66,35 @@ class DiscordTool(Tool):
         webhook_url: str = "",
         bot_token: str = "",
         channel_id: str = "",
+        owner_user_id: str = "",
     ) -> None:
         self._webhook_url = webhook_url
         self._bot_token = bot_token
         self._channel_id = channel_id
+        self._owner_user_id = owner_user_id
+        self._resolved_dm_channel: str = ""
+
+    async def _resolve_dm_channel(self) -> str:
+        """Open (or return cached) DM channel with the owner user."""
+        if self._resolved_dm_channel:
+            return self._resolved_dm_channel
+        if not self._bot_token or not self._owner_user_id:
+            return self._channel_id
+        headers = {"Authorization": f"Bot {self._bot_token}", "Content-Type": "application/json"}
+        try:
+            async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+                resp = await client.post(
+                    f"{_DISCORD_API}/users/@me/channels",
+                    headers=headers,
+                    json={"recipient_id": self._owner_user_id},
+                )
+            if resp.status_code == 200:
+                self._resolved_dm_channel = resp.json().get("id", "")
+                logger.info("Discord DM channel resolved: %s", self._resolved_dm_channel)
+                return self._resolved_dm_channel
+        except Exception as exc:
+            logger.error("Failed to resolve DM channel: %s", exc)
+        return self._channel_id
 
     async def execute(
         self,
@@ -90,7 +115,7 @@ class DiscordTool(Tool):
             return ToolResult(ok=False, error="'content' is required for 'send'")
 
         # Webhook path (no auth required)
-        if self._webhook_url:
+        if self._webhook_url and not self._owner_user_id:
             payload: dict = {"content": content}
             if username:
                 payload["username"] = username
@@ -106,10 +131,13 @@ class DiscordTool(Tool):
             except Exception as exc:
                 return ToolResult(ok=False, error=str(exc))
 
-        # Bot token path
-        if self._bot_token and self._channel_id:
+        # Bot token path – resolve DM channel if owner_user_id is set
+        if self._bot_token:
+            channel = await self._resolve_dm_channel() if self._owner_user_id else self._channel_id
+            if not channel:
+                return ToolResult(ok=False, error="No channel resolved for send.")
             headers = {"Authorization": f"Bot {self._bot_token}", "Content-Type": "application/json"}
-            url = f"{_DISCORD_API}/channels/{self._channel_id}/messages"
+            url = f"{_DISCORD_API}/channels/{channel}/messages"
             try:
                 async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
                     resp = await client.post(url, headers=headers, json={"content": content})
@@ -125,17 +153,20 @@ class DiscordTool(Tool):
 
         return ToolResult(
             ok=False,
-            error="No Discord credentials configured. Set webhook_url or (bot_token + channel_id).",
+            error="No Discord credentials configured. Set bot_token + owner_user_id.",
         )
 
     async def _history(self, limit: int) -> ToolResult:
-        if not self._bot_token or not self._channel_id:
+        if not self._bot_token:
             return ToolResult(
                 ok=False,
-                error="Reading channel history requires a bot token and channel ID.",
+                error="Reading channel history requires a bot token.",
             )
+        channel = await self._resolve_dm_channel() if self._owner_user_id else self._channel_id
+        if not channel:
+            return ToolResult(ok=False, error="No channel resolved for history.")
         headers = {"Authorization": f"Bot {self._bot_token}"}
-        url = f"{_DISCORD_API}/channels/{self._channel_id}/messages"
+        url = f"{_DISCORD_API}/channels/{channel}/messages"
         try:
             async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
                 resp = await client.get(url, headers=headers, params={"limit": limit})
@@ -148,6 +179,8 @@ class DiscordTool(Tool):
                 {
                     "id": m.get("id"),
                     "author": m.get("author", {}).get("username"),
+                    "author_id": m.get("author", {}).get("id"),
+                    "is_bot": m.get("author", {}).get("bot", False),
                     "content": m.get("content", ""),
                     "timestamp": m.get("timestamp"),
                 }

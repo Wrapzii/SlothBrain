@@ -5,6 +5,8 @@ import ipaddress
 import json
 import logging
 import re
+import time
+from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from functools import lru_cache
 from typing import Any, Optional
@@ -40,6 +42,316 @@ _AUTO_AGENTIC_TOOL_INTENT_RE = re.compile(
     r"(\bweb_fetch\b|\buse\b.{0,20}\btool\b|\btry\b.{0,20}\btool\b|\bfetch\b\s+https?://)",
     re.IGNORECASE,
 )
+_DM_TASK_INTENT_RE = re.compile(
+    r"\b(?:/task|/agentic|web\s*fetch|fetch|lookup|look\s+up|search|research|find|list|source|summari[sz]e|open|read|directory|projects?)\b",
+    re.IGNORECASE,
+)
+_DM_SHORT_ACK_RE = re.compile(r"^(?:yes|yep|yeah|ok|okay|sure|do it|go ahead|continue|proceed)$", re.IGNORECASE)
+_FILE_NAME_RE = re.compile(r"\b([a-zA-Z0-9_.-]+\.[a-zA-Z0-9]+)\b")
+_DISCORD_DM_HANDLE_TIMEOUT_SECONDS = 90.0
+_DISCORD_DM_MAX_BACKLOG_PER_POLL = 20
+
+
+def _sanitize_user_facing_response(text: str) -> str:
+    """Strip protocol / tool-call residue from responses shown to users."""
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return ""
+
+    cleaned = re.sub(r"(?is)<tool_call>.*?(?:</tool_call>|$)", "", cleaned)
+    cleaned = re.sub(r"(?is)<tool_result>.*?(?:</tool_result>|$)", "", cleaned)
+    cleaned = re.sub(r"(?is)<[a-z_][a-z0-9_:-]*>.*?</[a-z_][a-z0-9_:-]*>", "", cleaned)
+    cleaned = re.sub(r"(?is)</?[a-z_][a-z0-9_:-]*>", "", cleaned)
+    cleaned = re.sub(r'(?im)^\s*\{\s*"tool"\s*:.*$', "", cleaned)
+    cleaned = re.sub(r"(?im)^\s*(task execution complete\.?|task initiated\.?|fetching .* now\.?|would you like me to proceed\??)\s*$", "", cleaned)
+    cleaned = re.sub(r"(?im)^\s*task\s*result\s*:\s*.*$", "", cleaned)
+    cleaned = re.sub(r"(?im)^\s*no tools failed\.?\s*$", "", cleaned)
+    cleaned = re.sub(r"(?im)^\s*both the initial search and the web fetch executed without issues.*$", "", cleaned)
+    cleaned = re.sub(r"(?im)^\s*session terminated\.?\s*$", "", cleaned)
+    cleaned = re.sub(r"(?im)^\s*sub-agent session terminated successfully\.?\s*$", "", cleaned)
+    cleaned = re.sub(r"(?im)^\s*detected repeated tool loop for '.*' with near-identical arguments\.?\s*$", "", cleaned)
+    cleaned = re.sub(r"(?is)<br\s*/?>", "\n", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
+class DiscordDMBridge:
+    """Background task that listens to Discord DM and bridges to SlothBrain chat."""
+
+    def __init__(self, main_agent: "MainAgent", config: Any, registry: "ToolRegistry"):
+        self._main_agent = main_agent
+        self._config = config
+        self._registry = registry
+        self._running = False
+        self._processed_ids: deque = deque(maxlen=100)  # Track processed message IDs to avoid duplicates
+        self._task: asyncio.Task | None = None
+        self._bot_user_id: str = ""  # Populated on first message check
+        self._history_primed: bool = False
+        self._last_poll_at: float = 0.0
+        self._last_processed_id: str = ""
+        self._last_error: str = ""
+        # Keep a short per-user transcript so Discord replies preserve recent context.
+        self._dm_context: dict[str, deque[str]] = defaultdict(lambda: deque(maxlen=8))
+
+    @staticmethod
+    def _clean_discord_response(text: str) -> str:
+        """Strip protocol/HTML residue from model output before posting to Discord."""
+        return _sanitize_user_facing_response(text)
+
+    @staticmethod
+    def _extract_agentic_response(result: dict) -> str:
+        """Prefer the last meaningful step result over the loop's generic summary."""
+        steps = result.get("steps") if isinstance(result, dict) else None
+        if isinstance(steps, list):
+            for step in reversed(steps):
+                if not isinstance(step, dict):
+                    continue
+                step_result = str(step.get("result") or "").strip()
+                if not step_result:
+                    continue
+                if step_result in ("Task execution complete.", "Task execution finished with failures."):
+                    continue
+                return step_result
+        summary = str(result.get("summary") or "").strip() if isinstance(result, dict) else ""
+        return summary or "Task execution complete."
+
+    def _should_route_to_agentic(self, user_key: str, content: str) -> bool:
+        text = (content or "").strip()
+        if not text:
+            return False
+        lower = text.lower()
+        if lower.startswith("/task") or lower.startswith("/agentic"):
+            return True
+        if _DM_TASK_INTENT_RE.search(text):
+            return True
+        if _should_use_agentic_mode(text, max_steps=2, mode="auto"):
+            return True
+        if _DM_SHORT_ACK_RE.match(text):
+            history = list(self._dm_context.get(user_key, []))
+            recent = "\n".join(history[-4:]).lower()
+            if "/task" in recent or "fetch" in recent or "search" in recent:
+                return True
+        return False
+
+    def start(self) -> None:
+        """Start the DM listener background task."""
+        has_channel = bool(self._config.discord_bot_token and (
+            getattr(self._config, "discord_owner_user_id", "") or self._config.discord_channel_id
+        ))
+        if not has_channel:
+            logger.info("Discord DM bridge disabled: bot_token + owner_user_id (or channel_id) not configured")
+            return
+        self._running = True
+        self._task = asyncio.create_task(self._listener_loop())
+        logger.info("Discord DM listener started")
+
+    def stop(self) -> None:
+        """Stop the DM listener background task."""
+        self._running = False
+        if self._task is not None:
+            self._task.cancel()
+        logger.info("Discord DM listener stopped")
+
+    async def _listener_loop(self) -> None:
+        """Poll Discord channel history and forward new messages to SlothBrain."""
+        poll_interval = 5  # seconds
+        while self._running:
+            try:
+                await asyncio.sleep(poll_interval)
+                await self._check_new_messages()
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logger.error("Discord DM listener error: %s", exc)
+                await asyncio.sleep(poll_interval * 2)  # Back off on error
+
+    async def _check_new_messages(self) -> None:
+        """Fetch recent messages and process new ones."""
+        self._last_poll_at = time.time()
+        discord_tool = self._registry.get("discord")
+        if discord_tool is None:
+            return
+
+        # Resolve bot's own user ID once so we can filter reliably by ID not username
+        if not self._bot_user_id and self._config.discord_bot_token:
+            import httpx as _httpx
+            try:
+                async with _httpx.AsyncClient(timeout=5.0) as client:
+                    r = await client.get(
+                        "https://discord.com/api/v10/users/@me",
+                        headers={"Authorization": f"Bot {self._config.discord_bot_token}"},
+                    )
+                if r.status_code == 200:
+                    self._bot_user_id = r.json().get("id", "")
+            except Exception:
+                pass
+
+        # Get recent messages from DM channel
+        result = await discord_tool.execute(action="history", limit=50)
+        if not result.ok or not isinstance(result.output, dict):
+            return
+
+        messages = result.output.get("messages", [])
+        if not messages:
+            return
+
+        # On first successful poll after startup, prime the seen-ID buffer from
+        # existing channel history so we only process *new* incoming messages.
+        # This prevents replaying old backlog every time the backend restarts.
+        if not self._history_primed:
+            for msg in messages:
+                msg_id = msg.get("id")
+                if msg_id:
+                    self._processed_ids.append(msg_id)
+            self._history_primed = True
+            logger.info(
+                "Discord DM listener primed history with %d message ids",
+                len(self._processed_ids),
+            )
+            return
+
+        # Process messages in chronological order (oldest first)
+        messages_to_process = []
+        for msg in reversed(messages):
+            msg_id = msg.get("id")
+            author = msg.get("author", "")
+            author_id = msg.get("author_id", "")
+            is_bot = msg.get("is_bot", False)
+            content = msg.get("content", "").strip()
+
+            # Skip bot's own messages (by ID or bot flag)
+            if is_bot or (self._bot_user_id and author_id == self._bot_user_id):
+                continue
+
+            # Skip if already processed
+            if msg_id in self._processed_ids:
+                continue
+
+            if content:
+                messages_to_process.append(
+                    {
+                        "id": msg_id,
+                        "author": author,
+                        "author_id": author_id,
+                        "content": content,
+                    }
+                )
+
+        # Avoid draining huge backlogs in one poll and reduce the chance that
+        # stale old messages block responsiveness to current user input.
+        if len(messages_to_process) > _DISCORD_DM_MAX_BACKLOG_PER_POLL:
+            messages_to_process = messages_to_process[-_DISCORD_DM_MAX_BACKLOG_PER_POLL:]
+
+        # Process new messages
+        for msg in messages_to_process:
+            try:
+                await asyncio.wait_for(
+                    self._handle_message(msg),
+                    timeout=_DISCORD_DM_HANDLE_TIMEOUT_SECONDS,
+                )
+                self._processed_ids.append(msg["id"])
+                self._last_processed_id = str(msg.get("id") or "")
+            except asyncio.TimeoutError:
+                logger.error(
+                    "Discord DM processing timed out for message %s from %s",
+                    msg.get("id"),
+                    msg.get("author"),
+                )
+                self._last_error = (
+                    f"timeout processing message {msg.get('id')} from {msg.get('author')}"
+                )
+                self._processed_ids.append(msg["id"])
+                discord_tool = self._registry.get("discord")
+                if discord_tool is not None:
+                    try:
+                        await discord_tool.execute(
+                            action="send",
+                            content=(
+                                "I'm sorry, that request timed out while processing. "
+                                "Please try again with a shorter prompt."
+                            ),
+                        )
+                    except Exception:
+                        pass
+            except Exception as exc:
+                logger.error("Error processing Discord DM from %s: %s", msg.get("author"), exc)
+                self._last_error = f"processing error for {msg.get('id')}: {exc.__class__.__name__}"
+                # Mark as processed so one bad message cannot poison all future polls.
+                self._processed_ids.append(msg["id"])
+
+    async def _handle_message(self, msg: dict) -> None:
+        """Forward a Discord DM to SlothBrain and post the response."""
+        author = msg.get("author", "User")
+        author_id = str(msg.get("author_id", "")).strip()
+        content = msg.get("content", "")
+        user_key = author_id or author
+
+        logger.info("Discord DM from %s: %s", author, content[:100])
+
+        is_task_message = self._should_route_to_agentic(user_key=user_key, content=content)
+        response = ""
+
+        # Forward to SlothBrain direct chat or agentic loop depending on user input.
+        try:
+            if is_task_message:
+                from backend.agents.agentic_loop import AgenticLoop
+
+                task_message = content.strip()
+                for prefix in ("/task", "/agentic"):
+                    if task_message.lower().startswith(prefix):
+                        task_message = task_message[len(prefix):].strip()
+                        break
+
+                if not task_message:
+                    response = "Please provide a task after /task, for example: /task summarize https://example.com"
+                else:
+                    deterministic = await _try_handle_simple_file_task(task_message)
+                    if deterministic is not None:
+                        _schedule_deterministic_task_persist(task_message, deterministic)
+                        response = deterministic
+                    else:
+                        async with _inference_lock:
+                            loop = AgenticLoop(
+                                main_agent=self._main_agent,
+                                max_steps=10,
+                                checkpoint_manager=checkpoint_manager,
+                                supervisor=safety_supervisor,
+                                debug_options=AgenticDebugOptions(),
+                            )
+                            result = await loop.run(task=task_message)
+                        response = self._extract_agentic_response(result)
+            else:
+                async with _inference_lock:
+                    response = await self._main_agent.process_direct(
+                        user_input=content,
+                        conversation_context=list(self._dm_context.get(user_key, [])),
+                    )
+        except Exception as exc:
+            response = f"[Error processing message: {exc.__class__.__name__}]"
+            logger.error("Failed to process Discord DM: %s", exc)
+
+        response = self._clean_discord_response(response)
+        if not response:
+            response = "I couldn't generate a useful response. Please try again."
+
+        # Persist this turn in the DM context window.
+        self._dm_context[user_key].append(f"User: {content}")
+        self._dm_context[user_key].append(f"SlothBrain: {response[:280]}")
+
+        # Post response back to Discord
+        if response:
+            reply = response[:1900]
+            if len(response) > 1900:
+                reply += "\n\n[response truncated...]"
+
+            discord_tool = self._registry.get("discord")
+            if discord_tool:
+                send_result = await discord_tool.execute(action="send", content=reply)
+
+                if send_result.ok:
+                    logger.info("Discord DM response sent")
+                else:
+                    logger.error("Failed to post Discord DM response: %s", send_result.error)
 
 
 async def _apply_effective_slot_context_budget() -> None:
@@ -100,6 +412,7 @@ approval_queue: ApprovalQueue
 checkpoint_manager: CheckpointManager
 safety_supervisor: SafetySupervisor
 tool_registry: ToolRegistry
+discord_dm_bridge: "DiscordDMBridge | None" = None
 
 
 @asynccontextmanager
@@ -107,7 +420,7 @@ async def lifespan(app: FastAPI):  # type: ignore[type-arg]
     global llama_client, slot_manager, resource_manager
     global memory, main_agent, benchmark_suite
     global preset_manager, agent_registry, server_manager, audit_log, approval_queue
-    global checkpoint_manager, safety_supervisor, tool_registry
+    global checkpoint_manager, safety_supervisor, tool_registry, discord_dm_bridge
 
     audit_log = AuditLog()
     approval_queue = ApprovalQueue(max_entries=settings.max_pending_approvals)
@@ -127,8 +440,11 @@ async def lifespan(app: FastAPI):  # type: ignore[type-arg]
             embedding_model=settings.embedding_model,
         )
     except ImportError as exc:
-        print(f"[WARNING] LanceDB unavailable – memory disabled: {exc}")
-        memory = None  # type: ignore[assignment]
+        raise RuntimeError(
+            "LanceDB memory is required but failed to initialize. "
+            "Install compatible dependencies (for example: pip install -r requirements.txt). "
+            f"Original error: {exc}"
+        ) from exc
 
     main_agent = MainAgent(
         slot_manager=slot_manager,
@@ -191,9 +507,14 @@ async def lifespan(app: FastAPI):  # type: ignore[type-arg]
     if settings.enable_server_watchdog:
         server_manager.start_watchdog()
 
+    # Discord DM listener
+    discord_dm_bridge = DiscordDMBridge(main_agent=main_agent, config=settings, registry=tool_registry)
+    discord_dm_bridge.start()
+
     yield
 
     # Shutdown – stop all background tasks
+    discord_dm_bridge.stop()
     safety_supervisor.stop()
     server_manager.stop_watchdog()
     agent_registry.destroy_all()
@@ -241,21 +562,24 @@ def _register_tools(
     from backend.tools.plugin_loader import load_plugins
 
     # Vision / desktop
-    try:
-        from backend.vision.controller import DesktopController
-        controller = DesktopController()
-        registry.register(UITool(controller=controller))
-        registry.register(
-            ImageAnalysisTool(
-                llama_client=llama_client,
-                controller=controller,
-                backend=getattr(config, "image_analysis_backend", "cpu_ocr"),
-                llama_slot_id=int(getattr(config, "image_analysis_llama_slot_id", 0)),
-                cpu_max_text_chars=int(getattr(config, "image_analysis_cpu_max_text_chars", 4000)),
+    if getattr(config, "desktop_tools_enabled", True):
+        try:
+            from backend.vision.controller import DesktopController
+            controller = DesktopController()
+            registry.register(UITool(controller=controller))
+            registry.register(
+                ImageAnalysisTool(
+                    llama_client=llama_client,
+                    controller=controller,
+                    backend=getattr(config, "image_analysis_backend", "cpu_ocr"),
+                    llama_slot_id=int(getattr(config, "image_analysis_llama_slot_id", 0)),
+                    cpu_max_text_chars=int(getattr(config, "image_analysis_cpu_max_text_chars", 4000)),
+                )
             )
-        )
-    except Exception as exc:
-        logger.warning("Desktop tools unavailable: %s", exc)
+        except Exception as exc:
+            logger.warning("Desktop tools unavailable: %s", exc)
+    else:
+        logger.info("Desktop tools disabled by configuration")
 
     # Web
     registry.register(WebFetchTool())
@@ -288,8 +612,11 @@ def _register_tools(
             workspace_index_tool = WorkspaceIndexTool(indexer=ws_indexer)
             registry.register(workspace_index_tool)
         except ImportError as exc:
-            logger.warning("WorkspaceIndexTool not registered (missing deps): %s", exc)
-            workspace_index_tool = WorkspaceIndexTool(indexer=None)
+            raise RuntimeError(
+                "Workspace indexing is enabled but its LanceDB dependencies failed to load. "
+                "Install compatible dependencies (for example: pip install -r requirements.txt). "
+                f"Original error: {exc}"
+            ) from exc
     else:
         workspace_index_tool = WorkspaceIndexTool(indexer=None)
 
@@ -315,12 +642,14 @@ def _register_tools(
     webhook = getattr(config, "discord_webhook_url", "")
     bot_token = getattr(config, "discord_bot_token", "")
     channel_id = getattr(config, "discord_channel_id", "")
+    owner_user_id = getattr(config, "discord_owner_user_id", "")
     if webhook or bot_token:
         registry.register(
             DiscordTool(
                 webhook_url=webhook,
                 bot_token=bot_token,
                 channel_id=channel_id,
+                owner_user_id=owner_user_id,
             )
         )
 
@@ -345,10 +674,10 @@ import uvicorn
 # Note: These will be applied when the app is started via uvicorn with:
 # uvicorn.run(..., ws_max_size=_WS_MAX_SIZE, ws_max_queue=_WS_MAX_QUEUE)
 
-# Only one inference task (direct or agentic) may run at a time.
-# This avoids slot thrashing and recurrent-model slowdown when clients send
-# overlapping requests (e.g. rapid consecutive messages).
-_inference_lock: asyncio.Lock = asyncio.Lock()
+# Inference concurrency guard. Keep at 1 by default for safety, but allow
+# operators to raise it (for example 2) when llama.cpp is configured for
+# parallel execution capacity.
+_inference_lock: asyncio.Semaphore = asyncio.Semaphore(max(1, int(getattr(settings, "inference_concurrency", 1))))
 
 
 async def _run_agentic_with_cancel(
@@ -583,15 +912,8 @@ def _should_use_agentic_mode(message: str, max_steps: int, mode: str) -> bool:
     if lower.startswith("/task ") or lower.startswith("/agentic "):
         return True
 
-    # If caller requests multiple steps, treat as an agentic task.
-    if max_steps > 1:
-        return True
-
-    # Tool-intent prompts should run through agentic mode so tool execution is real.
-    if _AUTO_AGENTIC_TOOL_INTENT_RE.search(msg):
-        return True
-
-    # Otherwise default to direct chat for quick responsiveness.
+    # Otherwise default to direct chat for quick responsiveness. Natural-language
+    # task detection for Discord is handled by the DM bridge separately.
     return False
 
 
@@ -617,12 +939,183 @@ def _build_debug_options(debug: "Optional[AgenticDebugRequest]") -> AgenticDebug
     return defaults
 
 
+async def _try_handle_simple_file_task(task_message: str) -> str | None:
+    """Handle explicit local system/file tasks deterministically."""
+    if tool_registry is None:
+        return None
+    file_tool = tool_registry.get("file")
+    shell_tool = tool_registry.get("shell")
+    if file_tool is None:
+        return None
+
+    text = (task_message or "").strip()
+    lower = text.lower()
+
+    async def _run_shell(command: str) -> tuple[bool, str]:
+        if shell_tool is None:
+            return False, ""
+        result = await shell_tool.execute(command=command, timeout=30)
+        if not result.ok or not isinstance(result.output, dict):
+            return False, result.error or ""
+        stdout = str(result.output.get("stdout", "")).strip()
+        stderr = str(result.output.get("stderr", "")).strip()
+        return True, (stdout or stderr)
+
+    if "user name" in lower or "username" in lower or "who am i" in lower:
+        ok, output = await _run_shell("whoami")
+        if ok and output:
+            return f"Your computer username is: {output}"
+        return "I couldn't determine your username from the local shell."
+
+    if "computer name" in lower or "computers name" in lower or "hostname" in lower or "pc name" in lower:
+        ok, output = await _run_shell("hostname")
+        if ok and output:
+            return f"Your computer name is: {output}"
+        ok2, output2 = await _run_shell('cmd /c echo %COMPUTERNAME%')
+        if ok2 and output2:
+            return f"Your computer name is: {output2}"
+        return "I couldn't determine your computer name from the local shell."
+
+    if "check my documents" in lower or "check documents" in lower:
+        ok, output = await _run_shell('cmd /c dir /b "%USERPROFILE%\\Documents"')
+        if ok and output:
+            items = [line.strip() for line in output.splitlines() if line.strip()][:30]
+            if items:
+                return "Documents contains: " + ", ".join(items)
+        return "I couldn't list your Documents directory via command line."
+
+    if "github directory" in lower and ("list projects" in lower or "find my github directory" in lower):
+        ok, output = await _run_shell(
+            'cmd /c if exist "%USERPROFILE%\\Documents\\GitHub" (echo %USERPROFILE%\\Documents\\GitHub) else if exist "%USERPROFILE%\\GitHub" (echo %USERPROFILE%\\GitHub) else if exist "%USERPROFILE%\\github" (echo %USERPROFILE%\\github) else echo NOT_FOUND'
+        )
+        if ok and output and "NOT_FOUND" not in output:
+            github_path = output.splitlines()[0].strip()
+            ok2, output2 = await _run_shell(f'cmd /c dir /b /ad "{github_path}"')
+            if ok2 and output2:
+                projects = [line.strip() for line in output2.splitlines() if line.strip()][:50]
+                if projects:
+                    return f"GitHub directory: {github_path}\nProjects: " + ", ".join(projects)
+            return f"GitHub directory found at {github_path}, but I could not list project folders."
+
+        result = await file_tool.execute(action="list", path=".")
+        if result.ok and isinstance(result.output, dict):
+            entries = result.output.get("entries", [])
+            project_names = [e.get("name") for e in entries if isinstance(e, dict) and e.get("type") == "dir"]
+            if project_names:
+                return "GitHub directory projects: " + ", ".join(project_names)
+        return "I couldn't locate your GitHub directory via command line or workspace listing."
+
+    filename_match = _FILE_NAME_RE.search(text)
+    if not filename_match:
+        return None
+    filename = filename_match.group(1)
+    path = f"SlothBrain/{filename}"
+
+    if "create a file" in lower or "write a file" in lower:
+        content_match = re.search(r"with the text\s+(.+)$", text, re.IGNORECASE)
+        content = content_match.group(1).strip() if content_match else ""
+        result = await file_tool.execute(action="write", path=path, content=content)
+        if not result.ok:
+            return result.error or f"Failed to create {filename}."
+        return f"Created {filename} in the SlothBrain project directory."
+
+    if lower.startswith("read ") or "read the file" in lower:
+        result = await file_tool.execute(action="read", path=path)
+        if not result.ok:
+            return result.error or f"Failed to read {filename}."
+        return str(result.output)
+
+    if "append" in lower or "edit" in lower:
+        content_match = re.search(r"(?:saying|with the text)\s+(.+)$", text, re.IGNORECASE)
+        content = content_match.group(1).strip() if content_match else ""
+        if content and not content.startswith("\n"):
+            content = "\n" + content
+        result = await file_tool.execute(action="append", path=path, content=content)
+        if not result.ok:
+            return result.error or f"Failed to append to {filename}."
+        return f"Appended content to {filename}."
+
+    return None
+
+
+def _schedule_deterministic_task_persist(task_message: str, response: str) -> None:
+    """Persist deterministic task outcomes and trigger indexing for discovered roots."""
+    if memory is not None:
+        try:
+            snippet = (response or "").strip()
+            if len(snippet) > 4000:
+                snippet = snippet[:4000] + " ...[truncated]"
+            asyncio.create_task(
+                memory.store(
+                    text=(
+                        "deterministic_task_result\n"
+                        f"task: {task_message}\n"
+                        f"result: {snippet}"
+                    ),
+                    metadata={
+                        "agent": "main",
+                        "mode": "deterministic_task",
+                        "task": (task_message or "")[:200],
+                    },
+                )
+            )
+        except Exception:
+            pass
+
+    github_match = re.search(r"GitHub directory:\s*(.+)", response or "")
+    if github_match and tool_registry is not None:
+        workspace_index = tool_registry.get("workspace_index")
+        github_dir = github_match.group(1).strip().splitlines()[0]
+        if workspace_index is not None and hasattr(workspace_index, "is_available"):
+            try:
+                if workspace_index.is_available() and hasattr(workspace_index, "trigger_auto_index"):
+                    workspace_index.trigger_auto_index(github_dir)
+            except Exception:
+                pass
+
+
 # ---------------------------------------------------------------------------
 # Existing endpoints
 # ---------------------------------------------------------------------------
 @app.get("/health")
 async def health_check() -> dict:
     return {"status": "ok"}
+
+
+@app.get("/api/discord/debug")
+async def discord_debug() -> dict:
+    """Expose Discord DM bridge state for diagnostics."""
+    bridge = discord_dm_bridge
+    if bridge is None:
+        return {"bridge": "not_initialized"}
+    task_state = "none"
+    if bridge._task is not None:
+        if bridge._task.done():
+            exc = bridge._task.exception() if not bridge._task.cancelled() else None
+            task_state = f"done (exception={exc})"
+        else:
+            task_state = "running"
+    discord_tool = tool_registry.get("discord") if tool_registry else None
+    # Quick history fetch to test connectivity
+    history_result = None
+    if discord_tool is not None:
+        try:
+            r = await discord_tool.execute(action="history", limit=3)
+            history_result = {"ok": r.ok, "error": r.error, "count": r.output.get("count") if r.ok and r.output else None}
+        except Exception as exc:
+            history_result = {"error": str(exc)}
+    return {
+        "bridge_running": bridge._running,
+        "task_state": task_state,
+        "bot_user_id": bridge._bot_user_id,
+        "history_primed": bridge._history_primed,
+        "last_poll_at": bridge._last_poll_at,
+        "last_processed_id": bridge._last_processed_id,
+        "last_error": bridge._last_error,
+        "processed_ids_count": len(bridge._processed_ids),
+        "discord_tool_registered": discord_tool is not None,
+        "history_test": history_result,
+    }
 
 
 @app.get("/api/status")
@@ -642,12 +1135,6 @@ async def chat(http_request: Request, request: ChatRequest) -> dict:
     use_agentic = _should_use_agentic_mode(request.message, request.max_steps, request.mode)
 
     if not use_agentic:
-        if _inference_lock.locked():
-            raise HTTPException(
-                status_code=503,
-                detail="Another inference request is already running. Please wait.",
-            )
-
         await _ensure_llama_available("Direct chat")
         async with _inference_lock:
             try:
@@ -668,17 +1155,28 @@ async def chat(http_request: Request, request: ChatRequest) -> dict:
 
     await _ensure_llama_available("Agentic loop")
 
-    if _inference_lock.locked():
-        raise HTTPException(
-            status_code=503,
-            detail="Another inference request is already running. Please wait.",
-        )
-
     task_message = request.message.strip()
     for prefix in ("/task", "/agentic"):
         if task_message.lower().startswith(prefix):
             task_message = task_message[len(prefix):].strip()
             break
+
+    simple_file_response = await _try_handle_simple_file_task(task_message)
+    if simple_file_response is not None:
+        _schedule_deterministic_task_persist(task_message, simple_file_response)
+        return {
+            "agent": "agentic",
+            "response": _sanitize_user_facing_response(simple_file_response),
+            "handoff": False,
+            "result": {
+                "task": task_message,
+                "completion_verified": True,
+                "summary": simple_file_response,
+                "steps": [],
+                "total_steps": 0,
+                "duration_seconds": 0.0,
+            },
+        }
 
     async with _inference_lock:
         loop = AgenticLoop(
@@ -695,9 +1193,10 @@ async def chat(http_request: Request, request: ChatRequest) -> dict:
         except (httpx.HTTPError, RuntimeError, ValueError) as exc:
             _raise_service_unavailable(exc, "Agentic loop")
 
+    response_text = _sanitize_user_facing_response(str(result.get("summary", "")))
     return {
         "agent": "agentic",
-        "response": result.get("summary", ""),
+        "response": response_text,
         "handoff": False,
         "result": result,
     }
@@ -706,12 +1205,6 @@ async def chat(http_request: Request, request: ChatRequest) -> dict:
 @app.post("/api/chat/direct")
 async def direct_chat(request: ChatRequest) -> dict:
     """Explicit direct chat endpoint (single-shot, no task planning loop)."""
-    if _inference_lock.locked():
-        raise HTTPException(
-            status_code=503,
-            detail="Another inference request is already running. Please wait.",
-        )
-
     await _ensure_llama_available("Direct chat")
     async with _inference_lock:
         try:
@@ -740,12 +1233,6 @@ async def agentic_chat(http_request: Request, request: AgenticRequest) -> dict:
     from backend.agents.agentic_loop import AgenticLoop
 
     await _ensure_llama_available("Agentic loop")
-
-    if _inference_lock.locked():
-        raise HTTPException(
-            status_code=503,
-            detail="Another inference request is already running. Please wait.",
-        )
 
     async with _inference_lock:
         loop = AgenticLoop(

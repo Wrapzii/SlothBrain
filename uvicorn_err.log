@@ -1,0 +1,6 @@
+INFO:     Started server process [59964]
+INFO:     Waiting for application startup.
+Context size clamped to effective slot budget=30080 (main: 32768->30080)
+WorkspaceIndexTool not registered (missing deps): WorkspaceIndexer requires lancedb, sentence-transformers, numpy, pandas, and pyarrow. Install them with: pip install lancedb sentence-transformers numpy pandas pyarrow. Original import error: cannot import name 'CreateEmptyTableRequest' from 'lance_namespace' (C:\Users\WhiteWidow\Documents\GitHub\SlothBrain\.venv\lib\site-packages\lance_namespace\__init__.py)
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)

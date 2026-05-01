@@ -31,7 +31,8 @@ _FALLBACK_SYSTEM_PROMPT = (
 _DIRECT_SYSTEM_PROMPT = (
     "You are SlothBrain in direct chat mode. Reply to the user directly and concisely. "
     "Do not describe internal planning, verification, steps, watcher checks, or task-loop status. "
-    "If asked about capabilities, list them plainly from known system features."
+    "Do not volunteer capability lists, tool lists, or feature overviews unless the user explicitly asks for them. "
+    "If asked about capabilities, answer plainly from known system features."
 )
 
 # Maximum characters to keep when falling back to a single-step plan.
@@ -50,10 +51,26 @@ _MAX_TOOL_ITERATIONS = 5
 # checkpoint, causing the KV-cache thrash visible as
 # "Common part does not match fully" in the server logs.
 _ASSISTANT_THINK_SKIP = "<think>\n\n</think>\n\n"
-_TOOL_QUERY_RE = re.compile(r"\b(tool|tools|capabilit(?:y|ies)|access)\b", re.IGNORECASE)
+_TOOL_QUERY_RE = re.compile(
+    r"(?:^|\b)(?:"
+    r"what\s+tools\s+do\s+you\s+have|"
+    r"which\s+tools\s+do\s+you\s+have|"
+    r"list\s+(?:your\s+)?tools|"
+    r"what\s+can\s+you\s+do|"
+    r"what\s+are\s+your\s+skills|"
+    r"what\s+are\s+your\s+capabilities|"
+    r"show\s+(?:me\s+)?(?:your\s+)?tools|"
+    r"do\s+you\s+have\s+any\s+tools"
+    r")(?:\b|$)",
+    re.IGNORECASE,
+)
 _URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
 _DOMAIN_RE = re.compile(r"\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}\b", re.IGNORECASE)
 _FETCH_INTENT_RE = re.compile(r"\b(fetch|get|retrieve|download|read|visit|open)\b", re.IGNORECASE)
+_LOCAL_FILE_HINT_RE = re.compile(
+    r"\b(file|folder|directory|filesystem|local|workspace|github\s+directory|repo(?:sitory)?|project(?:s)?)\b",
+    re.IGNORECASE,
+)
 _DESKTOP_VISION_TOOLS = {"screenshot", "ui", "image_analysis"}
 _TOOL_BLOCK_RE = re.compile(
     r"</?(?:tool_call|tool_result|fetch|fetch_result|verify|sweep|think|sloth)>"
@@ -331,20 +348,27 @@ class MainAgent:
 
         return response
 
-    async def process_direct(self, user_input: str) -> str:
+    async def process_direct(
+        self,
+        user_input: str,
+        conversation_context: Optional[list[str]] = None,
+    ) -> str:
         """Single-shot direct chat path (no task-planning framing).
 
         This path intentionally avoids the heavy agentic-loop prompt style so
         normal chat requests return plain user-facing answers.
         """
-        if _TOOL_QUERY_RE.search(user_input):
+        latest_user_input = (user_input or "").strip()
+        if _TOOL_QUERY_RE.search(latest_user_input):
             return self._describe_direct_capabilities()
 
-        prompt = (
-            f"system: {_DIRECT_SYSTEM_PROMPT}\n\n"
-            f"user: {user_input}\n"
-            "assistant:"
-        )
+        prompt_parts = [f"system: {_DIRECT_SYSTEM_PROMPT}"]
+        if conversation_context:
+            trimmed_context = [line.strip() for line in conversation_context if line and line.strip()]
+            if trimmed_context:
+                prompt_parts.append("Recent conversation:\n" + "\n".join(trimmed_context[-8:]))
+        prompt_parts.append(f"user: {latest_user_input}\nassistant:")
+        prompt = "\n\n".join(prompt_parts)
 
         response = await self._slot_manager.send_to_main(prompt, max_tokens=900)
         response = _sanitize_direct_response(response)
@@ -353,7 +377,7 @@ class MainAgent:
             try:
                 asyncio.create_task(
                     self._memory.store(
-                        text=f"user: {user_input}\nassistant: {response}",
+                        text=f"user: {latest_user_input}\nassistant: {response}",
                         metadata={"agent": "main", "slot": self.slot_id, "mode": "direct"},
                     )
                 )
@@ -405,7 +429,8 @@ class MainAgent:
         task_text = task or ""
         url_match = _URL_RE.search(task_text)
         domain_match = _DOMAIN_RE.search(task_text)
-        if _FETCH_INTENT_RE.search(task_text) and (url_match or domain_match):
+        local_file_task = bool(_LOCAL_FILE_HINT_RE.search(task_text))
+        if _FETCH_INTENT_RE.search(task_text) and (url_match or domain_match) and not local_file_task:
             if url_match:
                 url = url_match.group(0)
             else:
@@ -417,7 +442,7 @@ class MainAgent:
 
         # Fetch intent without a concrete URL/domain should ask for target
         # instead of letting the model invent a placeholder URL.
-        if _FETCH_INTENT_RE.search(task_text) and not (url_match or domain_match):
+        if _FETCH_INTENT_RE.search(task_text) and not (url_match or domain_match) and not local_file_task:
             return {
                 "approach": "Ask user for a specific URL before running web_fetch.",
                 "steps": [

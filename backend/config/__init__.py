@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from pydantic import field_validator
 from pydantic_settings import BaseSettings
+
+
+_ENV_FILE = Path(__file__).resolve().parents[2] / ".env"
 
 
 class AppConfig(BaseSettings):
@@ -31,6 +36,9 @@ class AppConfig(BaseSettings):
     max_context_size: int = 131072
     max_slots: int = 8
     max_pending_approvals: int = 500
+    # Maximum number of concurrent inference tasks allowed by the API layer.
+    # Set to 2+ when running llama.cpp with multiple parallel slots/workers.
+    inference_concurrency: int = 1
 
     # Operating mode
     mode: str = "idle"
@@ -78,6 +86,8 @@ class AppConfig(BaseSettings):
     # Tool system settings
     # Root directory that file/patch/diff tools are confined to.
     tool_workspace_root: str = "./workspace"
+    # When False, desktop UI / screenshot style tools are not registered.
+    desktop_tools_enabled: bool = True
     # Allowlisted command prefixes for the shell/process tools.
     # An empty list disables the shell tool unless allow_unrestricted_shell is True.
     shell_allowlist: list[str] = []
@@ -98,6 +108,9 @@ class AppConfig(BaseSettings):
     discord_webhook_url: str = ""
     discord_bot_token: str = ""
     discord_channel_id: str = ""
+    # If set, the bot will open a DM channel with this user ID at startup
+    # and use that channel for send/receive instead of discord_channel_id.
+    discord_owner_user_id: str = ""
 
     # Web search: set to a SearXNG base URL to use it instead of DuckDuckGo
     searxng_url: str = ""
@@ -182,6 +195,13 @@ class AppConfig(BaseSettings):
             raise ValueError("max_pending_approvals must be at least 1")
         return v
 
+    @field_validator("inference_concurrency")
+    @classmethod
+    def _validate_inference_concurrency(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError("inference_concurrency must be at least 1")
+        return v
+
     @field_validator("supervisor_slowdown_threshold_tps")
     @classmethod
     def _validate_slowdown_threshold(cls, v: float) -> float:
@@ -253,7 +273,7 @@ class AppConfig(BaseSettings):
             raise ValueError("image_analysis_cpu_max_text_chars must be at least 256")
         return v
 
-    model_config = {"env_prefix": "SLOTHBRAIN_", "env_file": ".env", "extra": "ignore"}
+    model_config = {"env_prefix": "SLOTHBRAIN_", "env_file": str(_ENV_FILE), "extra": "ignore"}
 
 
 settings = AppConfig()

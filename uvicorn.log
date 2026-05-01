@@ -1,0 +1,4 @@
+[WARNING] LanceDB unavailable – memory disabled: LanceDBMemory requires lancedb, sentence-transformers, numpy, pandas, and pyarrow. Install them with: pip install lancedb sentence-transformers numpy pandas pyarrow. Original import error: cannot import name 'CreateEmptyTableRequest' from 'lance_namespace' (C:\Users\WhiteWidow\Documents\GitHub\SlothBrain\.venv\lib\site-packages\lance_namespace\__init__.py)
+INFO:     127.0.0.1:64688 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55727 - "GET /api/discord/debug HTTP/1.1" 200 OK
+INFO:     127.0.0.1:56347 - "GET /api/discord/debug HTTP/1.1" 200 OK

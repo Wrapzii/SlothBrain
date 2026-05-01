@@ -118,6 +118,8 @@ class LoopHandle:
         self._consecutive_empty_or_malformed: int = 0
         self._give_up_signal_count: int = 0
         self._last_detected_key: str = ""
+        self._last_tool_name: str = ""
+        self._failed_tool_trace: deque[str] = deque(maxlen=5)
 
         self._max_repeated_tool_calls: int = 3
         self._max_failed_tool_calls: int = 3
@@ -140,11 +142,14 @@ class LoopHandle:
         This is called from the loop's async task and is intentionally
         lock-free (monotonic writes are safe on CPython).
         """
+        previous_step = self.current_step
         self._last_heartbeat = time.monotonic()
         self.current_step = step_num
         self.task = task
         # Keep only the 4 most recent context lines to bound memory
         self.recent_context = list(context[-4:]) if context else []
+        if previous_step != step_num:
+            self._last_detected_key = ""
 
     def configure_detection_thresholds(
         self,
@@ -188,6 +193,7 @@ class LoopHandle:
         return None
 
     def observe_tool_call(self, tool_name: str, args: dict | None) -> dict | None:
+        self._last_tool_name = tool_name
         fp = f"{tool_name}:{_fingerprint_payload(args or {})}"
         self._tool_call_history.append(fp)
 
@@ -205,13 +211,20 @@ class LoopHandle:
     def observe_tool_result(self, ok: bool, output: object, error: str | None) -> dict | None:
         if not ok:
             self._consecutive_failed_tools += 1
+            tool_label = self._last_tool_name or "unknown_tool"
+            err = (error or "unknown error").strip()
+            self._failed_tool_trace.append(f"{tool_label}: {err[:120]}")
         else:
             self._consecutive_failed_tools = 0
+            self._failed_tool_trace.clear()
+            self._last_detected_key = ""
 
         if self._consecutive_failed_tools >= self._max_failed_tool_calls:
+            recent_failures = "; ".join(self._failed_tool_trace) if self._failed_tool_trace else "no tool details available"
             return self._build_detection_intervention(
                 "failed_actions",
-                "Multiple consecutive tool failures detected without progress.",
+                "Multiple consecutive tool failures detected without progress. "
+                f"Recent failures: {recent_failures}",
             )
 
         # Best-effort no-change fingerprinting from successful tool outputs.

@@ -322,6 +322,7 @@ class AgenticLoop:
             )
 
             for attempt in range(_MAX_STEP_RETRIES + 1):
+                had_execution_error = False
                 await emit(
                     "loop_iteration",
                     {
@@ -463,6 +464,7 @@ class AgenticLoop:
                     if not (step.result or "").strip():
                         step.result = "Execution error: empty model response"
                 except Exception as exc:
+                    had_execution_error = True
                     logger.error(
                         "execute_step error (step %d, attempt %d): %s",
                         step_num,
@@ -501,6 +503,19 @@ class AgenticLoop:
 
                 if final_action == "abort":
                     break
+
+                if had_execution_error and attempt < _MAX_STEP_RETRIES:
+                    step.retries += 1
+                    await emit(
+                        "step_retry",
+                        {
+                            "step_num": step_num,
+                            "attempt": attempt + 2,
+                            "feedback": "Retrying after execution error",
+                        },
+                    )
+                    context.append(f"Step {step_num} retry after execution error.")
+                    continue
 
                 if final_action == "retry" and attempt < _MAX_STEP_RETRIES:
                     step.retries += 1
@@ -550,7 +565,7 @@ class AgenticLoop:
         # ── 3. Finalize ─────────────────────────────────────────────────────
         await emit("verifying", {"steps_completed": len(executed)})
         verified = len(executed) > 0 and all(s.status == "complete" for s in executed)
-        summary = "Task execution complete." if verified else "Task execution finished with failures."
+        summary = _derive_summary_from_steps(executed, verified)
 
         result_dict = _build_result(task, executed, verified, summary, start_time)
         await emit(
@@ -657,6 +672,18 @@ def _build_result(
         "total_steps": len(steps),
         "duration_seconds": round(time.monotonic() - start_time, 2),
     }
+
+
+def _derive_summary_from_steps(steps: "list[AgenticStep]", verified: bool) -> str:
+    """Prefer the last meaningful step output as the task summary."""
+    for step in reversed(steps):
+        result = (step.result or "").strip()
+        if not result:
+            continue
+        if result in ("Task execution complete.", "Task execution finished with failures."):
+            continue
+        return result
+    return "Task execution complete." if verified else "Task execution finished with failures."
 
 
 def _dict_to_step(d: dict) -> "AgenticStep":
