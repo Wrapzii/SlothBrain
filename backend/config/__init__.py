@@ -86,6 +86,9 @@ class AppConfig(BaseSettings):
     # Tool system settings
     # Root directory that file/patch/diff tools are confined to.
     tool_workspace_root: str = "./workspace"
+    # When True, FileTool also accepts absolute paths outside tool_workspace_root.
+    # Intended for trusted local usage (for example: Desktop/Documents inspection).
+    file_tool_allow_absolute_paths: bool = True
     # When False, desktop UI / screenshot style tools are not registered.
     desktop_tools_enabled: bool = True
     # Allowlisted command prefixes for the shell/process tools.

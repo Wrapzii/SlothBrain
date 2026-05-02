@@ -54,9 +54,6 @@ logger = logging.getLogger(__name__)
 # Maximum retries for a single step before moving on.
 _MAX_STEP_RETRIES = 2
 
-# Guardrail: cap persisted step context to avoid prompt/context blow-up.
-_MAX_STEP_CONTEXT_CHARS = 1200
-
 # Keep previews compact so debug events do not overwhelm clients/logs.
 _MAX_PREVIEW_CHARS = 300
 
@@ -397,7 +394,7 @@ class AgenticLoop:
                     elif et == "model_output":
                         await emit(
                             "model_output",
-                            {"output_preview": str(event.get("output", ""))[:300]},
+                            {"output_preview": str(event.get("output", ""))[:_MAX_PREVIEW_CHARS]},
                         )
 
                     if handle is None:
@@ -539,7 +536,7 @@ class AgenticLoop:
                 step.status = "complete"
 
             step.finish()
-            result_snippet = step.result[:_MAX_STEP_CONTEXT_CHARS]
+            result_snippet = step.result
             if self._debug.rolling_context_enabled:
                 context.append(f"Step {step_num} – {description}:\n{result_snippet}")
             executed.append(step)
@@ -615,7 +612,7 @@ class AgenticLoop:
             run_id,
             step.step_num,
             action,
-            message[:80],
+            message,
         )
 
         if action == "reset_context":

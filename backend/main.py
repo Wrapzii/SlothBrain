@@ -43,11 +43,16 @@ _AUTO_AGENTIC_TOOL_INTENT_RE = re.compile(
     re.IGNORECASE,
 )
 _DM_TASK_INTENT_RE = re.compile(
-    r"\b(?:/task|/agentic|web\s*fetch|fetch|lookup|look\s+up|search|research|find|list|source|summari[sz]e|open|read|directory|projects?)\b",
+    r"\b(?:/task|/agentic|web\s*fetch|research|summari[sz]e\s+https?://|plan\s+(?:this|a\s+task)|multi[-\s]?step|step\s+by\s+step)\b",
+    re.IGNORECASE,
+)
+_DM_FILESYSTEM_INTENT_RE = re.compile(
+    r"\b(?:desktop|documents|downloads|pictures|filesystem|file\s+system|folder|directory|path|list\s+files|list\s+folders|what\s+do\s+i\s+have)\b",
     re.IGNORECASE,
 )
 _DM_SHORT_ACK_RE = re.compile(r"^(?:yes|yep|yeah|ok|okay|sure|do it|go ahead|continue|proceed)$", re.IGNORECASE)
 _FILE_NAME_RE = re.compile(r"\b([a-zA-Z0-9_.-]+\.[a-zA-Z0-9]+)\b")
+_FOLDER_NAME_RE = re.compile(r"(?:find|locate)\s+(?:the\s+)?([a-zA-Z0-9_. -]{2,80}?)\s+(?:folder|directory)\b", re.IGNORECASE)
 _DISCORD_DM_HANDLE_TIMEOUT_SECONDS = 90.0
 _DISCORD_DM_MAX_BACKLOG_PER_POLL = 20
 
@@ -92,6 +97,9 @@ class DiscordDMBridge:
         self._last_error: str = ""
         # Keep a short per-user transcript so Discord replies preserve recent context.
         self._dm_context: dict[str, deque[str]] = defaultdict(lambda: deque(maxlen=8))
+        # Track in-flight background tasks per user so /status can report them.
+        self._active_tasks: dict[str, asyncio.Task] = {}
+        self._active_task_labels: dict[str, str] = {}
 
     @staticmethod
     def _clean_discord_response(text: str) -> str:
@@ -99,9 +107,49 @@ class DiscordDMBridge:
         return _sanitize_user_facing_response(text)
 
     @staticmethod
+    def _render_tools_used_block(tools_used: list[str]) -> str:
+        """Render a compact tree-style block of actually-used tools."""
+        clean = [t.strip() for t in tools_used if t and t.strip()]
+        if not clean:
+            return ""
+        unique: list[str] = []
+        seen: set[str] = set()
+        for name in clean:
+            if name in seen:
+                continue
+            seen.add(name)
+            unique.append(name)
+        lines = ["Tools used:", "📂 execution"]
+        for idx, name in enumerate(unique):
+            branch = "└──" if idx == len(unique) - 1 else "├──"
+            lines.append(f"{branch} 🔧 {name}")
+        return "\n" + "\n".join(lines)
+
+    # Matches step outputs that describe intended future work rather than
+    # delivering actual results.  These should be skipped when extracting the
+    # best agentic reply to show the user.
+    _META_COMMENTARY_RE = re.compile(
+        r"^(?:"
+        r"based on (?:the )?(?:research|information|data|findings|results|previous|prior|above)"
+        r"|i will now (?:compile|synthesize|summarize|gather|proceed|write|create|provide|present)"
+        r"|i(?:'ll| will) (?:now )?(?:compile|synthesize|summarize|gather|proceed)"
+        r"|since (?:no new|the) (?:data|information|research)"
+        r"|having (?:gathered|completed|reviewed|researched|analyzed)"
+        r"|now (?:that|i(?:'ll| will))\b"
+        r"|let me (?:compile|synthesize|summarize|now)"
+        r")",
+        re.IGNORECASE,
+    )
+
+    @staticmethod
     def _extract_agentic_response(result: dict) -> str:
-        """Prefer the last meaningful step result over the loop's generic summary."""
+        """Prefer the last meaningful step result over the loop's generic summary.
+
+        Skips meta-commentary like 'I will now compile...' and keeps scanning
+        backwards through steps for a response that contains real content.
+        """
         steps = result.get("steps") if isinstance(result, dict) else None
+        fallback: str = ""
         if isinstance(steps, list):
             for step in reversed(steps):
                 if not isinstance(step, dict):
@@ -111,7 +159,13 @@ class DiscordDMBridge:
                     continue
                 if step_result in ("Task execution complete.", "Task execution finished with failures."):
                     continue
+                if DiscordDMBridge._META_COMMENTARY_RE.match(step_result):
+                    if not fallback:
+                        fallback = step_result
+                    continue
                 return step_result
+        if fallback:
+            return fallback
         summary = str(result.get("summary") or "").strip() if isinstance(result, dict) else ""
         return summary or "Task execution complete."
 
@@ -120,18 +174,81 @@ class DiscordDMBridge:
         if not text:
             return False
         lower = text.lower()
+        # Only route explicit /task, /agentic, or strong task-like intent (web fetch, research).
+        # Do NOT auto-route simple chat questions via _should_use_agentic_mode — they belong in direct mode.
         if lower.startswith("/task") or lower.startswith("/agentic"):
             return True
         if _DM_TASK_INTENT_RE.search(text):
             return True
-        if _should_use_agentic_mode(text, max_steps=2, mode="auto"):
+        if _DM_FILESYSTEM_INTENT_RE.search(text):
             return True
         if _DM_SHORT_ACK_RE.match(text):
             history = list(self._dm_context.get(user_key, []))
             recent = "\n".join(history[-4:]).lower()
-            if "/task" in recent or "fetch" in recent or "search" in recent:
+            if "/task" in recent or "/agentic" in recent:
                 return True
         return False
+
+    async def _handle_command(self, user_key: str, content: str) -> str | None:
+        text = (content or "").strip()
+        lower = text.lower()
+
+        if lower == "/reset":
+            self._dm_context[user_key].clear()
+            return "Conversation context reset for this Discord chat."
+
+        if lower == "/status":
+            stats = await resource_manager.get_system_stats()
+
+            tps_snapshot = "unavailable"
+            try:
+                metrics = await llama_client.get_metrics()
+                slowdown = _extract_tps_from_metrics(metrics)
+                if slowdown is not None:
+                    tps_snapshot = f"{slowdown.tokens_per_sec:.2f} tok/s"
+            except Exception:
+                pass
+
+            # Inference state
+            inference_busy = _inference_lock.locked()
+            active_task_label = self._active_task_labels.get(user_key, "")
+            # Also check if any user has an active task (useful if single-user)
+            if not active_task_label and self._active_task_labels:
+                active_task_label = next(iter(self._active_task_labels.values()))
+            if active_task_label:
+                task_line = f"Active task: {active_task_label}"
+            elif inference_busy:
+                task_line = "Active task: inference busy (another user or API request)"
+            else:
+                task_line = "Active task: none"
+
+            cpp_status = server_manager.status
+            # server_manager reports 'stopped' when llama.cpp is managed externally — clarify
+            if cpp_status == "stopped" and inference_busy:
+                cpp_status = "external / unmanaged (inference active)"
+            elif cpp_status == "stopped":
+                cpp_status = "stopped (or externally managed)"
+
+            return (
+                "**SlothBrain Status**\n"
+                f"CPU: {stats.get('cpu_percent', '?')}%  |  "
+                f"RAM: {stats.get('ram_used_mb', '?')} / {stats.get('ram_total_mb', '?')} MB\n"
+                f"llama.cpp: {cpp_status}\n"
+                f"Throughput: {tps_snapshot}\n"
+                f"{task_line}"
+            )
+
+        if lower in ("/restart", "/restart cpp", "/restart llama", "/restart llamacpp"):
+            try:
+                await server_manager.restart(actor="discord")
+                return "Requested llama.cpp restart successfully."
+            except Exception as exc:
+                return f"Failed to restart llama.cpp: {exc}"
+
+        if lower in ("/restart slothbrain", "/restart app"):
+            return "Restarting the SlothBrain app process from inside the running app is not implemented yet. Use the local launcher for that restart path."
+
+        return None
 
     def start(self) -> None:
         """Start the DM listener background task."""
@@ -288,6 +405,39 @@ class DiscordDMBridge:
 
         logger.info("Discord DM from %s: %s", author, content[:100])
 
+        command_response = await self._handle_command(user_key=user_key, content=content)
+        if command_response is not None:
+            response = command_response
+            response = self._clean_discord_response(response)
+            self._dm_context[user_key].append(f"User: {content}")
+            self._dm_context[user_key].append(f"SlothBrain: {response}")
+
+            discord_tool = self._registry.get("discord")
+            if discord_tool:
+                send_result = await discord_tool.execute(action="send", content=response[:1900])
+                if send_result.ok:
+                    logger.info("Discord DM command response sent")
+                else:
+                    logger.error("Failed to post Discord DM command response: %s", send_result.error)
+            return
+
+        deterministic = await _try_handle_simple_file_task(content)
+        if deterministic is not None:
+            response = self._clean_discord_response(deterministic)
+            if not response:
+                response = "I couldn't generate a useful response. Please try again."
+            self._dm_context[user_key].append(f"User: {content}")
+            self._dm_context[user_key].append(f"SlothBrain: {response}")
+            discord_tool = self._registry.get("discord")
+            if discord_tool:
+                send_result = await discord_tool.execute(action="send", content=response[:1900])
+                if send_result.ok:
+                    logger.info("Discord DM deterministic response sent")
+                else:
+                    logger.error("Failed to post Discord DM deterministic response: %s", send_result.error)
+            _schedule_deterministic_task_persist(content, deterministic)
+            return
+
         is_task_message = self._should_route_to_agentic(user_key=user_key, content=content)
         response = ""
 
@@ -310,22 +460,25 @@ class DiscordDMBridge:
                         _schedule_deterministic_task_persist(task_message, deterministic)
                         response = deterministic
                     else:
-                        async with _inference_lock:
-                            loop = AgenticLoop(
-                                main_agent=self._main_agent,
-                                max_steps=10,
-                                checkpoint_manager=checkpoint_manager,
-                                supervisor=safety_supervisor,
-                                debug_options=AgenticDebugOptions(),
-                            )
-                            result = await loop.run(task=task_message)
-                        response = self._extract_agentic_response(result)
+                        # Run in background so the listener loop stays responsive (e.g. /status).
+                        await self._run_bg_task(user_key=user_key, label=task_message, coro=self._run_agentic_task(user_key, task_message, content))
+                        discord_tool = self._registry.get("discord")
+                        if discord_tool:
+                            try:
+                                await discord_tool.execute(
+                                    action="send",
+                                    content=(
+                                        f"Started task: {task_message}\n"
+                                        "Use /status to check progress."
+                                    ),
+                                )
+                            except Exception:
+                                pass
+                        return
             else:
-                async with _inference_lock:
-                    response = await self._main_agent.process_direct(
-                        user_input=content,
-                        conversation_context=list(self._dm_context.get(user_key, [])),
-                    )
+                # Direct chat — also run in background so listener isn't blocked.
+                await self._run_bg_task(user_key=user_key, label=content[:60], coro=self._run_direct_task(user_key, content))
+                return
         except Exception as exc:
             response = f"[Error processing message: {exc.__class__.__name__}]"
             logger.error("Failed to process Discord DM: %s", exc)
@@ -336,13 +489,13 @@ class DiscordDMBridge:
 
         # Persist this turn in the DM context window.
         self._dm_context[user_key].append(f"User: {content}")
-        self._dm_context[user_key].append(f"SlothBrain: {response[:280]}")
+        self._dm_context[user_key].append(f"SlothBrain: {response}")
 
         # Post response back to Discord
         if response:
             reply = response[:1900]
             if len(response) > 1900:
-                reply += "\n\n[response truncated...]"
+                reply += "\n\n[response truncated...]"  
 
             discord_tool = self._registry.get("discord")
             if discord_tool:
@@ -352,6 +505,91 @@ class DiscordDMBridge:
                     logger.info("Discord DM response sent")
                 else:
                     logger.error("Failed to post Discord DM response: %s", send_result.error)
+
+    async def _run_bg_task(self, user_key: str, label: str, coro: Any) -> None:
+        """Fire *coro* as a background asyncio task, tracking it under user_key."""
+        # Cancel any existing task for this user to avoid pile-up
+        existing = self._active_tasks.get(user_key)
+        if existing and not existing.done():
+            logger.info("Discord: user %s sent new task; previous task still running, it will continue in background", user_key)
+        task = asyncio.create_task(coro)
+        self._active_tasks[user_key] = task
+        self._active_task_labels[user_key] = label[:80]
+
+        def _on_done(t: asyncio.Task) -> None:
+            self._active_tasks.pop(user_key, None)
+            self._active_task_labels.pop(user_key, None)
+
+        task.add_done_callback(_on_done)
+
+    async def _run_agentic_task(self, user_key: str, task_message: str, original_content: str) -> None:
+        """Run an agentic loop for *task_message* and post the result to Discord."""
+        from backend.agents.agentic_loop import AgenticLoop
+        used_tools: list[str] = []
+
+        async def _capture_progress(event: dict | None) -> None:
+            if not isinstance(event, dict):
+                return
+            if event.get("type") != "tool_call":
+                return
+            name = str(event.get("tool") or "").strip()
+            if name:
+                used_tools.append(name)
+
+        try:
+            async with _inference_lock:
+                loop = AgenticLoop(
+                    main_agent=self._main_agent,
+                    max_steps=10,
+                    checkpoint_manager=checkpoint_manager,
+                    supervisor=safety_supervisor,
+                    debug_options=AgenticDebugOptions(),
+                )
+                result = await loop.run(task=task_message, on_progress=_capture_progress)
+            # Defensive: ensure result is a valid dict before extracting
+            if isinstance(result, dict):
+                response = self._extract_agentic_response(result)
+            else:
+                response = str(result or "Task execution complete.")
+        except Exception as exc:
+            response = f"[Agentic task error: {exc.__class__.__name__}: {str(exc)[:60]}]"
+            logger.error("Discord agentic task failed: %s", exc, exc_info=True)
+
+        response = self._clean_discord_response(response) or "I couldn't generate a useful response."
+        response += self._render_tools_used_block(used_tools)
+        self._dm_context[user_key].append(f"User: {original_content}")
+        self._dm_context[user_key].append(f"SlothBrain: {response}")
+        await self._send_to_discord(response)
+
+    async def _run_direct_task(self, user_key: str, content: str) -> None:
+        """Run a direct chat turn and post the result to Discord."""
+        try:
+            async with _inference_lock:
+                response = await self._main_agent.process_direct(
+                    user_input=content,
+                    conversation_context=list(self._dm_context.get(user_key, [])),
+                )
+        except Exception as exc:
+            response = f"[Error: {exc.__class__.__name__}]"
+            logger.error("Discord direct task failed: %s", exc)
+
+        response = self._clean_discord_response(response) or "I couldn't generate a useful response."
+        self._dm_context[user_key].append(f"User: {content}")
+        self._dm_context[user_key].append(f"SlothBrain: {response}")
+        await self._send_to_discord(response)
+
+    async def _send_to_discord(self, response: str) -> None:
+        """Helper: send *response* back to the configured Discord channel."""
+        reply = response[:1900]
+        if len(response) > 1900:
+            reply += "\n\n[response truncated...]"
+        discord_tool = self._registry.get("discord")
+        if discord_tool:
+            send_result = await discord_tool.execute(action="send", content=reply)
+            if send_result.ok:
+                logger.info("Discord DM response sent")
+            else:
+                logger.error("Failed to post Discord DM response: %s", send_result.error)
 
 
 async def _apply_effective_slot_context_budget() -> None:
@@ -951,6 +1189,16 @@ async def _try_handle_simple_file_task(task_message: str) -> str | None:
     text = (task_message or "").strip()
     lower = text.lower()
 
+    def _extract_target_folder_name(raw_text: str) -> str:
+        match = _FOLDER_NAME_RE.search(raw_text or "")
+        if not match:
+            return ""
+        candidate = " ".join(match.group(1).split()).strip(" .")
+        lowered = candidate.lower()
+        if lowered in {"github", "my github", "the github"}:
+            return ""
+        return candidate
+
     async def _run_shell(command: str) -> tuple[bool, str]:
         if shell_tool is None:
             return False, ""
@@ -984,12 +1232,33 @@ async def _try_handle_simple_file_task(task_message: str) -> str | None:
                 return "Documents contains: " + ", ".join(items)
         return "I couldn't list your Documents directory via command line."
 
-    if "github directory" in lower and ("list projects" in lower or "find my github directory" in lower):
+    if (
+        ("github directory" in lower or "github folder" in lower or "github" in lower)
+        and ("find" in lower or "locate" in lower or "where" in lower or "within" in lower)
+    ):
         ok, output = await _run_shell(
             'cmd /c if exist "%USERPROFILE%\\Documents\\GitHub" (echo %USERPROFILE%\\Documents\\GitHub) else if exist "%USERPROFILE%\\GitHub" (echo %USERPROFILE%\\GitHub) else if exist "%USERPROFILE%\\github" (echo %USERPROFILE%\\github) else echo NOT_FOUND'
         )
         if ok and output and "NOT_FOUND" not in output:
             github_path = output.splitlines()[0].strip()
+            target_folder = _extract_target_folder_name(text)
+
+            if target_folder:
+                ok_target, out_target = await _run_shell(
+                    f'cmd /c if exist "{github_path}\\{target_folder}" (echo {github_path}\\{target_folder}) else echo NOT_FOUND'
+                )
+                if ok_target and out_target and "NOT_FOUND" not in out_target:
+                    folder_path = out_target.splitlines()[0].strip()
+                    return f"Yes. I found the {target_folder} folder at: {folder_path}"
+
+                ok_case, out_case = await _run_shell(
+                    f'powershell -NoProfile -Command "Get-ChildItem -Path ''{github_path}'' -Directory | Where-Object {{$_.Name -ieq ''{target_folder}''}} | Select-Object -First 1 -ExpandProperty FullName"'
+                )
+                if ok_case and out_case:
+                    folder_path = out_case.splitlines()[0].strip()
+                    if folder_path:
+                        return f"Yes. I found the {target_folder} folder at: {folder_path}"
+
             ok2, output2 = await _run_shell(f'cmd /c dir /b /ad "{github_path}"')
             if ok2 and output2:
                 projects = [line.strip() for line in output2.splitlines() if line.strip()][:50]
@@ -1043,8 +1312,6 @@ def _schedule_deterministic_task_persist(task_message: str, response: str) -> No
     if memory is not None:
         try:
             snippet = (response or "").strip()
-            if len(snippet) > 4000:
-                snippet = snippet[:4000] + " ...[truncated]"
             asyncio.create_task(
                 memory.store(
                     text=(

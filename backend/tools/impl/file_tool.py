@@ -77,6 +77,9 @@ class FileTool(Tool):
         self._root = Path(workspace).resolve()
         self._root.mkdir(parents=True, exist_ok=True)
         self._workspace_index = workspace_index
+        self._allow_absolute_paths = bool(
+            getattr(config, "file_tool_allow_absolute_paths", False)
+        )
 
     def _safe_path(self, rel_path: str) -> Path | None:
         """Resolve *rel_path* relative to the workspace root.
@@ -84,6 +87,11 @@ class FileTool(Tool):
         Returns ``None`` if the resolved path escapes the workspace root
         (path traversal attempt).
         """
+        candidate = Path(rel_path)
+        if candidate.is_absolute():
+            if self._allow_absolute_paths:
+                return candidate.resolve()
+            return None
         try:
             resolved = (self._root / rel_path).resolve()
             resolved.relative_to(self._root)  # raises if outside root
@@ -170,7 +178,11 @@ class FileTool(Tool):
                     "type": "dir" if entry.is_dir() else "file",
                     "size": entry.stat().st_size if entry.is_file() else None,
                 })
-            return ToolResult(ok=True, output={"path": str(path.relative_to(self._root)), "entries": entries})
+            try:
+                out_path = str(path.relative_to(self._root))
+            except ValueError:
+                out_path = str(path)
+            return ToolResult(ok=True, output={"path": out_path, "entries": entries})
         except Exception as exc:
             return ToolResult(ok=False, error=str(exc))
 

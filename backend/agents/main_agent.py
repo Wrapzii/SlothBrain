@@ -35,9 +35,6 @@ _DIRECT_SYSTEM_PROMPT = (
     "If asked about capabilities, answer plainly from known system features."
 )
 
-# Maximum characters to keep when falling back to a single-step plan.
-_MAX_FALLBACK_STEP_LENGTH = 300
-
 # Maximum tool-call iterations per execute_step call to prevent infinite loops.
 _MAX_TOOL_ITERATIONS = 5
 
@@ -84,8 +81,11 @@ _TOOL_BLOCK_RE = re.compile(
 _MAX_EVENT_TEXT_CHARS = 600
 _MAX_LIST_ITEMS = 20
 _MAX_MODEL_RESPONSE_PREVIEW_CHARS = 240
-_MAX_TOOL_PROMPT_TEXT_CHARS = 320
-_MAX_TOOL_PROMPT_LIST_ITEMS = 8
+# Tool output limits: event payloads vs. model-facing prompts.
+# Event payloads can be compact (logging/discord), but prompts need
+# full content so the model can actually use tool results and not hallucinate.
+_MAX_TOOL_PROMPT_TEXT_CHARS = 16000  # Allow full web pages, API responses, etc.
+_MAX_TOOL_PROMPT_LIST_ITEMS = 100  # Allow comprehensive result lists
 _HEAVY_B64_KEYS = {
     "annotated_png_b64",
     "image_b64",
@@ -228,7 +228,7 @@ def _parse_plan(response: str) -> dict:
 
     if not steps:
         # ── Attempt 4: Last resort ────────────────────────────────────────
-        steps = [response.strip()[:_MAX_FALLBACK_STEP_LENGTH]]
+        steps = [response.strip()]
 
     return {"approach": approach, "steps": steps[:10]}
 
@@ -268,8 +268,6 @@ class MainAgent:
         # Injected after construction so we avoid circular imports
         self._registry: AgentRegistry | None = None
         self._tool_registry: "ToolRegistry | None" = None
-        # Guardrail: cap injected tool transcript size to avoid runaway prompt growth.
-        self._MAX_TOOL_CONTEXT_CHARS = 6000
     def set_registry(self, registry: "AgentRegistry") -> None:
         """Inject the AgentRegistry so MainAgent can spawn sub-agents."""
         self._registry = registry
@@ -334,7 +332,7 @@ class MainAgent:
         )
 
         response = await self._slot_manager.send_to_main(
-            full_prompt, max_tokens=2048
+            full_prompt, max_tokens=self._config.main_context_size or 4096
         )
 
         if self._memory is not None:
@@ -371,8 +369,6 @@ class MainAgent:
                     text = str(row.get("text") or "").strip()
                     if not text:
                         continue
-                    if len(text) > 260:
-                        text = text[:260] + " ...[truncated]"
                     snippets.append(f"- {text}")
                 if snippets:
                     memory_context = "Relevant long-term memory:\n" + "\n".join(snippets)
@@ -389,7 +385,7 @@ class MainAgent:
         prompt_parts.append(f"user: {latest_user_input}\nassistant:")
         prompt = "\n\n".join(prompt_parts)
 
-        response = await self._slot_manager.send_to_main(prompt, max_tokens=900)
+        response = await self._slot_manager.send_to_main(prompt, max_tokens=self._config.main_context_size or 4096)
         response = _sanitize_direct_response(response)
 
         if self._memory is not None:
@@ -488,11 +484,10 @@ class MainAgent:
             f"Task: {task}\nassistant:"
         )
         try:
-            # 512 tokens is ample for a JSON plan object (≤10 steps).
-            # Using 1024 caused the model to hit the limit and produce a
-            # truncated / non-parseable response that fell back to a single step.
+            # Plan JSON rarely needs more than a few hundred tokens, but give it
+            # room in case the task has many steps.
             response = await self._slot_manager.send_to_main(
-                plan_prompt, max_tokens=512
+                plan_prompt, max_tokens=1024
             )
         except Exception as exc:
             logger.warning("plan_task failed: %s", exc.__class__.__name__)
@@ -561,6 +556,16 @@ class MainAgent:
             if web_intent:
                 tools = [t for t in tools if t.name not in _DESKTOP_VISION_TOOLS]
 
+            local_file_intent = bool(_LOCAL_FILE_HINT_RE.search(routing_context)) and not web_intent
+            if local_file_intent:
+                tools = [t for t in tools if t.name not in _DESKTOP_VISION_TOOLS]
+                # Always expose core filesystem tools for local-file requests,
+                # even if semantic routing did not include them in top-k.
+                for must_have in ("file", "shell", "workspace_index"):
+                    forced = self._tool_registry.get(must_have)
+                    if forced is not None and all(t.name != must_have for t in tools):
+                        tools.append(forced)
+
             if tools:
                 tools_block = self._tool_registry.render_tool_descriptions(tools)
                 tools_section = (
@@ -570,9 +575,9 @@ class MainAgent:
                     '{"tool": "<name>", "args": {<arguments>}}\n'
                     "</tool_call>\n"
                     "The tool result will be provided and you may continue.\n"
-                    "During tool iterations, keep text very brief and avoid long summaries;\n"
-                    "either emit the next tool_call or a concise final answer.\n"
-                    "When no more tools are needed, provide your final answer."
+                    "During tool calls: output ONLY the next <tool_call> block, no prose.\n"
+                    "When you have enough real data: write the complete final answer with\n"
+                    "actual findings, facts, and details — NOT a description of what you plan to write."
                 )
 
         step_prompt = (
@@ -582,7 +587,8 @@ class MainAgent:
             f"Current step: {step}"
             f"{context_section}"
             f"{tools_section}\n\n"
-            "Execute this step thoroughly and report what you did and what you found.\n"
+            "Execute this step and return ACTUAL results now.\n"
+            "Do NOT say what you plan to do or will compile later — output the real content directly.\n"
             "assistant:"
         )
 
@@ -597,8 +603,11 @@ class MainAgent:
                 semantic_routing_enabled,
                 allowed_tool_names or [],
             )
+            # Give each iteration ample room. The model stops naturally when
+            # done; we don't need to force-truncate the output.
+            iter_max_tokens = self._config.main_context_size or 4096
             try:
-                response = await self._slot_manager.send_to_main(prompt, max_tokens=256)
+                response = await self._slot_manager.send_to_main(prompt, max_tokens=iter_max_tokens)
             except Exception as exc:
                 if on_event is not None:
                     maybe = on_event(
@@ -709,9 +718,15 @@ class MainAgent:
                     f"\n<tool_result>\n{result_json}\n</tool_result>"
                 )
 
-            accumulated_tool_context += "\n" + "\n".join(tool_result_lines) + "\nassistant:"
-            if len(accumulated_tool_context) > self._MAX_TOOL_CONTEXT_CHARS:
-                accumulated_tool_context = accumulated_tool_context[-self._MAX_TOOL_CONTEXT_CHARS:]
+            # After tool results, add an explicit synthesis directive to force the model
+            # to extract real findings instead of hallucinating. This prevents responses
+            # that ignore the actual tool output and make things up.
+            accumulated_tool_context += (
+                "\n" + "\n".join(tool_result_lines)
+                + "\n\nBased on the tool result(s) above, provide the actual findings, data, or answer. "
+                + "Do NOT make up information. Extract and cite what the tool returned. "
+                + "If the tool returned an error, explain that. If it succeeded, summarize the real result.\nassistant:"
+            )
 
         # Iteration limit reached — return last response
         return response
