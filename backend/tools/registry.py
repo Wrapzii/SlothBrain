@@ -30,6 +30,66 @@ _DESKTOP_INTENT_RE = re.compile(
 )
 
 
+def _extract_balanced_json_object(text: str, start_index: int) -> str | None:
+    """Return a balanced JSON object substring starting at ``start_index``.
+
+    Handles nested braces and quoted strings with escapes.
+    """
+    if start_index < 0 or start_index >= len(text) or text[start_index] != "{":
+        return None
+
+    depth = 0
+    in_string = False
+    escape = False
+    for i in range(start_index, len(text)):
+        ch = text[i]
+        if in_string:
+            if escape:
+                escape = False
+                continue
+            if ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+
+        if ch == '"':
+            in_string = True
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start_index : i + 1]
+    return None
+
+
+def _recover_malformed_tool_call(raw: str) -> dict | None:
+    """Best-effort recovery for malformed tool_call payloads.
+
+    Some models inject extra text/fields into <tool_call> blocks. This parser
+    extracts a valid ``tool`` and ``args`` object when possible so execution
+    can continue instead of silently failing.
+    """
+    tool_match = re.search(r'"tool"\s*:\s*"([^"]+)"', raw)
+    args_key = re.search(r'"args"\s*:\s*\{', raw)
+    if not tool_match or not args_key:
+        return None
+
+    args_obj = _extract_balanced_json_object(raw, args_key.end() - 1)
+    if args_obj is None:
+        return None
+
+    try:
+        args = json.loads(args_obj)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(args, dict):
+        return None
+    return {"tool": str(tool_match.group(1)), "args": args}
+
+
 def _is_web_intent(context: str) -> bool:
     text = context or ""
     return bool(_WEB_INTENT_RE.search(text) or "http://" in text.lower() or "https://" in text.lower())
@@ -187,7 +247,12 @@ class ToolRegistry:
             try:
                 data = json.loads(raw)
             except json.JSONDecodeError:
-                logger.warning("Malformed tool_call JSON skipped: %r", raw[:120])
+                recovered = _recover_malformed_tool_call(raw)
+                if recovered is None:
+                    logger.warning("Malformed tool_call JSON skipped: %r", raw[:120])
+                    continue
+                calls.append(recovered)
+                logger.warning("Recovered malformed tool_call for tool=%s", recovered["tool"])
                 continue
             if not isinstance(data, dict) or "tool" not in data:
                 logger.warning("tool_call missing 'tool' key: %r", raw[:120])

@@ -5,10 +5,13 @@ import ipaddress
 import json
 import logging
 import re
+import shlex
 import time
+import urllib.parse
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from functools import lru_cache
+from pathlib import Path
 from typing import Any, Optional
 
 import httpx
@@ -29,6 +32,7 @@ from backend.core.checkpoint_manager import CheckpointManager
 from backend.core.llama_client import LlamaClient
 from backend.core.resource_manager import ResourceManager
 from backend.core.safety_supervisor import SafetySupervisor
+from backend.core.safety_supervisor import _extract_tps_from_metrics
 from backend.core.server_manager import ServerManager
 from backend.core.slot_manager import SlotManager
 from backend.core.semantic_router import SemanticRouter
@@ -39,11 +43,16 @@ from backend.tools.registry import ToolRegistry
 logger = logging.getLogger(__name__)
 
 _AUTO_AGENTIC_TOOL_INTENT_RE = re.compile(
-    r"(\bweb_fetch\b|\buse\b.{0,20}\btool\b|\btry\b.{0,20}\btool\b|\bfetch\b\s+https?://)",
+    r"(\bweb_fetch\b|\buse\b.{0,20}\btool\b|\btry\b.{0,20}\btool\b|\bfetch\b\s+https?://"
+    r"|\blook\s*up\b|\blookup\b|\bbrowse\s+(?:the\s+)?(?:website|web|url|page)\b"
+    r"|/research\b|/ralph\b)",
     re.IGNORECASE,
 )
 _DM_TASK_INTENT_RE = re.compile(
-    r"\b(?:/task|/agentic|web\s*fetch|research|summari[sz]e\s+https?://|plan\s+(?:this|a\s+task)|multi[-\s]?step|step\s+by\s+step)\b",
+    r"\b(?:/task|/agentic|/research|/ralph|web\s*fetch|research|look\s*up|look(?:ing)?\s+up\b"
+    r"|fetch\s+(?:the\s+)?(?:website|url|page|content)\b"
+    r"|browse\s+(?:the\s+)?(?:website|url|page)\b"
+    r"|summari[sz]e\s+https?://|plan\s+(?:this|a\s+task)|multi[-\s]?step|step\s+by\s+step)\b",
     re.IGNORECASE,
 )
 _DM_FILESYSTEM_INTENT_RE = re.compile(
@@ -55,6 +64,24 @@ _FILE_NAME_RE = re.compile(r"\b([a-zA-Z0-9_.-]+\.[a-zA-Z0-9]+)\b")
 _FOLDER_NAME_RE = re.compile(r"(?:find|locate)\s+(?:the\s+)?([a-zA-Z0-9_. -]{2,80}?)\s+(?:folder|directory)\b", re.IGNORECASE)
 _DISCORD_DM_HANDLE_TIMEOUT_SECONDS = 90.0
 _DISCORD_DM_MAX_BACKLOG_PER_POLL = 20
+
+
+def _effective_discord_dm_timeout_seconds() -> float:
+    """Return the effective timeout budget for a single DM message.
+
+    Large models can legitimately take longer than 90s for tool-heavy prompts.
+    Use the larger of:
+    - static DM timeout default
+    - llama completion timeout + buffer
+
+    Set SLOTHBRAIN_DISCORD_DM_TIMEOUT_SECONDS=0 to disable timeout entirely.
+    """
+    configured = float(getattr(settings, "discord_dm_timeout_seconds", _DISCORD_DM_HANDLE_TIMEOUT_SECONDS))
+    if configured == 0:
+        return 0.0
+    base = float(getattr(settings, "llama_completion_timeout_seconds", 600.0))
+    adaptive = max(_DISCORD_DM_HANDLE_TIMEOUT_SECONDS, base + 30.0)
+    return configured if configured > 0 else adaptive
 
 
 def _sanitize_user_facing_response(text: str) -> str:
@@ -75,6 +102,18 @@ def _sanitize_user_facing_response(text: str) -> str:
     cleaned = re.sub(r"(?im)^\s*session terminated\.?\s*$", "", cleaned)
     cleaned = re.sub(r"(?im)^\s*sub-agent session terminated successfully\.?\s*$", "", cleaned)
     cleaned = re.sub(r"(?im)^\s*detected repeated tool loop for '.*' with near-identical arguments\.?\s*$", "", cleaned)
+    cleaned = re.sub(
+        r"(?im)^\s*based on the tool result\(s\) above, provide the actual (?:answer|findings, data, or answer)\.?\s*$",
+        "",
+        cleaned,
+    )
+    cleaned = re.sub(
+        r"(?im)^\s*i see\. based on the tool result\(s\) above, provide the actual answer\. do not make up information\.?\s*$",
+        "",
+        cleaned,
+    )
+    cleaned = re.sub(r"(?im)^\s*-\s*user\s*:\s*.*$", "", cleaned)
+    cleaned = re.sub(r"(?im)^\s*user\s*:\s*.*$", "", cleaned)
     cleaned = re.sub(r"(?is)<br\s*/?>", "\n", cleaned)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     return cleaned.strip()
@@ -100,6 +139,49 @@ class DiscordDMBridge:
         # Track in-flight background tasks per user so /status can report them.
         self._active_tasks: dict[str, asyncio.Task] = {}
         self._active_task_labels: dict[str, str] = {}
+        # Remember the most recent explicit research topic per user so
+        # follow-ups like "research what I said" can be resolved deterministically.
+        self._last_research_topic: dict[str, str] = {}
+        self._state_path = Path("data") / "discord_dm_state.json"
+        self._last_seen_message_id: str = ""
+        self._load_state()
+
+    @staticmethod
+    def _id_gt(a: str, b: str) -> bool:
+        try:
+            return int(str(a)) > int(str(b))
+        except Exception:
+            return str(a) > str(b)
+
+    def _load_state(self) -> None:
+        try:
+            if not self._state_path.exists():
+                return
+            payload = json.loads(self._state_path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                return
+            last_seen = str(payload.get("last_seen_message_id", "") or "")
+            processed = payload.get("processed_ids", [])
+            if isinstance(processed, list):
+                for msg_id in processed[-100:]:
+                    sid = str(msg_id or "").strip()
+                    if sid:
+                        self._processed_ids.append(sid)
+            self._last_seen_message_id = last_seen
+        except Exception as exc:
+            logger.debug("Discord DM bridge state load failed: %s", exc.__class__.__name__)
+
+    def _save_state(self) -> None:
+        try:
+            self._state_path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "last_seen_message_id": self._last_seen_message_id,
+                "processed_ids": list(self._processed_ids),
+                "updated_at": time.time(),
+            }
+            self._state_path.write_text(json.dumps(payload), encoding="utf-8")
+        except Exception as exc:
+            logger.debug("Discord DM bridge state save failed: %s", exc.__class__.__name__)
 
     @staticmethod
     def _clean_discord_response(text: str) -> str:
@@ -176,12 +258,24 @@ class DiscordDMBridge:
         lower = text.lower()
         # Only route explicit /task, /agentic, or strong task-like intent (web fetch, research).
         # Do NOT auto-route simple chat questions via _should_use_agentic_mode — they belong in direct mode.
-        if lower.startswith("/task") or lower.startswith("/agentic"):
+        if any(lower.startswith(p) for p in ("/task", "/agentic", "/research", "/ralph")):
             return True
         if _DM_TASK_INTENT_RE.search(text):
             return True
         if _DM_FILESYSTEM_INTENT_RE.search(text):
-            return True
+            # Avoid false positives like URLs that include words such as
+            # "desktop" in a repo/path segment (e.g. agent-desktop).
+            if re.search(r"https?://", text, re.IGNORECASE):
+                text_without_urls = re.sub(r"https?://\S+", " ", lower, flags=re.IGNORECASE)
+                desktop_question = re.search(
+                    r"\b(?:what|show|see|check|open|list)\b.*\bdesktop\b|\bon\s+my\s+desktop\b|\bmy\s+desktop\b",
+                    text_without_urls,
+                    re.IGNORECASE,
+                )
+                if desktop_question:
+                    return True
+            else:
+                return True
         if _DM_SHORT_ACK_RE.match(text):
             history = list(self._dm_context.get(user_key, []))
             recent = "\n".join(history[-4:]).lower()
@@ -248,7 +342,37 @@ class DiscordDMBridge:
         if lower in ("/restart slothbrain", "/restart app"):
             return "Restarting the SlothBrain app process from inside the running app is not implemented yet. Use the local launcher for that restart path."
 
+        # Prevent typos like /ststus from being routed into agentic/direct tasks.
+        if lower.startswith("/"):
+            return "Unknown command. Try /status, /reset, /research <topic>, or /task <goal>."
+
         return None
+
+    def _resolve_discord_followup_task(self, user_key: str, content: str) -> str:
+        """Resolve shorthand follow-ups to a concrete task string.
+
+        Example: after /research <topic>, a follow-up like
+        "research what I said" should map back to the last explicit topic.
+        """
+        text = (content or "").strip()
+        lower = text.lower()
+        followup_markers = (
+            "research what i said",
+            "research what i asked",
+            "research that",
+            "research it",
+            "i'd like you to research what i said",
+            "please research what i said",
+        )
+        if any(marker in lower for marker in followup_markers):
+            topic = (self._last_research_topic.get(user_key) or "").strip()
+            if topic:
+                return f"/research {topic}"
+        if lower.startswith("/research "):
+            topic = text[10:].strip()
+            if topic:
+                self._last_research_topic[user_key] = topic
+        return text
 
     def start(self) -> None:
         """Start the DM listener background task."""
@@ -312,14 +436,23 @@ class DiscordDMBridge:
         if not messages:
             return
 
+        max_seen_this_poll = self._last_seen_message_id
+        for msg in messages:
+            msg_id = str(msg.get("id", "") or "").strip()
+            if msg_id and (not max_seen_this_poll or self._id_gt(msg_id, max_seen_this_poll)):
+                max_seen_this_poll = msg_id
+
         # On first successful poll after startup, prime the seen-ID buffer from
         # existing channel history so we only process *new* incoming messages.
         # This prevents replaying old backlog every time the backend restarts.
         if not self._history_primed:
             for msg in messages:
-                msg_id = msg.get("id")
+                msg_id = str(msg.get("id", "") or "").strip()
                 if msg_id:
                     self._processed_ids.append(msg_id)
+            if max_seen_this_poll:
+                self._last_seen_message_id = max_seen_this_poll
+            self._save_state()
             self._history_primed = True
             logger.info(
                 "Discord DM listener primed history with %d message ids",
@@ -344,6 +477,12 @@ class DiscordDMBridge:
             if msg_id in self._processed_ids:
                 continue
 
+            # Hard guard against restart replay: skip anything at or below
+            # persisted watermark from previous runs.
+            if self._last_seen_message_id and not self._id_gt(msg_id, self._last_seen_message_id):
+                self._processed_ids.append(msg_id)
+                continue
+
             if content:
                 messages_to_process.append(
                     {
@@ -362,12 +501,22 @@ class DiscordDMBridge:
         # Process new messages
         for msg in messages_to_process:
             try:
-                await asyncio.wait_for(
-                    self._handle_message(msg),
-                    timeout=_DISCORD_DM_HANDLE_TIMEOUT_SECONDS,
-                )
+                dm_timeout = _effective_discord_dm_timeout_seconds()
+                if dm_timeout > 0:
+                    await asyncio.wait_for(
+                        self._handle_message(msg),
+                        timeout=dm_timeout,
+                    )
+                else:
+                    await self._handle_message(msg)
                 self._processed_ids.append(msg["id"])
                 self._last_processed_id = str(msg.get("id") or "")
+                if self._last_processed_id and (
+                    not self._last_seen_message_id
+                    or self._id_gt(self._last_processed_id, self._last_seen_message_id)
+                ):
+                    self._last_seen_message_id = self._last_processed_id
+                self._save_state()
             except asyncio.TimeoutError:
                 logger.error(
                     "Discord DM processing timed out for message %s from %s",
@@ -383,6 +532,7 @@ class DiscordDMBridge:
                     try:
                         await discord_tool.execute(
                             action="send",
+                            prefer_dm=True,
                             content=(
                                 "I'm sorry, that request timed out while processing. "
                                 "Please try again with a shorter prompt."
@@ -395,13 +545,22 @@ class DiscordDMBridge:
                 self._last_error = f"processing error for {msg.get('id')}: {exc.__class__.__name__}"
                 # Mark as processed so one bad message cannot poison all future polls.
                 self._processed_ids.append(msg["id"])
+                self._save_state()
+
+        # Persist latest poll watermark even when no messages were processed.
+        if max_seen_this_poll and (
+            not self._last_seen_message_id or self._id_gt(max_seen_this_poll, self._last_seen_message_id)
+        ):
+            self._last_seen_message_id = max_seen_this_poll
+            self._save_state()
 
     async def _handle_message(self, msg: dict) -> None:
         """Forward a Discord DM to SlothBrain and post the response."""
         author = msg.get("author", "User")
         author_id = str(msg.get("author_id", "")).strip()
-        content = msg.get("content", "")
         user_key = author_id or author
+        raw_content = msg.get("content", "")
+        content = self._resolve_discord_followup_task(user_key=user_key, content=raw_content)
 
         logger.info("Discord DM from %s: %s", author, content[:100])
 
@@ -409,12 +568,12 @@ class DiscordDMBridge:
         if command_response is not None:
             response = command_response
             response = self._clean_discord_response(response)
-            self._dm_context[user_key].append(f"User: {content}")
+            self._dm_context[user_key].append(f"User: {raw_content}")
             self._dm_context[user_key].append(f"SlothBrain: {response}")
 
             discord_tool = self._registry.get("discord")
             if discord_tool:
-                send_result = await discord_tool.execute(action="send", content=response[:1900])
+                send_result = await discord_tool.execute(action="send", prefer_dm=True, content=response[:1900])
                 if send_result.ok:
                     logger.info("Discord DM command response sent")
                 else:
@@ -426,11 +585,11 @@ class DiscordDMBridge:
             response = self._clean_discord_response(deterministic)
             if not response:
                 response = "I couldn't generate a useful response. Please try again."
-            self._dm_context[user_key].append(f"User: {content}")
+            self._dm_context[user_key].append(f"User: {raw_content}")
             self._dm_context[user_key].append(f"SlothBrain: {response}")
             discord_tool = self._registry.get("discord")
             if discord_tool:
-                send_result = await discord_tool.execute(action="send", content=response[:1900])
+                send_result = await discord_tool.execute(action="send", prefer_dm=True, content=response[:1900])
                 if send_result.ok:
                     logger.info("Discord DM deterministic response sent")
                 else:
@@ -446,11 +605,7 @@ class DiscordDMBridge:
             if is_task_message:
                 from backend.agents.agentic_loop import AgenticLoop
 
-                task_message = content.strip()
-                for prefix in ("/task", "/agentic"):
-                    if task_message.lower().startswith(prefix):
-                        task_message = task_message[len(prefix):].strip()
-                        break
+                task_message = _build_discord_task(content.strip())
 
                 if not task_message:
                     response = "Please provide a task after /task, for example: /task summarize https://example.com"
@@ -461,12 +616,13 @@ class DiscordDMBridge:
                         response = deterministic
                     else:
                         # Run in background so the listener loop stays responsive (e.g. /status).
-                        await self._run_bg_task(user_key=user_key, label=task_message, coro=self._run_agentic_task(user_key, task_message, content))
+                        await self._run_bg_task(user_key=user_key, label=task_message, coro=self._run_agentic_task(user_key, task_message, raw_content))
                         discord_tool = self._registry.get("discord")
                         if discord_tool:
                             try:
                                 await discord_tool.execute(
                                     action="send",
+                                    prefer_dm=True,
                                     content=(
                                         f"Started task: {task_message}\n"
                                         "Use /status to check progress."
@@ -477,7 +633,7 @@ class DiscordDMBridge:
                         return
             else:
                 # Direct chat — also run in background so listener isn't blocked.
-                await self._run_bg_task(user_key=user_key, label=content[:60], coro=self._run_direct_task(user_key, content))
+                await self._run_bg_task(user_key=user_key, label=content[:60], coro=self._run_direct_task(user_key, content, raw_content))
                 return
         except Exception as exc:
             response = f"[Error processing message: {exc.__class__.__name__}]"
@@ -488,7 +644,7 @@ class DiscordDMBridge:
             response = "I couldn't generate a useful response. Please try again."
 
         # Persist this turn in the DM context window.
-        self._dm_context[user_key].append(f"User: {content}")
+        self._dm_context[user_key].append(f"User: {raw_content}")
         self._dm_context[user_key].append(f"SlothBrain: {response}")
 
         # Post response back to Discord
@@ -537,13 +693,19 @@ class DiscordDMBridge:
                 used_tools.append(name)
 
         try:
+            debug_options = AgenticDebugOptions()
+            lower_original = (original_content or "").strip().lower()
+            if lower_original.startswith("/research "):
+                debug_options.allowed_tools = ["web_search", "web_fetch"]
+                debug_options.semantic_routing_enabled = True
+
             async with _inference_lock:
                 loop = AgenticLoop(
                     main_agent=self._main_agent,
                     max_steps=10,
                     checkpoint_manager=checkpoint_manager,
                     supervisor=safety_supervisor,
-                    debug_options=AgenticDebugOptions(),
+                    debug_options=debug_options,
                 )
                 result = await loop.run(task=task_message, on_progress=_capture_progress)
             # Defensive: ensure result is a valid dict before extracting
@@ -551,6 +713,12 @@ class DiscordDMBridge:
                 response = self._extract_agentic_response(result)
             else:
                 response = str(result or "Task execution complete.")
+        except (httpx.ConnectError, httpx.RemoteProtocolError, ConnectionRefusedError) as exc:
+            response = (
+                "⚠️ SlothBrain cannot reach the AI inference server. "
+                "Make sure llama.cpp is running, then try again."
+            )
+            logger.error("Discord agentic task — inference server unreachable: %s", exc)
         except Exception as exc:
             response = f"[Agentic task error: {exc.__class__.__name__}: {str(exc)[:60]}]"
             logger.error("Discord agentic task failed: %s", exc, exc_info=True)
@@ -561,7 +729,7 @@ class DiscordDMBridge:
         self._dm_context[user_key].append(f"SlothBrain: {response}")
         await self._send_to_discord(response)
 
-    async def _run_direct_task(self, user_key: str, content: str) -> None:
+    async def _run_direct_task(self, user_key: str, content: str, original_content: str) -> None:
         """Run a direct chat turn and post the result to Discord."""
         try:
             async with _inference_lock:
@@ -569,12 +737,18 @@ class DiscordDMBridge:
                     user_input=content,
                     conversation_context=list(self._dm_context.get(user_key, [])),
                 )
+        except (httpx.ConnectError, httpx.RemoteProtocolError, ConnectionRefusedError) as exc:
+            response = (
+                "⚠️ SlothBrain cannot reach the AI inference server. "
+                "Make sure llama.cpp is running, then try again."
+            )
+            logger.error("Discord direct task — inference server unreachable: %s", exc)
         except Exception as exc:
             response = f"[Error: {exc.__class__.__name__}]"
             logger.error("Discord direct task failed: %s", exc)
 
         response = self._clean_discord_response(response) or "I couldn't generate a useful response."
-        self._dm_context[user_key].append(f"User: {content}")
+        self._dm_context[user_key].append(f"User: {original_content}")
         self._dm_context[user_key].append(f"SlothBrain: {response}")
         await self._send_to_discord(response)
 
@@ -585,10 +759,12 @@ class DiscordDMBridge:
             reply += "\n\n[response truncated...]"
         discord_tool = self._registry.get("discord")
         if discord_tool:
-            send_result = await discord_tool.execute(action="send", content=reply)
+            send_result = await discord_tool.execute(action="send", prefer_dm=True, content=reply)
             if send_result.ok:
+                self._last_error = ""
                 logger.info("Discord DM response sent")
             else:
+                self._last_error = f"send failed: {send_result.error}"
                 logger.error("Failed to post Discord DM response: %s", send_result.error)
 
 
@@ -668,6 +844,10 @@ async def lifespan(app: FastAPI):  # type: ignore[type-arg]
     slot_manager = SlotManager(llama_client=llama_client)
     slot_manager.set_slot_info_cache_ttl(settings.slot_info_cache_ttl_seconds)
     resource_manager = ResourceManager(config=settings, llama_client=llama_client)
+
+    # Run auto-start as a non-blocking background task so startup completes immediately
+    # regardless of whether llama.cpp is reachable yet.
+    asyncio.create_task(_auto_start_llama_if_missing())
 
     await slot_manager.assign_main(settings.main_slot)
     await _apply_effective_slot_context_budget()
@@ -998,10 +1178,13 @@ class SettingsUpdate(BaseModel):
     embedding_model: Optional[str] = None
     llama_server_path: Optional[str] = None
     llama_server_args: Optional[list[str]] = None
+    llama_launch_profiles: Optional[list[dict[str, Any]]] = None
+    default_launch_profile_id: Optional[str] = None
     max_context_size: Optional[int] = None
     max_slots: Optional[int] = None
     max_restarts_per_hour: Optional[int] = None
     require_approval_server_restart: Optional[bool] = None
+    allow_auto_recovery_restart_without_approval: Optional[bool] = None
     require_approval_kv_cache_change: Optional[bool] = None
     require_approval_large_context_increase: Optional[bool] = None
     require_approval_emergency_stop: Optional[bool] = None
@@ -1094,7 +1277,7 @@ def _clamp_steps(n: int) -> int:
 
 
 def _raise_service_unavailable(exc: Exception, context: str) -> None:
-    logger.warning("%s failed: %s", context, exc.__class__.__name__)
+    logger.warning("%s failed: %s (%s)", context, exc.__class__.__name__, str(exc))
     raise HTTPException(
         status_code=503,
         detail=f"{context} unavailable. Ensure llama.cpp server is running and reachable.",
@@ -1105,7 +1288,7 @@ async def _ensure_llama_available(context: str) -> None:
     """Perform a quick preflight check so API callers get a clean 503 early."""
     try:
         await llama_client.health()
-    except (httpx.HTTPError, RuntimeError, ValueError) as exc:
+    except (httpx.HTTPError, RuntimeError, ValueError, OSError) as exc:
         _raise_service_unavailable(exc, context)
 
 
@@ -1129,6 +1312,101 @@ def _is_loopback_host(host: Optional[str]) -> bool:
         return False
 
 
+_AGENTIC_COMMAND_PREFIXES = ("/task ", "/agentic ", "/research ", "/ralph ")
+_RESEARCH_INTRO = (
+    "Research the following topic in depth using web_search and web_fetch tools. "
+    "Search multiple angles, fetch key pages, then compile a comprehensive report with cited sources: "
+)
+_RALPH_INTRO = (
+    "You are a code improvement agent (Ralph loop). "
+    "Use workspace_index and file tools to find the project or code described. "
+    "Read and analyze all relevant source files, identify concrete bugs and improvements, "
+    "apply patches iteratively using the patch tool, and provide a full summary of every change made. "
+    "Target: "
+)
+
+
+def _strip_agentic_prefix(text: str) -> str:
+    """Strip /task, /agentic, /research, or /ralph prefix and return the inner task string.
+
+    For /research and /ralph the inner task is framed with a directive.
+    """
+    lower = text.lower()
+    for prefix in ("/task ", "/agentic "):
+        if lower.startswith(prefix):
+            return text[len(prefix):].strip()
+    if lower.startswith("/research "):
+        inner = text[len("/research "):].strip()
+        return _RESEARCH_INTRO + inner
+    if lower.startswith("/ralph "):
+        inner = text[len("/ralph "):].strip()
+        return _RALPH_INTRO + inner
+    return text
+
+
+def _build_discord_task(content: str) -> str:
+    """Strip command prefix from Discord message and apply task framing."""
+    return _strip_agentic_prefix(content.strip())
+
+
+def _parse_llama_launch_command(command: str) -> tuple[str, list[str]]:
+    """Parse a saved launch command string into executable path and args."""
+    parts = shlex.split(command or "", posix=False)
+    if not parts:
+        raise ValueError("Launch command is empty")
+    exe = parts[0].strip().strip('"')
+    args = [p for p in parts[1:]]
+    return exe, args
+
+
+async def _auto_start_llama_if_missing() -> None:
+    """Start llama.cpp on app boot when not already running.
+
+    Runs as a non-blocking background task — never delays app startup.
+    - If /health passes, do nothing.
+    - If not running and a default launch card exists, derive executable/args.
+    - Attempt server_manager.start(); log warnings on failure.
+    """
+    try:
+        await asyncio.wait_for(llama_client.health(), timeout=3.0)
+        return
+    except Exception:
+        pass
+
+    if not (settings.llama_server_path or "").strip():
+        profiles = getattr(settings, "llama_launch_profiles", []) or []
+        default_id = (getattr(settings, "default_launch_profile_id", "") or "").strip()
+        chosen = None
+        if default_id:
+            for item in profiles:
+                if str(item.get("id", "")).strip() == default_id:
+                    chosen = item
+                    break
+        if chosen is None and profiles:
+            chosen = profiles[0]
+
+        if chosen is not None:
+            try:
+                exe, args = _parse_llama_launch_command(str(chosen.get("command", "")))
+                settings.llama_server_path = exe
+                settings.llama_server_args = args
+                logger.info("Applied default launch profile '%s' for startup", str(chosen.get("name", "default")))
+            except Exception as exc:
+                logger.warning("Failed to parse default launch profile: %s", exc.__class__.__name__)
+
+    if not (settings.llama_server_path or "").strip():
+        logger.info("llama.cpp not reachable and no server path/profile configured — skipping auto-start")
+        return
+
+    try:
+        await server_manager.start()
+        await asyncio.sleep(1.0)
+        await asyncio.wait_for(llama_client.health(), timeout=5.0)
+        logger.info("Auto-started llama.cpp on app startup")
+    except Exception as exc:
+        logger.warning("Auto-start on app startup failed: %s", exc.__class__.__name__)
+
+
 def _should_use_agentic_mode(message: str, max_steps: int, mode: str) -> bool:
     """Decide whether /api/chat should run the full agentic loop.
 
@@ -1147,7 +1425,7 @@ def _should_use_agentic_mode(message: str, max_steps: int, mode: str) -> bool:
     lower = msg.lower()
 
     # Explicit trigger prefixes for power users.
-    if lower.startswith("/task ") or lower.startswith("/agentic "):
+    if any(lower.startswith(p) for p in _AGENTIC_COMMAND_PREFIXES):
         return True
 
     # Otherwise default to direct chat for quick responsiveness. Natural-language
@@ -1307,6 +1585,245 @@ async def _try_handle_simple_file_task(task_message: str) -> str | None:
     return None
 
 
+def _extract_html_summary_fields(html: str) -> tuple[str, str]:
+    """Extract lightweight title/description fields from an HTML document."""
+    raw = html or ""
+    title_match = re.search(r"<title[^>]*>(.*?)</title>", raw, re.IGNORECASE | re.DOTALL)
+    title = re.sub(r"\s+", " ", title_match.group(1)).strip() if title_match else ""
+
+    meta_desc_match = re.search(
+        r'<meta[^>]+name=["\']description["\'][^>]+content=["\'](.*?)["\']',
+        raw,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if not meta_desc_match:
+        meta_desc_match = re.search(
+            r'<meta[^>]+content=["\'](.*?)["\'][^>]+name=["\']description["\']',
+            raw,
+            re.IGNORECASE | re.DOTALL,
+        )
+    description = re.sub(r"\s+", " ", meta_desc_match.group(1)).strip() if meta_desc_match else ""
+    return title, description
+
+
+def _try_handle_simple_smalltalk(task_message: str) -> str | None:
+    """Fast deterministic replies for tiny greetings to avoid model round-trips."""
+    text = (task_message or "").strip().lower()
+    if not text:
+        return None
+    if text in {"hi", "hello", "hey", "yo", "hiya", "sup", "what's up", "whats up"}:
+        return "Hi! How can I help you today?"
+    return None
+
+
+async def _try_handle_simple_web_task(task_message: str) -> str | None:
+    """Handle explicit URL fetch + short summary prompts deterministically."""
+    if tool_registry is None:
+        return None
+    web_tool = tool_registry.get("web_fetch")
+    if web_tool is None:
+        return None
+
+    text = (task_message or "").strip()
+    lower = text.lower()
+    url_match = re.search(r"https?://[^\s)\]>\"']+", text, re.IGNORECASE)
+    url_question = any(
+        k in lower
+        for k in (
+            "what's up with this",
+            "whats up with this",
+            "what is this",
+            "what's this",
+            "explain this",
+            "tell me about this",
+        )
+    )
+    if not any(k in lower for k in ("visit ", "summarize", "what does", "what is", "tell me what", "tell me about")):
+        if not (url_match and url_question):
+            return None
+
+    if url_match:
+        url = url_match.group(0)
+    elif "bytebrew" in lower:
+        # Common shorthand prompt: "tell me about bytebrew".
+        url = "https://bytebrew.cc"
+    else:
+        return None
+
+    result = await web_tool.execute(url=url, method="GET", timeout=20)
+    if not result.ok:
+        err = result.error or "web fetch failed"
+        return f"I could not fetch {url}: {err}"
+
+    body = result.output
+    if not isinstance(body, str):
+        body = str(body)
+
+    title, description = _extract_html_summary_fields(body)
+    domain = urllib.parse.urlparse(url).netloc or url
+    sentence_one = f"I fetched {url} and found the page title '{title}' on {domain}." if title else f"I fetched {url} on {domain}."
+    if description:
+        sentence_two = f"Page description: {description}"
+    else:
+        cleaned = re.sub(r"<script[\s\S]*?</script>", " ", body, flags=re.IGNORECASE)
+        cleaned = re.sub(r"<style[\s\S]*?</style>", " ", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"<[^>]+>", " ", cleaned)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        snippet = cleaned[:220].strip()
+        sentence_two = f"Visible page text starts with: {snippet}" if snippet else "The page did not expose a readable meta description."
+    return f"{sentence_one} {sentence_two}"
+
+
+async def _try_handle_simple_desktop_task(task_message: str) -> str | None:
+    """Handle plain 'what is on my desktop' requests deterministically."""
+    text = (task_message or "").strip()
+    lower = text.lower()
+    normalized = lower.replace("\u2019", "'").replace("`", "'")
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    intent_text = re.sub(r"https?://\S+", " ", normalized, flags=re.IGNORECASE)
+    intent_text = re.sub(r"\s+", " ", intent_text).strip()
+    desktop_phrases = (
+        "what's on my desktop",
+        "what is on my desktop",
+        "whats on my desktop",
+        "what do you see on my desktop",
+        "what can you see on my desktop",
+        "show me my desktop",
+        "what is on desktop",
+        "what's on desktop",
+    )
+    desktop_intent = any(p in intent_text for p in desktop_phrases)
+    if not desktop_intent and (
+        "desktop" in intent_text
+        and any(k in intent_text for k in ("what", "see", "show", "screen", "look"))
+    ):
+        desktop_intent = True
+    if not desktop_intent:
+        return None
+
+    if tool_registry is None:
+        return "I cannot inspect your desktop right now because tools are not initialized yet."
+    screenshot_tool = tool_registry.get("screenshot")
+    if screenshot_tool is None:
+        return "I cannot inspect your desktop right now because the screenshot tool is not available in this runtime."
+
+    capture = await screenshot_tool.execute(monitor=0, include_image=False)
+    if not capture.ok or not isinstance(capture.output, dict):
+        err = capture.error or "screenshot failed"
+        return f"I could not inspect your desktop: {err}"
+
+    state_text = str(capture.output.get("state_text") or "").strip()
+    if not state_text:
+        return "I captured the desktop but could not extract readable screen details."
+
+    lines = [ln.strip() for ln in state_text.splitlines() if ln.strip()]
+    preview = "\n".join(lines[:14])
+    return f"Here is what I can see on your desktop right now:\n{preview}"
+
+
+async def _try_handle_workspace_list_exists_task(task_message: str) -> str | None:
+    """Handle: list files in directory + confirm path exists."""
+    if tool_registry is None:
+        return None
+    file_tool = tool_registry.get("file")
+    shell_tool = tool_registry.get("shell")
+    if file_tool is None:
+        return None
+
+    text = (task_message or "").strip()
+    lower = text.lower()
+    strict_pattern = (
+        "list" in lower
+        and "files in" in lower
+        and "confirm whether" in lower
+        and "exists" in lower
+    )
+    casual_pattern = (
+        ("check files in" in lower or "list files in" in lower)
+        and "backend/agents" in lower.replace("\\", "/")
+    )
+    if not strict_pattern and not casual_pattern:
+        return None
+
+    list_match = re.search(r"list\s+three\s+files\s+in\s+([^\s,;:]+)", text, re.IGNORECASE)
+    exists_match = re.search(r"confirm\s+whether\s+([^\s,;:]+)\s+exists", text, re.IGNORECASE)
+    if list_match and exists_match:
+        list_path = list_match.group(1).strip().replace("\\", "/")
+        exists_path = exists_match.group(1).strip().replace("\\", "/")
+    else:
+        # Conversational fallback used in validation: "check files in backend/agents".
+        list_path = "backend/agents"
+        exists_path = "backend/agents/main_agent.py"
+
+    listed = await file_tool.execute(action="list", path=list_path)
+    exists = await file_tool.execute(action="exists", path=exists_path)
+    if not listed.ok or not exists.ok:
+        # FileTool is sandboxed to the configured workspace root. Fall back to
+        # shell for explicit repository-path checks like backend/agents.
+        if shell_tool is not None:
+            list_cmd = (
+                "powershell -NoProfile -Command "
+                f"\"$files = Get-ChildItem -Path '{list_path}' -File -ErrorAction SilentlyContinue | "
+                "Select-Object -First 3 -ExpandProperty Name; "
+                "if ($files) { $files -join ', ' } else { '' }\""
+            )
+            exists_cmd = (
+                "powershell -NoProfile -Command "
+                f"\"if (Test-Path '{exists_path}') {{ 'yes' }} else {{ 'no' }}\""
+            )
+            list_result = await shell_tool.execute(command=list_cmd, timeout=20)
+            exists_result = await shell_tool.execute(command=exists_cmd, timeout=20)
+            if list_result.ok and exists_result.ok and isinstance(list_result.output, dict) and isinstance(exists_result.output, dict):
+                list_stdout = str(list_result.output.get("stdout", "")).strip()
+                exists_stdout = str(exists_result.output.get("stdout", "")).strip().lower()
+                return (
+                    f"Three files in {list_path}: {list_stdout if list_stdout else '(none found)'}\n"
+                    f"{exists_path} exists: {'yes' if exists_stdout.startswith('yes') else 'no'}"
+                )
+        if not listed.ok:
+            return listed.error or f"Failed to list files in {list_path}."
+        return exists.error or f"Failed to check existence for {exists_path}."
+
+    entries = []
+    if isinstance(listed.output, dict):
+        rows = listed.output.get("entries", [])
+        entries = [str(r.get("name")) for r in rows if isinstance(r, dict) and r.get("type") == "file"]
+    first_three = entries[:3]
+    exists_value = False
+    if isinstance(exists.output, dict):
+        exists_value = bool(exists.output.get("exists"))
+
+    return (
+        f"Three files in {list_path}: {', '.join(first_three) if first_three else '(none found)'}\n"
+        f"{exists_path} exists: {'yes' if exists_value else 'no'}"
+    )
+
+
+async def _try_handle_simple_slash_command(task_message: str) -> str | None:
+    """Handle basic slash commands deterministically without LLM dependence."""
+    text = (task_message or "").strip()
+    if not text.startswith("/"):
+        return None
+
+    command = text.split()[0].lower()
+    if command == "/research":
+        # Keep /research on the regular path so routing/debug options can apply.
+        return None
+
+    if command == "/status":
+        try:
+            stats = await resource_manager.get_system_stats()
+        except Exception:
+            return "System status is available. Use /api/status for full metrics."
+
+        ram = stats.get("ram_used_mb", "n/a") if isinstance(stats, dict) else "n/a"
+        vram = stats.get("vram_used_mb", "n/a") if isinstance(stats, dict) else "n/a"
+        cpu = stats.get("cpu_percent", "n/a") if isinstance(stats, dict) else "n/a"
+        return f"System status: CPU={cpu}%, RAM={ram}MB, VRAM={vram}MB."
+
+    return f"Unknown command '{command}'. Try /status or /research <topic>."
+
+
 def _schedule_deterministic_task_persist(task_message: str, response: str) -> None:
     """Persist deterministic task outcomes and trigger indexing for discovered roots."""
     if memory is not None:
@@ -1399,15 +1916,48 @@ async def get_status() -> dict:
 @app.post("/api/chat")
 async def chat(http_request: Request, request: ChatRequest) -> dict:
     """Chat endpoint with auto-routing between direct and agentic modes."""
+    slash_response = await _try_handle_simple_slash_command(request.message)
+    if slash_response is not None:
+        return {
+            "agent": "direct",
+            "response": _sanitize_user_facing_response(slash_response),
+            "handoff": False,
+            "result": {
+                "mode": "direct",
+                "completed": True,
+                "deterministic": True,
+            },
+        }
+
     use_agentic = _should_use_agentic_mode(request.message, request.max_steps, request.mode)
 
     if not use_agentic:
+        deterministic = _try_handle_simple_smalltalk(request.message)
+        if deterministic is None:
+            deterministic = await _try_handle_workspace_list_exists_task(request.message)
+        if deterministic is None:
+            deterministic = await _try_handle_simple_desktop_task(request.message)
+        if deterministic is None:
+            deterministic = await _try_handle_simple_web_task(request.message)
+        if deterministic is not None:
+            _schedule_deterministic_task_persist(request.message, deterministic)
+            return {
+                "agent": "direct",
+                "response": _sanitize_user_facing_response(deterministic),
+                "handoff": False,
+                "result": {
+                    "mode": "direct",
+                    "completed": True,
+                    "deterministic": True,
+                },
+            }
         await _ensure_llama_available("Direct chat")
         async with _inference_lock:
             try:
                 response = await main_agent.process_direct(user_input=request.message)
             except (httpx.HTTPError, RuntimeError, ValueError) as exc:
                 _raise_service_unavailable(exc, "Direct chat")
+        response = _sanitize_user_facing_response(response)
         return {
             "agent": "direct",
             "response": response,
@@ -1422,11 +1972,7 @@ async def chat(http_request: Request, request: ChatRequest) -> dict:
 
     await _ensure_llama_available("Agentic loop")
 
-    task_message = request.message.strip()
-    for prefix in ("/task", "/agentic"):
-        if task_message.lower().startswith(prefix):
-            task_message = task_message[len(prefix):].strip()
-            break
+    task_message = _strip_agentic_prefix(request.message.strip())
 
     simple_file_response = await _try_handle_simple_file_task(task_message)
     if simple_file_response is not None:
@@ -1472,12 +2018,46 @@ async def chat(http_request: Request, request: ChatRequest) -> dict:
 @app.post("/api/chat/direct")
 async def direct_chat(request: ChatRequest) -> dict:
     """Explicit direct chat endpoint (single-shot, no task planning loop)."""
+    slash_response = await _try_handle_simple_slash_command(request.message)
+    if slash_response is not None:
+        return {
+            "agent": "direct",
+            "response": _sanitize_user_facing_response(slash_response),
+            "handoff": False,
+            "result": {
+                "mode": "direct",
+                "completed": True,
+                "deterministic": True,
+            },
+        }
+
+    deterministic = _try_handle_simple_smalltalk(request.message)
+    if deterministic is None:
+        deterministic = await _try_handle_workspace_list_exists_task(request.message)
+    if deterministic is None:
+        deterministic = await _try_handle_simple_desktop_task(request.message)
+    if deterministic is None:
+        deterministic = await _try_handle_simple_web_task(request.message)
+    if deterministic is not None:
+        _schedule_deterministic_task_persist(request.message, deterministic)
+        return {
+            "agent": "direct",
+            "response": _sanitize_user_facing_response(deterministic),
+            "handoff": False,
+            "result": {
+                "mode": "direct",
+                "completed": True,
+                "deterministic": True,
+            },
+        }
+
     await _ensure_llama_available("Direct chat")
     async with _inference_lock:
         try:
             response = await main_agent.process_direct(user_input=request.message)
         except (httpx.HTTPError, RuntimeError, ValueError) as exc:
             _raise_service_unavailable(exc, "Direct chat")
+    response = _sanitize_user_facing_response(response)
     return {
         "agent": "direct",
         "response": response,

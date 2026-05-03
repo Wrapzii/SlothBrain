@@ -46,6 +46,11 @@ class AppConfig(BaseSettings):
     # llama-server process management
     llama_server_path: str = ""
     llama_server_args: list[str] = []
+    # Saved launch profiles shown as UI cards in the main app settings.
+    # Each item: {"id": str, "name": str, "command": str}
+    llama_launch_profiles: list[dict] = []
+    # Profile id from llama_launch_profiles used as startup default.
+    default_launch_profile_id: str = ""
     # Optional hard cap for effective per-slot context budget.
     # Set to 0 to disable and rely on /slots metadata.
     llama_slot_context_cap: int = 0
@@ -61,6 +66,9 @@ class AppConfig(BaseSettings):
 
     # Approval gates – set to True to require human approval for that action
     require_approval_server_restart: bool = True
+    # Allow automatic health-recovery restarts to bypass manual approval.
+    # This keeps chat/tool flows resilient when llama.cpp drops unexpectedly.
+    allow_auto_recovery_restart_without_approval: bool = True
     require_approval_kv_cache_change: bool = True
     require_approval_large_context_increase: bool = True
     require_approval_emergency_stop: bool = True
@@ -77,6 +85,9 @@ class AppConfig(BaseSettings):
     # Keep this comfortably above worst-case prompt-eval + generation times to
     # avoid client-side cancellations that invalidate llama.cpp slot checkpoints.
     llama_completion_timeout_seconds: float = 600.0
+    # Discord DM per-message processing timeout (seconds).
+    # 0 disables timeout and lets the request run to completion.
+    discord_dm_timeout_seconds: float = -1.0
     supervisor_max_repeated_tool_calls: int = 3
     supervisor_max_failed_tool_calls: int = 3
     supervisor_max_no_progress_steps: int = 3
@@ -231,6 +242,13 @@ class AppConfig(BaseSettings):
     def _validate_llama_completion_timeout(cls, v: float) -> float:
         if v <= 0:
             raise ValueError("llama_completion_timeout_seconds must be > 0")
+        return v
+
+    @field_validator("discord_dm_timeout_seconds")
+    @classmethod
+    def _validate_discord_dm_timeout(cls, v: float) -> float:
+        if v < -1:
+            raise ValueError("discord_dm_timeout_seconds must be >= -1")
         return v
 
     @field_validator(

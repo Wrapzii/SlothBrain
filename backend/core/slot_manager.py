@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 import time
 
 from backend.core.llama_client import LlamaClient
 
 
-_STOP_SEQUENCES = ["\nuser:", "\nassistant:", "\nsystem:", "\n# Response", "<think>"]
+logger = logging.getLogger(__name__)
+
+
+_STOP_SEQUENCES = ["\nuser:", "\nassistant:", "\nsystem:", "\n# Response", "<end_of_turn>", "<start_of_turn>"]
 _RESPONSE_PREFIX_RE = re.compile(
     r"(?is)^(?:\s*(?:system|user|assistant):.*?)+\s*(?:#\s*Response\s*)?"
 )
@@ -61,9 +65,31 @@ class SlotManager:
         self._slot_info_cache_ts = 0.0
 
     async def assign_main(self, slot_id: int) -> None:
-        self._main_slot = slot_id
-        if slot_id not in self._histories:
-            self._histories[slot_id] = []
+        resolved_slot = int(slot_id)
+        try:
+            slots = await self._client.get_slots()
+            available_ids = {
+                int(s.get("id"))
+                for s in slots
+                if isinstance(s, dict) and s.get("id") is not None
+            }
+            if available_ids and resolved_slot not in available_ids:
+                fallback_slot = min(available_ids)
+                logger.warning(
+                    "Configured main slot %d is unavailable; falling back to slot %d",
+                    resolved_slot,
+                    fallback_slot,
+                )
+                resolved_slot = fallback_slot
+        except Exception as exc:
+            logger.debug(
+                "Could not validate main slot assignment against /slots: %s",
+                exc.__class__.__name__,
+            )
+
+        self._main_slot = resolved_slot
+        if resolved_slot not in self._histories:
+            self._histories[resolved_slot] = []
 
     async def get_slot_info(self) -> dict:
         now = time.monotonic()
@@ -105,13 +131,15 @@ class SlotManager:
         response = _sanitize_response(response)
 
         # Some thinking/reasoning model outputs can be reduced to empty text
-        # after stop-sequence + sanitization trimming. Retry once without
-        # explicit stop sequences to recover a user-visible answer.
+        # after stop-sequence + sanitization trimming. Retry once with the
+        # same stop sequences so we do not fall back into unbounded generation
+        # on models that can emit long reasoning traces.
         if not response:
             retry = await self._client.complete(
                 prompt=prompt,
                 slot_id=self._main_slot,
                 max_tokens=max_tokens,
+                stop=_STOP_SEQUENCES,
             )
             response = _sanitize_response(retry) or (retry or "").strip()
 

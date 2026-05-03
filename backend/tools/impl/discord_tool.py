@@ -52,6 +52,11 @@ class DiscordTool(Tool):
                 "type": "string",
                 "description": "Override webhook display name (webhook mode only).",
             },
+            "prefer_dm": {
+                "type": "boolean",
+                "description": "When true, prefer bot DM/channel send path before webhook.",
+                "default": False,
+            },
             "limit": {
                 "type": "integer",
                 "description": "Number of recent messages to fetch (default: 20, max: 100).",
@@ -92,50 +97,41 @@ class DiscordTool(Tool):
                 self._resolved_dm_channel = resp.json().get("id", "")
                 logger.info("Discord DM channel resolved: %s", self._resolved_dm_channel)
                 return self._resolved_dm_channel
+            logger.error("Failed to resolve DM channel: HTTP %s %s", resp.status_code, resp.text[:200])
         except Exception as exc:
             logger.error("Failed to resolve DM channel: %s", exc)
-        return self._channel_id
+        # In DM mode, do not silently fall back to a configured channel.
+        # Falling back can cause the DM bridge to ingest and replay channel backlog.
+        return ""
 
     async def execute(
         self,
         action: str = "",
         content: str = "",
         username: str = "",
+        prefer_dm: bool = False,
         limit: int = 20,
         **kwargs: Any,
     ) -> ToolResult:
         if action == "send":
-            return await self._send(content, username)
+            return await self._send(content, username, prefer_dm=prefer_dm)
         if action == "history":
             return await self._history(min(limit, 100))
         return ToolResult(ok=False, error=f"Unknown action: {action!r}")
 
-    async def _send(self, content: str, username: str) -> ToolResult:
+    async def _send(self, content: str, username: str, prefer_dm: bool = False) -> ToolResult:
         if not content:
             return ToolResult(ok=False, error="'content' is required for 'send'")
 
-        # Webhook path (no auth required)
-        if self._webhook_url and not self._owner_user_id:
-            payload: dict = {"content": content}
-            if username:
-                payload["username"] = username
-            try:
-                async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
-                    resp = await client.post(self._webhook_url, json=payload)
-                if resp.status_code in (200, 204):
-                    return ToolResult(ok=True, output={"sent": True, "via": "webhook"})
-                return ToolResult(
-                    ok=False,
-                    error=f"Webhook returned HTTP {resp.status_code}: {resp.text[:200]}",
-                )
-            except Exception as exc:
-                return ToolResult(ok=False, error=str(exc))
+        errors: list[str] = []
 
-        # Bot token path – resolve DM channel if owner_user_id is set
-        if self._bot_token:
+        async def _try_bot_send() -> ToolResult | None:
+            if not self._bot_token:
+                return None
             channel = await self._resolve_dm_channel() if self._owner_user_id else self._channel_id
             if not channel:
-                return ToolResult(ok=False, error="No channel resolved for send.")
+                errors.append("No channel resolved for send.")
+                return None
             headers = {"Authorization": f"Bot {self._bot_token}", "Content-Type": "application/json"}
             url = f"{_DISCORD_API}/channels/{channel}/messages"
             try:
@@ -144,17 +140,39 @@ class DiscordTool(Tool):
                 if resp.status_code == 200:
                     data = resp.json()
                     return ToolResult(ok=True, output={"sent": True, "message_id": data.get("id"), "via": "bot"})
-                return ToolResult(
-                    ok=False,
-                    error=f"Discord API returned HTTP {resp.status_code}: {resp.text[:200]}",
-                )
+                errors.append(f"Discord API returned HTTP {resp.status_code}: {resp.text[:200]}")
             except Exception as exc:
-                return ToolResult(ok=False, error=str(exc))
+                errors.append(f"Bot send error: {exc}")
+            return None
 
-        return ToolResult(
-            ok=False,
-            error="No Discord credentials configured. Set bot_token + owner_user_id.",
-        )
+        if prefer_dm:
+            bot_result = await _try_bot_send()
+            if bot_result is not None:
+                return bot_result
+
+        # Prefer webhook when configured because it targets the configured
+        # channel directly and avoids DM-channel resolution edge cases.
+        if self._webhook_url:
+            payload: dict = {"content": content}
+            if username:
+                payload["username"] = username
+            try:
+                async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+                    resp = await client.post(self._webhook_url, json=payload)
+                if resp.status_code in (200, 204):
+                    return ToolResult(ok=True, output={"sent": True, "via": "webhook"})
+                errors.append(f"Webhook returned HTTP {resp.status_code}: {resp.text[:200]}")
+            except Exception as exc:
+                errors.append(f"Webhook error: {exc}")
+
+        bot_result = await _try_bot_send()
+        if bot_result is not None:
+            return bot_result
+
+        if errors:
+            return ToolResult(ok=False, error=" | ".join(errors))
+
+        return ToolResult(ok=False, error="No Discord credentials configured. Set webhook_url and/or bot_token.")
 
     async def _history(self, limit: int) -> ToolResult:
         if not self._bot_token:

@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Awaitable, Callable, Optional
 from backend.config import AppConfig
 from backend.core.slot_manager import SlotManager
 from backend.memory.lancedb_memory import LanceDBMemory
+from backend.memory.rolling_context import RollingContext
 
 if TYPE_CHECKING:
     from backend.agents.registry import AgentRegistry
@@ -30,9 +31,10 @@ _FALLBACK_SYSTEM_PROMPT = (
 
 _DIRECT_SYSTEM_PROMPT = (
     "You are SlothBrain in direct chat mode. Reply to the user directly and concisely. "
-    "Do not describe internal planning, verification, steps, watcher checks, or task-loop status. "
-    "Do not volunteer capability lists, tool lists, or feature overviews unless the user explicitly asks for them. "
-    "If asked about capabilities, answer plainly from known system features."
+    "You have access to tools listed below — use them whenever the request would benefit "
+    "from real data (web lookups, file reads, searches, etc.). "
+    "When you use a tool, wait for its result and base your reply on the actual output. "
+    "Do not fabricate tool results. Do not describe internal planning or task-loop status."
 )
 
 # Maximum tool-call iterations per execute_step call to prevent infinite loops.
@@ -68,6 +70,7 @@ _LOCAL_FILE_HINT_RE = re.compile(
     r"\b(file|folder|directory|filesystem|local|workspace|github\s+directory|repo(?:sitory)?|project(?:s)?)\b",
     re.IGNORECASE,
 )
+_PLACEHOLDER_TOOL_NAME_RE = re.compile(r"^\s*(?:<[^>]+>|name|tool)\s*$", re.IGNORECASE)
 _DESKTOP_VISION_TOOLS = {"screenshot", "ui", "image_analysis"}
 _TOOL_BLOCK_RE = re.compile(
     r"</?(?:tool_call|tool_result|fetch|fetch_result|verify|sweep|think|sloth)>"
@@ -84,8 +87,9 @@ _MAX_MODEL_RESPONSE_PREVIEW_CHARS = 240
 # Tool output limits: event payloads vs. model-facing prompts.
 # Event payloads can be compact (logging/discord), but prompts need
 # full content so the model can actually use tool results and not hallucinate.
-_MAX_TOOL_PROMPT_TEXT_CHARS = 16000  # Allow full web pages, API responses, etc.
+_MAX_TOOL_PROMPT_TEXT_CHARS = 5000
 _MAX_TOOL_PROMPT_LIST_ITEMS = 100  # Allow comprehensive result lists
+_MAX_TOOL_CONTEXT_CHARS = 12000
 _HEAVY_B64_KEYS = {
     "annotated_png_b64",
     "image_b64",
@@ -148,20 +152,89 @@ def _sanitize_tool_payload_for_prompt(value):
 
 
 def _sanitize_direct_response(text: str) -> str:
-    """Strip pseudo-tool markup from direct responses.
+    """Clean up the final direct-mode response before returning to the caller.
 
-    Direct mode should not claim tool execution. If model output includes tool
-    protocol style tags, replace with a clear and truthful user-facing message.
+    Tool calls executed inside the tool-call loop are fine — their results are
+    already incorporated.  We only replace a dangling bare <tool_call> block
+    that is the *entire* final answer (iteration limit reached with no prose).
     """
     stripped = (text or "").strip()
     if not stripped:
         return stripped
-    if _TOOL_BLOCK_RE.search(stripped):
-        return (
-            "I cannot execute tools in direct mode. "
-            "Use /task <goal> to run agentic mode and perform real tool calls."
-        )
+    _BARE_TOOL_CALL_RE = re.compile(
+        r"^\s*<tool_call>.*?</tool_call>\s*$", re.DOTALL | re.IGNORECASE
+    )
+    if _BARE_TOOL_CALL_RE.match(stripped):
+        return "I tried to use a tool but reached the iteration limit. Please rephrase or use /task."
     return stripped
+
+
+def _trim_tool_context(context: str) -> str:
+    """Bound accumulated tool-context size to avoid prompt-eval blowups.
+
+    Large tool outputs across iterations can force expensive full prompt
+    re-processing and lead to client-side cancellations. Keep only the most
+    recent tail, anchored to a tool/result boundary when possible.
+    """
+    if len(context) <= _MAX_TOOL_CONTEXT_CHARS:
+        return context
+
+    tail = context[-_MAX_TOOL_CONTEXT_CHARS :]
+    anchor = tail.find("<tool_result>")
+    if anchor == -1:
+        anchor = tail.find("<tool_call>")
+    if anchor > 0:
+        return tail[anchor:]
+    return tail
+
+
+def _resolve_tool_name(
+    requested_name: str,
+    tool_args: dict,
+    *,
+    active_tools: list,
+    user_input: str,
+) -> str:
+    """Best-effort resolution for malformed/placeholder tool names.
+
+    Some models occasionally emit placeholders like "<name>" even when tools
+    are provided. Resolve these to a concrete routed tool to keep execution
+    grounded instead of failing the whole turn.
+    """
+    name = (requested_name or "").strip()
+    active_names = [t.name for t in active_tools]
+    if name in active_names:
+        return name
+
+    lower_name = name.lower()
+    for candidate in active_names:
+        if lower_name == candidate.lower():
+            return candidate
+
+    if name and not _PLACEHOLDER_TOOL_NAME_RE.match(name):
+        # Keep the original unknown name so the caller can report a proper error.
+        return name
+
+    args = tool_args or {}
+    if any(k in args for k in ("url", "urls")):
+        if "web_fetch" in active_names:
+            return "web_fetch"
+    if any(k in args for k in ("query", "q", "keywords")):
+        if "web_search" in active_names:
+            return "web_search"
+    if any(k in args for k in ("path", "file_path", "action")):
+        if "file" in active_names:
+            return "file"
+
+    ui = (user_input or "").lower()
+    if ("http://" in ui or "https://" in ui or "website" in ui or "web" in ui) and "web_fetch" in active_names:
+        return "web_fetch"
+    if ("search" in ui or "research" in ui or "look up" in ui or "lookup" in ui) and "web_search" in active_names:
+        return "web_search"
+    if _LOCAL_FILE_HINT_RE.search(user_input or "") and "file" in active_names:
+        return "file"
+
+    return active_names[0] if active_names else name
 
 
 def _load_protected_prompt() -> str:
@@ -268,6 +341,26 @@ class MainAgent:
         # Injected after construction so we avoid circular imports
         self._registry: AgentRegistry | None = None
         self._tool_registry: "ToolRegistry | None" = None
+        summarize_at = max(1200, int((config.main_context_size or 4096) * 0.20))
+        summary_timeout = min(
+            2.0,
+            max(0.25, float(getattr(config, "llama_completion_timeout_seconds", 600.0)) / 600.0),
+        )
+        self._direct_rolling_context = RollingContext(
+            llama_client=self._slot_manager._client,
+            slot_id=self.slot_id,
+            max_tokens=config.main_context_size or 4096,
+            summarize_at=summarize_at,
+            summary_timeout_seconds=summary_timeout,
+        )
+        self._agentic_rolling_context = RollingContext(
+            llama_client=self._slot_manager._client,
+            slot_id=self.slot_id,
+            max_tokens=config.main_context_size or 4096,
+            summarize_at=summarize_at,
+            summary_timeout_seconds=summary_timeout,
+        )
+
     def set_registry(self, registry: "AgentRegistry") -> None:
         """Inject the AgentRegistry so MainAgent can spawn sub-agents."""
         self._registry = registry
@@ -275,6 +368,21 @@ class MainAgent:
     def set_tool_registry(self, tool_registry: "ToolRegistry") -> None:
         """Inject the ToolRegistry."""
         self._tool_registry = tool_registry
+
+    async def _append_rolling_context(self, ctx: RollingContext, role: str, content: str) -> None:
+        text = (content or "").strip()
+        if not text:
+            return
+        try:
+            await ctx.add_message(role, text)
+        except Exception as exc:
+            logger.warning("RollingContext add_message failed: %s", exc.__class__.__name__)
+
+    def _rolling_context_prompt(self, ctx: RollingContext, header: str) -> str:
+        prompt = ctx.get_context_prompt().strip()
+        if not prompt:
+            return ""
+        return f"{header}:\n{prompt}"
 
     # ------------------------------------------------------------------
     # Sub-agent delegation
@@ -351,17 +459,29 @@ class MainAgent:
         user_input: str,
         conversation_context: Optional[list[str]] = None,
     ) -> str:
-        """Single-shot direct chat path (no task-planning framing).
+        """Direct chat path with tool awareness.
 
-        This path intentionally avoids the heavy agentic-loop prompt style so
-        normal chat requests return plain user-facing answers.
+        Tools are semantically routed from the registry and injected into the
+        prompt so the model knows what it can call.  If the model emits a
+        <tool_call> block the result is fed back and the model produces a
+        final answer grounded in real data rather than hallucination.
         """
         latest_user_input = (user_input or "").strip()
         if _TOOL_QUERY_RE.search(latest_user_input):
             return self._describe_direct_capabilities()
 
+        web_intent = bool(_FETCH_INTENT_RE.search(latest_user_input)) and (
+            bool(_URL_RE.search(latest_user_input)) or bool(_DOMAIN_RE.search(latest_user_input))
+        )
+        local_file_intent = bool(_LOCAL_FILE_HINT_RE.search(latest_user_input)) and not web_intent
+
+        # Tool-grounded direct requests should rely on fresh tool outputs rather
+        # than semantically retrieved memory, which can leak stale facts into
+        # summarization/fetch tasks and increase prompt size.
+        allow_memory_context = not (web_intent or local_file_intent)
+
         memory_context = ""
-        if self._memory is not None:
+        if allow_memory_context and self._memory is not None:
             try:
                 memory_results = await self._memory.search(latest_user_input, limit=4)
                 snippets: list[str] = []
@@ -375,18 +495,157 @@ class MainAgent:
             except Exception as exc:
                 logger.warning("MainAgent direct memory search failed: %s", exc.__class__.__name__)
 
-        prompt_parts = [f"system: {_DIRECT_SYSTEM_PROMPT}"]
+        rolling_context = self._rolling_context_prompt(
+            self._direct_rolling_context,
+            "Rolling conversation summary",
+        )
+
+        # ── Tool injection ───────────────────────────────────────────────────
+        # Route tools semantically based on the user input so the model always
+        # knows what it can call.  We avoid desktop/vision tools unless the
+        # request explicitly asks for them.
+        tools_section = ""
+        active_tools: list = []
+        if self._tool_registry is not None:
+            active_tools = self._tool_registry.get_tools(
+                context=latest_user_input,
+                semantic_routing_enabled=True,
+            )
+            if web_intent:
+                active_tools = [t for t in active_tools if t.name not in _DESKTOP_VISION_TOOLS]
+            if local_file_intent:
+                active_tools = [t for t in active_tools if t.name not in _DESKTOP_VISION_TOOLS]
+                for must_have in ("file", "shell", "workspace_index"):
+                    forced = self._tool_registry.get(must_have)
+                    if forced is not None and all(t.name != must_have for t in active_tools):
+                        active_tools.append(forced)
+            if active_tools:
+                tools_block = self._tool_registry.render_tool_descriptions(active_tools)
+                example_tool_name = active_tools[0].name
+                tools_section = (
+                    f"\n\n{tools_block}\n\n"
+                    "To use a tool, emit a <tool_call> block with JSON:\n"
+                    "<tool_call>\n"
+                    f'{{"tool": "{example_tool_name}", "args": {{}}}}\n'
+                    "</tool_call>\n"
+                    "Use an exact tool name from the <tools> block above.\n"
+                    "The tool result will be provided and you may continue.\n"
+                    "During tool calls: output ONLY the next <tool_call> block, no prose.\n"
+                    "Never invent file paths, URLs, or facts not present in tool outputs.\n"
+                    "When you have real data from tools: write the answer using actual results, not guesses."
+                )
+
+        sys_prompt = self.system_prompt if active_tools else _DIRECT_SYSTEM_PROMPT
+        prompt_parts = [f"system: {sys_prompt}"]
         if memory_context:
             prompt_parts.append(memory_context)
+        if rolling_context:
+            prompt_parts.append(rolling_context)
         if conversation_context:
             trimmed_context = [line.strip() for line in conversation_context if line and line.strip()]
             if trimmed_context:
                 prompt_parts.append("Recent conversation:\n" + "\n".join(trimmed_context[-8:]))
+        if tools_section:
+            prompt_parts.append(tools_section.strip())
         prompt_parts.append(f"user: {latest_user_input}\nassistant:")
         prompt = "\n\n".join(prompt_parts)
 
-        response = await self._slot_manager.send_to_main(prompt, max_tokens=self._config.main_context_size or 4096)
+        # ── Tool-call loop ───────────────────────────────────────────────────
+        accumulated_tool_context = ""
+        response = ""
+        for iteration in range(_MAX_TOOL_ITERATIONS):
+            full_prompt = prompt + accumulated_tool_context
+            try:
+                response = await self._slot_manager.send_to_main(
+                    full_prompt, max_tokens=self._config.main_context_size or 4096
+                )
+            except RuntimeError as exc:
+                # llama.cpp can return HTTP 500 "context shift is disabled" when
+                # prompt state grows too large for the slot. Retry once with an
+                # aggressively trimmed tool context tail.
+                if "context shift is disabled" in str(exc).lower() and accumulated_tool_context:
+                    accumulated_tool_context = _trim_tool_context(accumulated_tool_context[-4000:])
+                    full_prompt = prompt + accumulated_tool_context
+                    response = await self._slot_manager.send_to_main(
+                        full_prompt, max_tokens=self._config.main_context_size or 4096
+                    )
+                else:
+                    raise
+
+            # No registry or no tools routed → single-shot answer
+            if self._tool_registry is None or not active_tools:
+                break
+
+            tool_calls = self._tool_registry.parse_tool_calls(response)
+            if not tool_calls:
+                # Model attempted tool protocol but emitted malformed payload.
+                # Ask for a corrected tool_call (or final answer) instead of
+                # returning raw protocol text to the user.
+                if "<tool_call>" in (response or "").lower() and iteration < (_MAX_TOOL_ITERATIONS - 1):
+                    accumulated_tool_context += (
+                        "\n\nYour previous <tool_call> payload was malformed. "
+                        "Emit ONE valid <tool_call> JSON block with exact keys {\"tool\",\"args\"}, "
+                        "or provide the final answer if no tool is needed.\nassistant:"
+                    )
+                    accumulated_tool_context = _trim_tool_context(accumulated_tool_context)
+                    continue
+                break  # Final answer; no more tool calls needed
+
+            response_in_cache = _ASSISTANT_THINK_SKIP + response
+            tool_result_lines: list[str] = [response_in_cache]
+            for tc in tool_calls:
+                tool_name = _resolve_tool_name(
+                    tc["tool"],
+                    tc.get("args", {}),
+                    active_tools=active_tools,
+                    user_input=latest_user_input,
+                )
+                tool_args = tc.get("args", {})
+                tool = self._tool_registry.get(tool_name)
+                if tool is None:
+                    result_dict = {"ok": False, "error": f"Unknown tool: {tool_name!r}"}
+                else:
+                    try:
+                        tool_result = await tool.execute(**tool_args)
+                        result_dict = tool_result.to_dict()
+                    except Exception as exc:
+                        logger.warning("Direct tool %s raised: %s", tool_name, exc)
+                        result_dict = {"ok": False, "error": "Tool execution failed"}
+                result_json = json.dumps(
+                    {
+                        "tool": tool_name,
+                        "ok": bool(result_dict.get("ok")),
+                        "output": _sanitize_tool_payload_for_prompt(result_dict.get("output")),
+                        "error": _sanitize_tool_payload_for_prompt(result_dict.get("error")),
+                    },
+                    ensure_ascii=False,
+                    default=str,
+                )
+                tool_result_lines.append(f"\n<tool_result>\n{result_json}\n</tool_result>")
+
+            accumulated_tool_context += (
+                "\n" + "\n".join(tool_result_lines)
+                + "\n\nBased on the tool result(s) above, provide the actual answer. "
+                + "Extract and use what the tool returned. Do NOT make up information.\nassistant:"
+            )
+            _before_trim = accumulated_tool_context
+            accumulated_tool_context = _trim_tool_context(accumulated_tool_context)
+            if self._memory is not None and len(accumulated_tool_context) < len(_before_trim):
+                dropped = _before_trim[: len(_before_trim) - len(accumulated_tool_context)]
+                compact = _truncate_text(" ".join(dropped.split()), 1200)
+                try:
+                    asyncio.create_task(
+                        self._memory.store(
+                            text=f"direct_tool_context_summary: {compact}",
+                            metadata={"agent": "main", "slot": self.slot_id, "mode": "direct", "kind": "tool_context_trim"},
+                        )
+                    )
+                except Exception:
+                    pass
+
         response = _sanitize_direct_response(response)
+        await self._append_rolling_context(self._direct_rolling_context, "user", latest_user_input)
+        await self._append_rolling_context(self._direct_rolling_context, "assistant", response)
 
         if self._memory is not None:
             try:
@@ -397,7 +656,6 @@ class MainAgent:
                     )
                 )
             except Exception:
-                # Never block direct responses on memory write scheduling.
                 pass
 
         return response
@@ -528,6 +786,13 @@ class MainAgent:
         if include_rolling_context and context:
             recent = context[-5:]
             context_section = "\n\nContext from previous steps:\n" + "\n".join(recent)
+        if include_rolling_context:
+            rolling_context_section = self._rolling_context_prompt(
+                self._agentic_rolling_context,
+                "Rolling task summary",
+            )
+            if rolling_context_section:
+                context_section += "\n\n" + rolling_context_section
 
         # Build tool descriptions block if tools are available
         tools_section = ""
@@ -568,12 +833,14 @@ class MainAgent:
 
             if tools:
                 tools_block = self._tool_registry.render_tool_descriptions(tools)
+                example_tool_name = tools[0].name
                 tools_section = (
                     f"\n\n{tools_block}\n\n"
                     "To use a tool, emit a <tool_call> block with JSON:\n"
                     "<tool_call>\n"
-                    '{"tool": "<name>", "args": {<arguments>}}\n'
+                    f'{{"tool": "{example_tool_name}", "args": {{}}}}\n'
                     "</tool_call>\n"
+                    "Use an exact tool name from the <tools> block above.\n"
                     "The tool result will be provided and you may continue.\n"
                     "During tool calls: output ONLY the next <tool_call> block, no prose.\n"
                     "When you have enough real data: write the complete final answer with\n"
@@ -632,12 +899,16 @@ class MainAgent:
 
             # No tool registry or no tools → return directly
             if self._tool_registry is None or not tools:
+                await self._append_rolling_context(self._agentic_rolling_context, "user", step)
+                await self._append_rolling_context(self._agentic_rolling_context, "assistant", response)
                 return response
 
             tool_calls = self._tool_registry.parse_tool_calls(response)
             logger.info("execute_step parsed_tool_calls iteration=%d count=%d", iteration + 1, len(tool_calls))
             if not tool_calls:
                 # No tool calls — final answer
+                await self._append_rolling_context(self._agentic_rolling_context, "user", step)
+                await self._append_rolling_context(self._agentic_rolling_context, "assistant", response)
                 return response
 
             # Execute each tool call and accumulate results.
@@ -659,7 +930,12 @@ class MainAgent:
             response_in_cache = _ASSISTANT_THINK_SKIP + response
             tool_result_lines: list[str] = [response_in_cache]
             for tc in tool_calls:
-                tool_name = tc["tool"]
+                tool_name = _resolve_tool_name(
+                    tc["tool"],
+                    tc.get("args", {}),
+                    active_tools=tools,
+                    user_input=f"{task}\n{step}",
+                )
                 tool_args = tc.get("args", {})
 
                 if on_event is not None:
@@ -727,6 +1003,22 @@ class MainAgent:
                 + "Do NOT make up information. Extract and cite what the tool returned. "
                 + "If the tool returned an error, explain that. If it succeeded, summarize the real result.\nassistant:"
             )
+            _before_trim = accumulated_tool_context
+            accumulated_tool_context = _trim_tool_context(accumulated_tool_context)
+            if self._memory is not None and len(accumulated_tool_context) < len(_before_trim):
+                dropped = _before_trim[: len(_before_trim) - len(accumulated_tool_context)]
+                compact = _truncate_text(" ".join(dropped.split()), 1200)
+                try:
+                    asyncio.create_task(
+                        self._memory.store(
+                            text=f"agentic_tool_context_summary: {compact}",
+                            metadata={"agent": "main", "slot": self.slot_id, "mode": "agentic", "kind": "tool_context_trim"},
+                        )
+                    )
+                except Exception:
+                    pass
 
         # Iteration limit reached — return last response
+        await self._append_rolling_context(self._agentic_rolling_context, "user", step)
+        await self._append_rolling_context(self._agentic_rolling_context, "assistant", response)
         return response

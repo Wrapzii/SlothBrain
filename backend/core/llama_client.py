@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 
 import httpx
@@ -42,6 +43,52 @@ class LlamaClient:
     # silently consuming minutes of inference time.
     _THINK_SKIP_SUFFIX = "<think>\n\n</think>\n\n"
     _ASSISTANT_PREFIXES = ("assistant:", "assistant:\n")
+    _MAX_COMPLETION_RETRIES = 2
+    _RETRY_BASE_DELAY_SECONDS = 0.35
+    _RECOVERY_HEALTH_WAIT_SECONDS = 25.0
+    _RECOVERY_HEALTH_POLL_SECONDS = 1.0
+
+    @staticmethod
+    def _is_transient_completion_error(exc: Exception) -> bool:
+        return isinstance(exc, (httpx.ReadError, httpx.ConnectError, httpx.RemoteProtocolError))
+
+    async def _wait_for_server_recovery(self, timeout_seconds: float) -> bool:
+        """Poll /health until llama.cpp becomes reachable again.
+
+        This allows in-flight completion calls to survive short server restarts
+        (manual restart, watchdog restart, model reload) instead of failing
+        immediately on a transient ConnectError.
+        """
+        deadline = asyncio.get_running_loop().time() + max(0.0, float(timeout_seconds))
+        while asyncio.get_running_loop().time() < deadline:
+            try:
+                await self.health()
+                return True
+            except Exception:
+                await asyncio.sleep(self._RECOVERY_HEALTH_POLL_SECONDS)
+        return False
+
+    async def _post_completion(self, payload: dict) -> dict:
+        last_exc: Exception | None = None
+        for attempt in range(self._MAX_COMPLETION_RETRIES + 1):
+            try:
+                async with httpx.AsyncClient(timeout=self._completion_timeout) as client:
+                    response = await client.post(f"{self.base_url}/completion", json=payload)
+                if response.status_code >= 400:
+                    self._raise_completion_error(response)
+                return response.json()
+            except Exception as exc:
+                if not self._is_transient_completion_error(exc) or attempt >= self._MAX_COMPLETION_RETRIES:
+                    raise
+                last_exc = exc
+                # If llama.cpp temporarily crashed/restarted, wait for /health
+                # before retrying so callers recover automatically.
+                await self._wait_for_server_recovery(self._RECOVERY_HEALTH_WAIT_SECONDS)
+                await asyncio.sleep(self._RETRY_BASE_DELAY_SECONDS * (2 ** attempt))
+
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("Completion call failed without an exception")
 
     async def complete(
         self,
@@ -70,11 +117,7 @@ class LlamaClient:
         if stop:
             payload["stop"] = stop
 
-        async with httpx.AsyncClient(timeout=self._completion_timeout) as client:
-            response = await client.post(f"{self.base_url}/completion", json=payload)
-            if response.status_code >= 400:
-                self._raise_completion_error(response)
-            result = response.json()
+        result = await self._post_completion(payload)
         text = self._extract_text(result)
         if text.strip():
             return text
@@ -83,11 +126,7 @@ class LlamaClient:
         # the optional thinking flag is present. Retry once without it.
         retry_payload = dict(payload)
         retry_payload.pop("thinking", None)
-        async with httpx.AsyncClient(timeout=self._completion_timeout) as client:
-            retry_response = await client.post(f"{self.base_url}/completion", json=retry_payload)
-            if retry_response.status_code >= 400:
-                self._raise_completion_error(retry_response)
-            retry_result = retry_response.json()
+        retry_result = await self._post_completion(retry_payload)
         return self._extract_text(retry_result)
 
     @staticmethod
@@ -133,5 +172,11 @@ class LlamaClient:
         lower = message.lower()
         if "exceeds the available context size" in lower or "context size" in lower:
             raise ValueError("llama.cpp context window exceeded")
+
+        if response.status_code >= 500 or response.status_code == 429:
+            msg = message.strip() or response.text.strip() or response.reason_phrase
+            raise RuntimeError(
+                f"llama.cpp completion HTTP {response.status_code}: {msg[:280]}"
+            )
 
         response.raise_for_status()

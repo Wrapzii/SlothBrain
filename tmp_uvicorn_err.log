@@ -1,0 +1,5 @@
+INFO:     Started server process [19728]
+INFO:     Waiting for application startup.
+Context size clamped to effective slot budget=30080 (main: 32768->30080)
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)

@@ -10,7 +10,10 @@ from __future__ import annotations
 
 import asyncio
 import re
-from typing import ClassVar, Optional
+import shlex
+import uuid
+from pathlib import Path
+from typing import Any, ClassVar, Optional
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -46,14 +49,44 @@ def _fmt(val: object) -> str:
 
 
 _TOOL_INTENT_RE = re.compile(
-    r"(\bweb_fetch\b|\buse\b.{0,20}\btool\b|\btry\b.{0,20}\btool\b|\bfetch\b\s+https?://)",
+    r"(\bweb_fetch\b|\buse\b.{0,20}\btool\b|\btry\b.{0,20}\btool\b|\bfetch\b\s+https?://"
+    r"|\blook\s*up\b|\blookup\b"
+    r"|\bbrowse\s+(?:the\s+)?(?:website|web|url|page)\b"
+    r"|/research\b|/ralph\b)",
     re.IGNORECASE,
 )
+
+_RESEARCH_INTRO = (
+    "Research the following topic in depth using web_search and web_fetch tools. "
+    "Search multiple angles, fetch key pages, then compile a comprehensive report with cited sources: "
+)
+_RALPH_INTRO = (
+    "You are a code improvement agent (Ralph loop). "
+    "Use workspace_index and file tools to find the project or code described. "
+    "Read and analyze all relevant source files, identify concrete bugs and improvements, "
+    "apply patches iteratively using the patch tool, and provide a full summary of every change made. "
+    "Target: "
+)
+
+
+def _build_agentic_task(msg: str) -> str:
+    """Strip command prefix and frame the task for the agentic loop."""
+    lower = msg.lower()
+    for prefix in ("/task ", "/agentic "):
+        if lower.startswith(prefix):
+            return msg[len(prefix):].strip()
+    if lower.startswith("/research "):
+        return _RESEARCH_INTRO + msg[10:].strip()
+    if lower.startswith("/ralph "):
+        return _RALPH_INTRO + msg[7:].strip()
+    return msg
 
 
 def _should_use_agentic_chat(message: str) -> bool:
     msg = (message or "").strip().lower()
-    return msg.startswith("/task ") or bool(_TOOL_INTENT_RE.search(message or ""))
+    if any(msg.startswith(p) for p in ("/task ", "/agentic ", "/research ", "/ralph ")):
+        return True
+    return bool(_TOOL_INTENT_RE.search(message or ""))
 
 
 # ---------------------------------------------------------------------------
@@ -257,6 +290,12 @@ class ChatTab(Container):
         log = self.query_one("#chat-log", Log)
         use_agentic = _should_use_agentic_chat(msg)
         mode_label = "agentic" if use_agentic else "direct"
+        if use_agentic:
+            lower = msg.lower()
+            if lower.startswith("/research "):
+                mode_label = "research"
+            elif lower.startswith("/ralph "):
+                mode_label = "ralph"
         log.write_line(f"[You → {mode_label}] {msg}")
         log.write_line("[thinking…]")
         self.run_worker(self._send_async(msg, log), exclusive=False, name="chat-request")
@@ -278,8 +317,7 @@ class ChatTab(Container):
                 inp.focus()
             return
 
-        task_msg = msg[6:].strip() if msg.lower().startswith("/task ") else msg
-        task_msg = task_msg or msg
+        task_msg = _build_agentic_task(msg)
         try:
             result: dict | None = None
             async for event in api.stream_agentic_chat(task_msg):
@@ -579,6 +617,11 @@ class NewPresetScreen(ModalScreen):
 
 
 class SettingsTab(Container):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._profiles: list[dict[str, Any]] = []
+        self._default_profile_id: str = ""
+
     def compose(self) -> ComposeResult:
         yield Label("[b]Settings[/b]")
         yield Label("Server Host")
@@ -589,6 +632,24 @@ class SettingsTab(Container):
         yield Input(id="s-main-slot", placeholder="1")
         yield Label("Main Context Size")
         yield Input(id="s-ctx", placeholder="32768")
+
+        yield Label("llama.cpp Executable")
+        with Horizontal(id="s-path-row"):
+            yield Input(id="s-server-path", placeholder="C:/path/to/llama-server.exe")
+            yield Button("Browse", id="s-browse-exe", variant="default")
+
+        yield Label("New Launch Card Command")
+        yield Input(
+            id="s-card-command",
+            placeholder='"C:/llama/llama-server.exe" -m "C:/models/model.gguf" -c 32768',
+        )
+        with Horizontal(id="s-card-buttons"):
+            yield Button("Add Card", id="s-card-add", variant="primary")
+            yield Button("Apply Default To Server", id="s-card-apply-default", variant="warning")
+
+        yield Label("Launch Cards")
+        yield ScrollableContainer(id="s-cards")
+
         with Horizontal(id="settings-buttons"):
             yield Button("Load", id="s-load", variant="default")
             yield Button("Save", id="s-save", variant="primary")
@@ -597,6 +658,47 @@ class SettingsTab(Container):
 
     def on_mount(self) -> None:
         self.app.call_later(self._load)
+
+    @staticmethod
+    def _infer_model_name(command: str) -> str:
+        try:
+            parts = shlex.split(command or "", posix=False)
+        except ValueError:
+            return "Model"
+        model_path = ""
+        for idx, token in enumerate(parts):
+            lower = token.lower()
+            if lower in {"-m", "--model"} and idx + 1 < len(parts):
+                model_path = parts[idx + 1].strip().strip('"')
+                break
+            if lower.endswith(".gguf"):
+                model_path = token.strip().strip('"')
+                break
+        if model_path:
+            return Path(model_path).stem or "Model"
+        return "Model"
+
+    def _render_profiles(self) -> None:
+        cards = self.query_one("#s-cards", ScrollableContainer)
+        cards.remove_children()
+        if not self._profiles:
+            cards.mount(Label("No launch cards yet."))
+            return
+        for profile in self._profiles:
+            pid = str(profile.get("id", ""))
+            name = str(profile.get("name", "Model"))
+            command = str(profile.get("command", ""))
+            is_default = pid and pid == self._default_profile_id
+            default_text = " [default]" if is_default else ""
+            row = Vertical(classes="s-card")
+            row.mount(Label(f"[b]{name}{default_text}[/b]"))
+            row.mount(Label(command, classes="s-card-command"))
+            actions = Horizontal(classes="s-card-actions")
+            actions.mount(Button("Set Default", id=f"s-card-default:{pid}", variant="primary"))
+            actions.mount(Button("Use For Server", id=f"s-card-use:{pid}", variant="default"))
+            actions.mount(Button("Delete", id=f"s-card-delete:{pid}", variant="error"))
+            row.mount(actions)
+            cards.mount(row)
 
     async def _load(self) -> None:
         try:
@@ -608,14 +710,21 @@ class SettingsTab(Container):
         self.query_one("#s-port", Input).value = _fmt(cfg.get("llama_port", "8080"))
         self.query_one("#s-main-slot", Input).value = _fmt(cfg.get("main_slot", "1"))
         self.query_one("#s-ctx", Input).value = _fmt(cfg.get("main_context_size", "32768"))
+        self.query_one("#s-server-path", Input).value = _fmt(cfg.get("llama_server_path", ""))
+        self._profiles = [p for p in (cfg.get("llama_launch_profiles") or []) if isinstance(p, dict)]
+        self._default_profile_id = str(cfg.get("default_launch_profile_id") or "")
+        self._render_profiles()
         self.query_one("#s-status", Label).update("Settings loaded.")
 
     async def _save(self) -> None:
-        data: dict = {
+        data: dict[str, Any] = {
             "llama_host": self.query_one("#s-host", Input).value,
             "llama_port": int(self.query_one("#s-port", Input).value or "8080"),
             "main_slot": int(self.query_one("#s-main-slot", Input).value or "1"),
             "main_context_size": int(self.query_one("#s-ctx", Input).value or "32768"),
+            "llama_server_path": self.query_one("#s-server-path", Input).value.strip(),
+            "llama_launch_profiles": self._profiles,
+            "default_launch_profile_id": self._default_profile_id,
         }
         try:
             await api.update_settings(data)
@@ -623,13 +732,108 @@ class SettingsTab(Container):
         except Exception as exc:
             self.query_one("#s-status", Label).update(f"Error: {exc}")
 
+    async def _add_card(self) -> None:
+        cmd = self.query_one("#s-card-command", Input).value.strip()
+        if not cmd:
+            self.query_one("#s-status", Label).update("Card command is empty.")
+            return
+        model_name = self._infer_model_name(cmd)
+        profile = {
+            "id": uuid.uuid4().hex,
+            "name": model_name,
+            "command": cmd,
+        }
+        self._profiles.append(profile)
+        if not self._default_profile_id:
+            self._default_profile_id = str(profile["id"])
+        self.query_one("#s-card-command", Input).value = ""
+        self._render_profiles()
+        self.query_one("#s-status", Label).update(f"Added card: {model_name}")
+
+    async def _apply_profile_to_server(self, profile_id: str) -> None:
+        match = next((p for p in self._profiles if str(p.get("id", "")) == profile_id), None)
+        if match is None:
+            self.query_one("#s-status", Label).update("Profile not found.")
+            return
+        command = str(match.get("command", "")).strip()
+        try:
+            parts = shlex.split(command, posix=False)
+        except ValueError as exc:
+            self.query_one("#s-status", Label).update(f"Bad command: {exc}")
+            return
+        if not parts:
+            self.query_one("#s-status", Label).update("Bad command: empty.")
+            return
+        exe = parts[0].strip().strip('"')
+        args = parts[1:]
+        self.query_one("#s-server-path", Input).value = exe
+        try:
+            await api.update_settings({"llama_server_path": exe, "llama_server_args": args})
+            self.query_one("#s-status", Label).update("Applied launch card to server settings.")
+        except Exception as exc:
+            self.query_one("#s-status", Label).update(f"Error: {exc}")
+
+    async def _browse_executable(self) -> None:
+        def _pick() -> str:
+            try:
+                import tkinter as tk
+                from tkinter import filedialog
+
+                root = tk.Tk()
+                root.withdraw()
+                selected = filedialog.askopenfilename(
+                    title="Select llama-server executable",
+                    filetypes=[("Executable", "*.exe"), ("All files", "*.*")],
+                )
+                root.destroy()
+                return selected or ""
+            except Exception:
+                return ""
+
+        selected = await asyncio.to_thread(_pick)
+        if selected:
+            self.query_one("#s-server-path", Input).value = selected
+            self.query_one("#s-status", Label).update("Executable selected.")
+
     def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "s-load":
+        btn_id = event.button.id or ""
+        if btn_id == "s-load":
             self.app.call_later(self._load)
-        elif event.button.id == "s-save":
+            return
+        if btn_id == "s-save":
             self.app.call_later(self._save)
-        elif event.button.id == "s-restart":
+            return
+        if btn_id == "s-restart":
             self.app.call_later(self._restart)
+            return
+        if btn_id == "s-card-add":
+            self.app.call_later(self._add_card)
+            return
+        if btn_id == "s-card-apply-default":
+            if self._default_profile_id:
+                self.app.call_later(self._apply_profile_to_server, self._default_profile_id)
+            else:
+                self.query_one("#s-status", Label).update("No default card selected.")
+            return
+        if btn_id == "s-browse-exe":
+            self.app.call_later(self._browse_executable)
+            return
+        if btn_id.startswith("s-card-default:"):
+            self._default_profile_id = btn_id.split(":", 1)[1]
+            self._render_profiles()
+            self.query_one("#s-status", Label).update("Default card updated.")
+            return
+        if btn_id.startswith("s-card-use:"):
+            profile_id = btn_id.split(":", 1)[1]
+            self.app.call_later(self._apply_profile_to_server, profile_id)
+            return
+        if btn_id.startswith("s-card-delete:"):
+            profile_id = btn_id.split(":", 1)[1]
+            self._profiles = [p for p in self._profiles if str(p.get("id", "")) != profile_id]
+            if self._default_profile_id == profile_id:
+                self._default_profile_id = str(self._profiles[0].get("id", "")) if self._profiles else ""
+            self._render_profiles()
+            self.query_one("#s-status", Label).update("Card removed.")
 
     async def _restart(self) -> None:
         confirmed = await self.app.push_screen_wait(ConfirmScreen("Restart llama-server?"))
@@ -644,6 +848,16 @@ class SettingsTab(Container):
     SettingsTab { padding: 1; }
     SettingsTab Label { margin-top: 1; }
     SettingsTab Input { margin-bottom: 0; }
+    #s-path-row { height: auto; }
+    #s-path-row Button { margin-left: 1; }
+    #s-path-row Input { width: 1fr; }
+    #s-card-buttons { height: auto; margin-top: 1; }
+    #s-card-buttons Button { margin-right: 1; }
+    #s-cards { height: 16; border: round $primary; padding: 1; }
+    .s-card { border: round $accent; padding: 0 1; margin-bottom: 1; }
+    .s-card-command { color: $text-muted; }
+    .s-card-actions { height: auto; margin-top: 1; }
+    .s-card-actions Button { margin-right: 1; }
     #settings-buttons { height: auto; margin-top: 1; }
     #settings-buttons Button { margin-right: 1; }
     #s-status { color: $success; }
