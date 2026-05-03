@@ -27,15 +27,14 @@ class AgentRegistry:
     def spawn(
         self,
         preset_id: str,
-        context_size_override: int | None = None,
+        assigned_slot_id: int = -1,
         max_tokens_override: int | None = None,
         task_description: str = "",
     ) -> SubAgent:
         """Spawn a sub-agent from a preset.
 
-        The MainAgent (or the API) can pass ``context_size_override`` and
-        ``max_tokens_override`` to right-size the agent for the actual task
-        instead of always using the preset's static defaults.
+        The caller assigns a concrete slot for the sub-agent. Context size is
+        governed by llama.cpp launch parameters and slot partitioning.
 
         Tool visibility is determined by global semantic routing.
         """
@@ -46,7 +45,7 @@ class AgentRegistry:
             preset=preset,
             llama_client=self._llama_client,
             memory=self._memory,
-            context_size_override=context_size_override,
+            assigned_slot_id=assigned_slot_id,
             max_tokens_override=max_tokens_override,
             task_description=task_description,
         )

@@ -126,6 +126,9 @@ class AppConfig(BaseSettings):
     # and use that channel for send/receive instead of discord_channel_id.
     discord_owner_user_id: str = ""
 
+    # Scheduler defaults
+    scheduler_timezone: str = "America/New_York"
+
     # Web search: set to a SearXNG base URL to use it instead of DuckDuckGo
     searxng_url: str = ""
 

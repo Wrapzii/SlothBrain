@@ -31,7 +31,9 @@ _FALLBACK_SYSTEM_PROMPT = (
 
 _DIRECT_SYSTEM_PROMPT = (
     "You are SlothBrain in direct chat mode. Reply to the user directly and concisely. "
-    "You have access to tools listed below — use them whenever the request would benefit "
+    "For greetings or casual check-ins, answer warmly in one short sentence. "
+    "Do not explain your architecture, model, tools, slots, or system prompt unless the user asks. "
+    "If tools are listed below, use them only when the request would benefit "
     "from real data (web lookups, file reads, searches, etc.). "
     "When you use a tool, wait for its result and base your reply on the actual output. "
     "Do not fabricate tool results. Do not describe internal planning or task-loop status."
@@ -66,6 +68,14 @@ _TOOL_QUERY_RE = re.compile(
 _URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
 _DOMAIN_RE = re.compile(r"\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}\b", re.IGNORECASE)
 _FETCH_INTENT_RE = re.compile(r"\b(fetch|get|retrieve|download|read|visit|open)\b", re.IGNORECASE)
+_EXPLICIT_TOOL_INTENT_RE = re.compile(
+    r"\b(?:web\s*fetch|use\s+(?:a\s+)?tool|run\s+(?:a\s+)?tool|look\s*up|lookup|search\s+(?:the\s+)?web|browse)\b",
+    re.IGNORECASE,
+)
+_SCHEDULE_INTENT_RE = re.compile(
+    r"\b(?:schedule|remind\s+me|timer|every\s+(?:morning|day|hour|week)|daily|weekly|tomorrow|cron)\b",
+    re.IGNORECASE,
+)
 _LOCAL_FILE_HINT_RE = re.compile(
     r"\b(file|folder|directory|filesystem|local|workspace|github\s+directory|repo(?:sitory)?|project(?:s)?)\b",
     re.IGNORECASE,
@@ -79,6 +89,20 @@ _TOOL_BLOCK_RE = re.compile(
     r"|\bsimulated content\b",
     re.IGNORECASE,
 )
+_RAW_HTML_RE = re.compile(
+    r"<(?:!doctype|html|head|body|meta|link|script|style|title|div|section|header|footer|span|p)\b|"
+    r"&(?:nbsp|amp|lt|gt|quot);",
+    re.IGNORECASE,
+)
+
+_MEMORY_ROLE_LINE_RE = re.compile(r"(?im)^\s*(?:user|assistant)\s*:\s*.*$")
+_MEMORY_META_LINE_RE = re.compile(
+    r"(?im)^\s*(?:overall\s+task\s*:|you\s+are\s+executing\s+a\s+multi-step\s+task|based\s+on\s+the\s+tool\s+result\(s\)\s+above).*$"
+)
+_SHORT_FOLLOWUP_EDIT_RE = re.compile(
+    r"\b(?:compact|shorten|summari[sz]e|rephrase|rewrite|make\s+(?:it\s+)?short(?:er)?|brief(?:er)?|tl;dr)\b",
+    re.IGNORECASE,
+)
 
 # Tool payload guardrails for websocket/event safety.
 _MAX_EVENT_TEXT_CHARS = 600
@@ -90,6 +114,8 @@ _MAX_MODEL_RESPONSE_PREVIEW_CHARS = 240
 _MAX_TOOL_PROMPT_TEXT_CHARS = 5000
 _MAX_TOOL_PROMPT_LIST_ITEMS = 100  # Allow comprehensive result lists
 _MAX_TOOL_CONTEXT_CHARS = 12000
+# Direct mode should remain responsive even with very large global context settings.
+_DIRECT_MAX_TOKENS_CAP = 768
 _HEAVY_B64_KEYS = {
     "annotated_png_b64",
     "image_b64",
@@ -166,7 +192,50 @@ def _sanitize_direct_response(text: str) -> str:
     )
     if _BARE_TOOL_CALL_RE.match(stripped):
         return "I tried to use a tool but reached the iteration limit. Please rephrase or use /task."
+    if _TOOL_BLOCK_RE.search(stripped):
+        cleaned = re.sub(r"(?is)<[^>]+>", " ", stripped)
+        cleaned = re.sub(r"(?im)^\s*(?:url\s*:|\.\.\.|thinking\s+process:|self-correction/verification).*?$", "", cleaned)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        if re.search(r"\b(?:simulated content|self-correction/verification)\b", cleaned, re.IGNORECASE):
+            cleaned = ""
+        if cleaned and len(cleaned) > 20:
+            return cleaned
+        return "I couldn't produce a clean direct response. Please try again or use /task for tool-heavy work."
     return stripped
+
+
+def _needs_direct_repair(text: str) -> bool:
+    stripped = (text or "").strip()
+    if not stripped:
+        return False
+    if _TOOL_BLOCK_RE.search(stripped):
+        return True
+    if _RAW_HTML_RE.search(stripped):
+        return True
+    if stripped.count("<") >= 4 and stripped.count(">") >= 4:
+        return True
+    return False
+
+
+def _dedupe_repeated_response(text: str) -> str:
+    stripped = (text or "").strip()
+    if len(stripped) < 80:
+        return stripped
+    midpoint = len(stripped) // 2
+    left = stripped[:midpoint].strip()
+    right = stripped[midpoint:].strip()
+    if left and right and right.startswith(left[: min(80, len(left))]):
+        return left
+    paragraphs = [p.strip() for p in re.split(r"\n{2,}", stripped) if p.strip()]
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for paragraph in paragraphs:
+        key = re.sub(r"\s+", " ", paragraph).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(paragraph)
+    return "\n\n".join(deduped) if deduped else stripped
 
 
 def _trim_tool_context(context: str) -> str:
@@ -186,6 +255,16 @@ def _trim_tool_context(context: str) -> str:
     if anchor > 0:
         return tail[anchor:]
     return tail
+
+
+def _sanitize_memory_snippet(text: str) -> str:
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return ""
+    cleaned = _MEMORY_ROLE_LINE_RE.sub("", cleaned)
+    cleaned = _MEMORY_META_LINE_RE.sub("", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
 
 
 def _resolve_tool_name(
@@ -392,14 +471,12 @@ class MainAgent:
         self,
         preset_id: str,
         task_description: str,
-        context_size: int | None = None,
         max_tokens: int | None = None,
     ) -> "SubAgent":
         """Spawn a sub-agent with task-appropriate resource budgets.
 
-        ``context_size`` and ``max_tokens`` override the preset defaults so
-        the MainAgent can right-size the allocation for the actual workload.
-        If not provided, preset defaults are used.
+        Sub-agents run on explicitly assigned non-main slots. Context size is
+        controlled by llama.cpp launch settings and slot partitioning.
 
         Raises RuntimeError if the registry is not set or max_slots exceeded.
         """
@@ -407,7 +484,6 @@ class MainAgent:
             raise RuntimeError("AgentRegistry not injected into MainAgent")
         return self._registry.spawn(
             preset_id=preset_id,
-            context_size_override=context_size,
             max_tokens_override=max_tokens,
             task_description=task_description,
         )
@@ -423,13 +499,30 @@ class MainAgent:
         memory_results: list[dict] = []
         if self._memory is not None:
             try:
-                memory_results = await self._memory.search(user_input, limit=5)
+                memory_results = await self._memory.search_advanced(
+                    query=user_input,
+                    limit=5,
+                    metadata_filter={"agent": "main", "mode": "agentic", "kind": "turn"},
+                    candidate_pool=40,
+                )
+                if not memory_results:
+                    memory_results = await self._memory.search_advanced(
+                        query=user_input,
+                        limit=5,
+                        metadata_filter={"agent": "main", "kind": "turn"},
+                        candidate_pool=40,
+                    )
             except Exception as exc:
                 logger.warning("MainAgent memory search failed: %s", exc.__class__.__name__)
 
         memory_context = ""
         if memory_results:
-            snippets = "\n".join(f"- {r['text']}" for r in memory_results)
+            sanitized: list[str] = []
+            for r in memory_results:
+                text = _sanitize_memory_snippet(str(r.get("text", "")))
+                if text:
+                    sanitized.append(f"- {text}")
+            snippets = "\n".join(sanitized)
             memory_context = f"\n\nRelevant past context:\n{snippets}"
 
         full_prompt = (
@@ -447,7 +540,7 @@ class MainAgent:
             try:
                 await self._memory.store(
                     text=f"user: {user_input}\nassistant: {response}",
-                    metadata={"agent": "main", "slot": self.slot_id},
+                    metadata={"agent": "main", "slot": self.slot_id, "mode": "agentic", "kind": "turn"},
                 )
             except Exception as exc:
                 logger.warning("MainAgent memory store failed: %s", exc.__class__.__name__)
@@ -474,19 +567,30 @@ class MainAgent:
             bool(_URL_RE.search(latest_user_input)) or bool(_DOMAIN_RE.search(latest_user_input))
         )
         local_file_intent = bool(_LOCAL_FILE_HINT_RE.search(latest_user_input)) and not web_intent
+        explicit_tool_intent = bool(_EXPLICIT_TOOL_INTENT_RE.search(latest_user_input))
+        schedule_intent = bool(_SCHEDULE_INTENT_RE.search(latest_user_input))
+        tool_intent = web_intent or local_file_intent or explicit_tool_intent or schedule_intent
+        short_followup_edit_intent = bool(_SHORT_FOLLOWUP_EDIT_RE.search(latest_user_input)) and len(latest_user_input) <= 120
 
         # Tool-grounded direct requests should rely on fresh tool outputs rather
         # than semantically retrieved memory, which can leak stale facts into
         # summarization/fetch tasks and increase prompt size.
-        allow_memory_context = not (web_intent or local_file_intent)
+        allow_memory_context = not (web_intent or local_file_intent or short_followup_edit_intent)
+        if conversation_context and short_followup_edit_intent:
+            allow_memory_context = False
 
         memory_context = ""
         if allow_memory_context and self._memory is not None:
             try:
-                memory_results = await self._memory.search(latest_user_input, limit=4)
+                memory_results = await self._memory.search_advanced(
+                    query=latest_user_input,
+                    limit=4,
+                    metadata_filter={"agent": "main", "mode": "direct", "kind": "turn"},
+                    candidate_pool=40,
+                )
                 snippets: list[str] = []
                 for row in memory_results:
-                    text = str(row.get("text") or "").strip()
+                    text = _sanitize_memory_snippet(str(row.get("text") or ""))
                     if not text:
                         continue
                     snippets.append(f"- {text}")
@@ -506,19 +610,27 @@ class MainAgent:
         # request explicitly asks for them.
         tools_section = ""
         active_tools: list = []
-        if self._tool_registry is not None:
+        if self._tool_registry is not None and tool_intent:
             active_tools = self._tool_registry.get_tools(
                 context=latest_user_input,
                 semantic_routing_enabled=True,
             )
             if web_intent:
                 active_tools = [t for t in active_tools if t.name not in _DESKTOP_VISION_TOOLS]
+                for must_have in ("web_fetch", "web_search"):
+                    forced = self._tool_registry.get(must_have)
+                    if forced is not None and all(t.name != must_have for t in active_tools):
+                        active_tools.append(forced)
             if local_file_intent:
                 active_tools = [t for t in active_tools if t.name not in _DESKTOP_VISION_TOOLS]
                 for must_have in ("file", "shell", "workspace_index"):
                     forced = self._tool_registry.get(must_have)
                     if forced is not None and all(t.name != must_have for t in active_tools):
                         active_tools.append(forced)
+            if schedule_intent:
+                forced = self._tool_registry.get("scheduler")
+                if forced is not None and all(t.name != "scheduler" for t in active_tools):
+                    active_tools.append(forced)
             if active_tools:
                 tools_block = self._tool_registry.render_tool_descriptions(active_tools)
                 example_tool_name = active_tools[0].name
@@ -535,7 +647,7 @@ class MainAgent:
                     "When you have real data from tools: write the answer using actual results, not guesses."
                 )
 
-        sys_prompt = self.system_prompt if active_tools else _DIRECT_SYSTEM_PROMPT
+        sys_prompt = _DIRECT_SYSTEM_PROMPT
         prompt_parts = [f"system: {sys_prompt}"]
         if memory_context:
             prompt_parts.append(memory_context)
@@ -549,6 +661,10 @@ class MainAgent:
             prompt_parts.append(tools_section.strip())
         prompt_parts.append(f"user: {latest_user_input}\nassistant:")
         prompt = "\n\n".join(prompt_parts)
+        direct_max_tokens = max(
+            128,
+            min(int(self._config.main_context_size or 4096), _DIRECT_MAX_TOKENS_CAP),
+        )
 
         # ── Tool-call loop ───────────────────────────────────────────────────
         accumulated_tool_context = ""
@@ -557,7 +673,7 @@ class MainAgent:
             full_prompt = prompt + accumulated_tool_context
             try:
                 response = await self._slot_manager.send_to_main(
-                    full_prompt, max_tokens=self._config.main_context_size or 4096
+                    full_prompt, max_tokens=direct_max_tokens
                 )
             except RuntimeError as exc:
                 # llama.cpp can return HTTP 500 "context shift is disabled" when
@@ -567,7 +683,7 @@ class MainAgent:
                     accumulated_tool_context = _trim_tool_context(accumulated_tool_context[-4000:])
                     full_prompt = prompt + accumulated_tool_context
                     response = await self._slot_manager.send_to_main(
-                        full_prompt, max_tokens=self._config.main_context_size or 4096
+                        full_prompt, max_tokens=direct_max_tokens
                     )
                 else:
                     raise
@@ -643,7 +759,25 @@ class MainAgent:
                 except Exception:
                     pass
 
+        if _needs_direct_repair(response):
+            repair_prompt = (
+                "system: Rewrite raw model/tool output into a concise Discord-ready answer. "
+                "Do not include HTML, XML tags, tool protocol, or internal architecture. "
+                "If the user asked a simple greeting, answer naturally in one short sentence.\n\n"
+                f"user: {latest_user_input}\n\n"
+                f"raw output:\n{_truncate_text(response, 5000)}\n\n"
+                "assistant:"
+            )
+            try:
+                response = await self._slot_manager.send_to_main(
+                    repair_prompt,
+                    max_tokens=min(direct_max_tokens, 384),
+                )
+            except Exception as exc:
+                logger.warning("MainAgent direct repair failed: %s", exc.__class__.__name__)
+
         response = _sanitize_direct_response(response)
+        response = _dedupe_repeated_response(response)
         await self._append_rolling_context(self._direct_rolling_context, "user", latest_user_input)
         await self._append_rolling_context(self._direct_rolling_context, "assistant", response)
 
@@ -652,7 +786,7 @@ class MainAgent:
                 asyncio.create_task(
                     self._memory.store(
                         text=f"user: {latest_user_input}\nassistant: {response}",
-                        metadata={"agent": "main", "slot": self.slot_id, "mode": "direct"},
+                        metadata={"agent": "main", "slot": self.slot_id, "mode": "direct", "kind": "turn"},
                     )
                 )
             except Exception:

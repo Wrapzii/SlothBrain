@@ -7,7 +7,7 @@ from fastapi.testclient import TestClient
 
 from backend.main import app
 from backend.config import settings
-from backend.main import _build_debug_options, _should_use_agentic_mode
+from backend.main import _build_debug_options, _should_use_agentic_mode, _strip_agentic_prefix, _try_handle_simple_slash_command
 from backend.agents.main_agent import MainAgent
 
 
@@ -88,12 +88,12 @@ def test_api_key_required_when_configured() -> None:
         _restore_settings(snapshot)
 
 
-def test_auto_mode_routes_tool_intent_to_agentic() -> None:
+def test_auto_mode_keeps_tool_intent_direct_without_slash() -> None:
     assert _should_use_agentic_mode(
         "can you try web_fetch on https://bytebrew.cc and tell me what it is?",
         max_steps=1,
         mode="auto",
-    ) is True
+    ) is False
 
 
 def test_auto_mode_keeps_simple_prompt_direct() -> None:
@@ -102,6 +102,17 @@ def test_auto_mode_keeps_simple_prompt_direct() -> None:
         max_steps=1,
         mode="auto",
     ) is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("message", ["/task do thing", "/agentic do thing", "/research topic", "/ralph improve repo"])
+async def test_loop_slash_commands_are_not_deterministic(message: str) -> None:
+    assert await _try_handle_simple_slash_command(message) is None
+
+
+@pytest.mark.parametrize("message", ["/task", "/agentic", "/research", "/ralph"])
+def test_bare_loop_slash_commands_strip_to_empty_task(message: str) -> None:
+    assert _strip_agentic_prefix(message) == ""
 
 
 def test_build_debug_options_uses_defaults_when_missing() -> None:
@@ -157,7 +168,8 @@ async def test_direct_mode_sanitizes_pseudo_tool_markup() -> None:
 
     response = await agent.process_direct("can you use web_fetch?")
 
-    assert "cannot execute tools in direct mode" in response.lower()
+    assert "<fetch" not in response.lower()
+    assert "clean direct response" in response.lower()
 
 
 @pytest.mark.asyncio
@@ -175,4 +187,5 @@ async def test_direct_mode_sanitizes_think_sloth_markup() -> None:
 
     response = await agent.process_direct("can you try web_fetch on https://bytebrew.cc and tell me what it is?")
 
-    assert "cannot execute tools in direct mode" in response.lower()
+    assert "<sloth" not in response.lower()
+    assert "clean direct response" in response.lower()

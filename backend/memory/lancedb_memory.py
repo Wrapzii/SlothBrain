@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timezone
 from typing import Any
+import math
 
 
 try:
@@ -103,6 +104,18 @@ class LanceDBMemory:
         await asyncio.to_thread(table.add, [row])
 
     async def search(self, query: str, limit: int = 5) -> list[dict]:
+        return await self.search_advanced(query=query, limit=limit)
+
+    async def search_advanced(
+        self,
+        query: str,
+        limit: int = 5,
+        *,
+        metadata_filter: dict[str, Any] | None = None,
+        exclude_metadata: dict[str, Any] | None = None,
+        candidate_pool: int = 32,
+        recency_half_life_days: float = 7.0,
+    ) -> list[dict]:
         async with self._init_lock:
             encoder = await asyncio.to_thread(self._get_encoder)
             query_vector = await asyncio.to_thread(encoder.encode, query)
@@ -112,17 +125,75 @@ class LanceDBMemory:
         def _search():
             return (
                 table.search(query_vector)
-                .limit(limit)
+                .limit(max(limit, candidate_pool))
                 .to_pandas()
             )
 
         results = await asyncio.to_thread(_search)
         import json
         output: list[dict] = []
+
+        def _metadata_match(meta: dict, expected: dict[str, Any]) -> bool:
+            for k, v in expected.items():
+                if meta.get(k) != v:
+                    return False
+            return True
+
+        now = datetime.now(timezone.utc)
+        half_life_seconds = max(1.0, float(recency_half_life_days) * 86400.0)
+        scored: list[tuple[float, dict]] = []
+
         for _, row in results.iterrows():
-            output.append({
-                "text": row["text"],
-                "metadata": json.loads(row["metadata"]) if row["metadata"] else {},
-                "timestamp": row.get("timestamp", ""),
-            })
+            meta = json.loads(row["metadata"]) if row.get("metadata") else {}
+            if metadata_filter and not _metadata_match(meta, metadata_filter):
+                continue
+            if exclude_metadata and _metadata_match(meta, exclude_metadata):
+                continue
+
+            text = str(row.get("text", "") or "")
+            timestamp = str(row.get("timestamp", "") or "")
+            distance = row.get("_distance", None)
+
+            try:
+                d = float(distance)
+            except Exception:
+                d = 1.0
+
+            # Convert vector distance to bounded similarity score.
+            similarity = 1.0 / (1.0 + max(0.0, d))
+
+            recency_score = 0.5
+            if timestamp:
+                try:
+                    ts = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+                    age_seconds = max(0.0, (now - ts).total_seconds())
+                    recency_score = math.exp(-math.log(2.0) * (age_seconds / half_life_seconds))
+                except Exception:
+                    recency_score = 0.5
+
+            combined = (0.85 * similarity) + (0.15 * recency_score)
+            scored.append(
+                (
+                    combined,
+                    {
+                        "text": text,
+                        "metadata": meta,
+                        "timestamp": timestamp,
+                        "score": round(combined, 6),
+                    },
+                )
+            )
+
+        scored.sort(key=lambda item: item[0], reverse=True)
+
+        seen_text: set[str] = set()
+        for _, item in scored:
+            key = (item.get("text", "") or "").strip().lower()
+            if not key or key in seen_text:
+                continue
+            seen_text.add(key)
+            output.append(item)
+            if len(output) >= limit:
+                break
+
         return output

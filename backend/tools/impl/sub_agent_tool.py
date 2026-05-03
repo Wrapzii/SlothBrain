@@ -47,10 +47,6 @@ class SubAgentTool(Tool):
                 "description": f"Maximum tokens for the response (default: {_DEFAULT_MAX_TOKENS}).",
                 "default": _DEFAULT_MAX_TOKENS,
             },
-            "context_size": {
-                "type": "integer",
-                "description": "Override the preset's context window size.",
-            },
         },
         "required": ["preset_id", "task"],
     }
@@ -63,7 +59,6 @@ class SubAgentTool(Tool):
         preset_id: str = "",
         task: str = "",
         max_tokens: int = _DEFAULT_MAX_TOKENS,
-        context_size: int | None = None,
         **kwargs: Any,
     ) -> ToolResult:
         if not preset_id:
@@ -71,10 +66,40 @@ class SubAgentTool(Tool):
         if not task:
             return ToolResult(ok=False, error="'task' argument is required")
 
+        # Sub-agents may only use non-main parallel slots and only when one
+        # is currently idle. Main slot remains reserved for the main agent.
+        try:
+            slots = await self._registry._llama_client.get_slots()
+        except Exception as exc:
+            return ToolResult(ok=False, error=f"Could not inspect slot availability: {exc}")
+
+        available_parallel_slots: list[int] = []
+        for slot in slots:
+            if not isinstance(slot, dict):
+                continue
+            sid = int(slot.get("id", -1))
+            if sid <= 0:
+                continue
+            next_token = slot.get("next_token")
+            has_next = bool(next_token.get("has_next_token")) if isinstance(next_token, dict) else False
+            if not has_next:
+                available_parallel_slots.append(sid)
+
+        if not available_parallel_slots:
+            return ToolResult(
+                ok=False,
+                error=(
+                    "No idle parallel sub-agent slot is available. "
+                    "Keep this task on main slot 0 or launch llama.cpp with -np >= 2."
+                ),
+            )
+
+        assigned_slot = min(available_parallel_slots)
+
         try:
             agent = self._registry.spawn(
                 preset_id=preset_id,
-                context_size_override=context_size,
+                assigned_slot_id=assigned_slot,
                 max_tokens_override=max_tokens,
                 task_description=task[:100],
             )

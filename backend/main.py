@@ -7,7 +7,6 @@ import logging
 import re
 import shlex
 import time
-import urllib.parse
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from functools import lru_cache
@@ -42,26 +41,7 @@ from backend.tools.registry import ToolRegistry
 
 logger = logging.getLogger(__name__)
 
-_AUTO_AGENTIC_TOOL_INTENT_RE = re.compile(
-    r"(\bweb_fetch\b|\buse\b.{0,20}\btool\b|\btry\b.{0,20}\btool\b|\bfetch\b\s+https?://"
-    r"|\blook\s*up\b|\blookup\b|\bbrowse\s+(?:the\s+)?(?:website|web|url|page)\b"
-    r"|/research\b|/ralph\b)",
-    re.IGNORECASE,
-)
-_DM_TASK_INTENT_RE = re.compile(
-    r"\b(?:/task|/agentic|/research|/ralph|web\s*fetch|research|look\s*up|look(?:ing)?\s+up\b"
-    r"|fetch\s+(?:the\s+)?(?:website|url|page|content)\b"
-    r"|browse\s+(?:the\s+)?(?:website|url|page)\b"
-    r"|summari[sz]e\s+https?://|plan\s+(?:this|a\s+task)|multi[-\s]?step|step\s+by\s+step)\b",
-    re.IGNORECASE,
-)
-_DM_FILESYSTEM_INTENT_RE = re.compile(
-    r"\b(?:desktop|documents|downloads|pictures|filesystem|file\s+system|folder|directory|path|list\s+files|list\s+folders|what\s+do\s+i\s+have)\b",
-    re.IGNORECASE,
-)
 _DM_SHORT_ACK_RE = re.compile(r"^(?:yes|yep|yeah|ok|okay|sure|do it|go ahead|continue|proceed)$", re.IGNORECASE)
-_FILE_NAME_RE = re.compile(r"\b([a-zA-Z0-9_.-]+\.[a-zA-Z0-9]+)\b")
-_FOLDER_NAME_RE = re.compile(r"(?:find|locate)\s+(?:the\s+)?([a-zA-Z0-9_. -]{2,80}?)\s+(?:folder|directory)\b", re.IGNORECASE)
 _DISCORD_DM_HANDLE_TIMEOUT_SECONDS = 90.0
 _DISCORD_DM_MAX_BACKLOG_PER_POLL = 20
 
@@ -114,6 +94,10 @@ def _sanitize_user_facing_response(text: str) -> str:
     )
     cleaned = re.sub(r"(?im)^\s*-\s*user\s*:\s*.*$", "", cleaned)
     cleaned = re.sub(r"(?im)^\s*user\s*:\s*.*$", "", cleaned)
+    cleaned = re.sub(r"(?im)^\s*```[a-zA-Z0-9_-]*\s*$", "", cleaned)
+    cleaned = re.sub(r"(?is)```\s*```", "", cleaned)
+    cleaned = re.sub(r"(?im)^\s*overall\s+task\s*:\s*.*$", "", cleaned)
+    cleaned = re.sub(r"(?im)^\s*you\s+are\s+executing\s+a\s+multi-step\s+task.*$", "", cleaned)
     cleaned = re.sub(r"(?is)<br\s*/?>", "\n", cleaned)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     return cleaned.strip()
@@ -256,26 +240,10 @@ class DiscordDMBridge:
         if not text:
             return False
         lower = text.lower()
-        # Only route explicit /task, /agentic, or strong task-like intent (web fetch, research).
-        # Do NOT auto-route simple chat questions via _should_use_agentic_mode — they belong in direct mode.
+        # Only explicit loop commands enter the agentic path. Normal language
+        # belongs to direct model chat so conversation is not hard-coded.
         if any(lower.startswith(p) for p in ("/task", "/agentic", "/research", "/ralph")):
             return True
-        if _DM_TASK_INTENT_RE.search(text):
-            return True
-        if _DM_FILESYSTEM_INTENT_RE.search(text):
-            # Avoid false positives like URLs that include words such as
-            # "desktop" in a repo/path segment (e.g. agent-desktop).
-            if re.search(r"https?://", text, re.IGNORECASE):
-                text_without_urls = re.sub(r"https?://\S+", " ", lower, flags=re.IGNORECASE)
-                desktop_question = re.search(
-                    r"\b(?:what|show|see|check|open|list)\b.*\bdesktop\b|\bon\s+my\s+desktop\b|\bmy\s+desktop\b",
-                    text_without_urls,
-                    re.IGNORECASE,
-                )
-                if desktop_question:
-                    return True
-            else:
-                return True
         if _DM_SHORT_ACK_RE.match(text):
             history = list(self._dm_context.get(user_key, []))
             recent = "\n".join(history[-4:]).lower()
@@ -286,6 +254,11 @@ class DiscordDMBridge:
     async def _handle_command(self, user_key: str, content: str) -> str | None:
         text = (content or "").strip()
         lower = text.lower()
+
+        if lower in {"/task", "/agentic", "/research", "/ralph"} or any(
+            lower.startswith(p) for p in ("/task ", "/agentic ", "/research ", "/ralph ")
+        ):
+            return None
 
         if lower == "/reset":
             self._dm_context[user_key].clear()
@@ -344,7 +317,7 @@ class DiscordDMBridge:
 
         # Prevent typos like /ststus from being routed into agentic/direct tasks.
         if lower.startswith("/"):
-            return "Unknown command. Try /status, /reset, /research <topic>, or /task <goal>."
+            return "Unknown command. Try /status, /reset, /restart, /task <goal>, /research <topic>, or /ralph <goal>."
 
         return None
 
@@ -580,23 +553,6 @@ class DiscordDMBridge:
                     logger.error("Failed to post Discord DM command response: %s", send_result.error)
             return
 
-        deterministic = await _try_handle_simple_file_task(content)
-        if deterministic is not None:
-            response = self._clean_discord_response(deterministic)
-            if not response:
-                response = "I couldn't generate a useful response. Please try again."
-            self._dm_context[user_key].append(f"User: {raw_content}")
-            self._dm_context[user_key].append(f"SlothBrain: {response}")
-            discord_tool = self._registry.get("discord")
-            if discord_tool:
-                send_result = await discord_tool.execute(action="send", prefer_dm=True, content=response[:1900])
-                if send_result.ok:
-                    logger.info("Discord DM deterministic response sent")
-                else:
-                    logger.error("Failed to post Discord DM deterministic response: %s", send_result.error)
-            _schedule_deterministic_task_persist(content, deterministic)
-            return
-
         is_task_message = self._should_route_to_agentic(user_key=user_key, content=content)
         response = ""
 
@@ -610,27 +566,22 @@ class DiscordDMBridge:
                 if not task_message:
                     response = "Please provide a task after /task, for example: /task summarize https://example.com"
                 else:
-                    deterministic = await _try_handle_simple_file_task(task_message)
-                    if deterministic is not None:
-                        _schedule_deterministic_task_persist(task_message, deterministic)
-                        response = deterministic
-                    else:
-                        # Run in background so the listener loop stays responsive (e.g. /status).
-                        await self._run_bg_task(user_key=user_key, label=task_message, coro=self._run_agentic_task(user_key, task_message, raw_content))
-                        discord_tool = self._registry.get("discord")
-                        if discord_tool:
-                            try:
-                                await discord_tool.execute(
-                                    action="send",
-                                    prefer_dm=True,
-                                    content=(
-                                        f"Started task: {task_message}\n"
-                                        "Use /status to check progress."
-                                    ),
-                                )
-                            except Exception:
-                                pass
-                        return
+                    # Run in background so the listener loop stays responsive (e.g. /status).
+                    await self._run_bg_task(user_key=user_key, label=task_message, coro=self._run_agentic_task(user_key, task_message, raw_content))
+                    discord_tool = self._registry.get("discord")
+                    if discord_tool:
+                        try:
+                            await discord_tool.execute(
+                                action="send",
+                                prefer_dm=True,
+                                content=(
+                                    f"Started task: {task_message}\n"
+                                    "Use /status to check progress."
+                                ),
+                            )
+                        except Exception:
+                            pass
+                    return
             else:
                 # Direct chat — also run in background so listener isn't blocked.
                 await self._run_bg_task(user_key=user_key, label=content[:60], coro=self._run_direct_task(user_key, content, raw_content))
@@ -1051,8 +1002,61 @@ def _register_tools(
     registry.register(AgentListTool(registry=agent_registry))
     registry.register(SessionTool(registry=agent_registry))
 
+    async def _trigger_scheduled_task(task: str) -> None:
+        """Run a persisted scheduler job through the full agentic loop."""
+        from backend.agents.agentic_loop import AgenticLoop
+
+        task_message = _strip_agentic_prefix((task or "").strip())
+        if not task_message:
+            logger.warning("Scheduler skipped empty task")
+            return
+
+        used_tools: list[str] = []
+
+        async def _capture_progress(event: dict | None) -> None:
+            if not isinstance(event, dict) or event.get("type") != "tool_call":
+                return
+            name = str(event.get("tool") or "").strip()
+            if name:
+                used_tools.append(name)
+
+        try:
+            async with _inference_lock:
+                loop = AgenticLoop(
+                    main_agent=main_agent,
+                    max_steps=10,
+                    checkpoint_manager=checkpoint_manager,
+                    supervisor=safety_supervisor,
+                    debug_options=AgenticDebugOptions(),
+                )
+                result = await loop.run(task=task_message, on_progress=_capture_progress)
+            if isinstance(result, dict):
+                response = DiscordDMBridge._extract_agentic_response(result)
+            else:
+                response = str(result or "Scheduled task complete.")
+        except Exception as exc:
+            response = f"[Scheduled task error: {exc.__class__.__name__}: {str(exc)[:80]}]"
+            logger.error("Scheduled task failed: %s", exc, exc_info=True)
+
+        response = _sanitize_user_facing_response(response) or "Scheduled task completed, but no useful response was generated."
+        response += DiscordDMBridge._render_tools_used_block(used_tools)
+
+        discord_tool = registry.get("discord")
+        if discord_tool is not None:
+            try:
+                await discord_tool.execute(
+                    action="send",
+                    prefer_dm=True,
+                    content=f"Scheduled task complete:\n{response}"[:1900],
+                )
+            except Exception as exc:
+                logger.warning("Failed to send scheduled task result to Discord: %s", exc.__class__.__name__)
+
     # Scheduler
-    sched = SchedulerTool()
+    sched = SchedulerTool(
+        on_trigger=_trigger_scheduled_task,
+        default_timezone=getattr(config, "scheduler_timezone", "America/New_York"),
+    )
     registry.register(sched)
     sched.start()
 
@@ -1193,6 +1197,7 @@ class SettingsUpdate(BaseModel):
     semantic_tool_routing_top_k: Optional[int] = None
     semantic_tool_routing_min_similarity: Optional[float] = None
     semantic_tool_routing_critical_tools: Optional[list[str]] = None
+    scheduler_timezone: Optional[str] = None
     debug_loop_enabled: Optional[bool] = None
     debug_loop_llm_only: Optional[bool] = None
     debug_loop_planning_enabled: Optional[bool] = None
@@ -1233,7 +1238,7 @@ class AgentChatRequest(BaseModel):
 
 
 class SpawnRequest(BaseModel):
-    context_size: Optional[int] = None   # override preset default
+    context_size: Optional[int] = None   # deprecated (ignored; context comes from llama.cpp slot split)
     max_tokens: Optional[int] = None     # override preset default
     task_description: str = ""
 
@@ -1274,6 +1279,27 @@ _MAX_AGENTIC_STEPS = 20
 def _clamp_steps(n: int) -> int:
     """Clamp a requested step count to the valid API range."""
     return min(max(n, _MIN_AGENTIC_STEPS), _MAX_AGENTIC_STEPS)
+
+
+async def _choose_idle_parallel_slot_id() -> int | None:
+    """Return an idle non-main slot ID, or None if no parallel slot is available."""
+    try:
+        slots = await llama_client.get_slots()
+    except Exception:
+        return None
+
+    candidates: list[int] = []
+    for slot in slots:
+        if not isinstance(slot, dict):
+            continue
+        sid = int(slot.get("id", -1))
+        if sid <= 0:
+            continue
+        next_token = slot.get("next_token")
+        has_next = bool(next_token.get("has_next_token")) if isinstance(next_token, dict) else False
+        if not has_next:
+            candidates.append(sid)
+    return min(candidates) if candidates else None
 
 
 def _raise_service_unavailable(exc: Exception, context: str) -> None:
@@ -1332,6 +1358,8 @@ def _strip_agentic_prefix(text: str) -> str:
     For /research and /ralph the inner task is framed with a directive.
     """
     lower = text.lower()
+    if lower in {"/task", "/agentic", "/research", "/ralph"}:
+        return ""
     for prefix in ("/task ", "/agentic "):
         if lower.startswith(prefix):
             return text[len(prefix):].strip()
@@ -1455,350 +1483,6 @@ def _build_debug_options(debug: "Optional[AgenticDebugRequest]") -> AgenticDebug
     return defaults
 
 
-async def _try_handle_simple_file_task(task_message: str) -> str | None:
-    """Handle explicit local system/file tasks deterministically."""
-    if tool_registry is None:
-        return None
-    file_tool = tool_registry.get("file")
-    shell_tool = tool_registry.get("shell")
-    if file_tool is None:
-        return None
-
-    text = (task_message or "").strip()
-    lower = text.lower()
-
-    def _extract_target_folder_name(raw_text: str) -> str:
-        match = _FOLDER_NAME_RE.search(raw_text or "")
-        if not match:
-            return ""
-        candidate = " ".join(match.group(1).split()).strip(" .")
-        lowered = candidate.lower()
-        if lowered in {"github", "my github", "the github"}:
-            return ""
-        return candidate
-
-    async def _run_shell(command: str) -> tuple[bool, str]:
-        if shell_tool is None:
-            return False, ""
-        result = await shell_tool.execute(command=command, timeout=30)
-        if not result.ok or not isinstance(result.output, dict):
-            return False, result.error or ""
-        stdout = str(result.output.get("stdout", "")).strip()
-        stderr = str(result.output.get("stderr", "")).strip()
-        return True, (stdout or stderr)
-
-    if "user name" in lower or "username" in lower or "who am i" in lower:
-        ok, output = await _run_shell("whoami")
-        if ok and output:
-            return f"Your computer username is: {output}"
-        return "I couldn't determine your username from the local shell."
-
-    if "computer name" in lower or "computers name" in lower or "hostname" in lower or "pc name" in lower:
-        ok, output = await _run_shell("hostname")
-        if ok and output:
-            return f"Your computer name is: {output}"
-        ok2, output2 = await _run_shell('cmd /c echo %COMPUTERNAME%')
-        if ok2 and output2:
-            return f"Your computer name is: {output2}"
-        return "I couldn't determine your computer name from the local shell."
-
-    if "check my documents" in lower or "check documents" in lower:
-        ok, output = await _run_shell('cmd /c dir /b "%USERPROFILE%\\Documents"')
-        if ok and output:
-            items = [line.strip() for line in output.splitlines() if line.strip()][:30]
-            if items:
-                return "Documents contains: " + ", ".join(items)
-        return "I couldn't list your Documents directory via command line."
-
-    if (
-        ("github directory" in lower or "github folder" in lower or "github" in lower)
-        and ("find" in lower or "locate" in lower or "where" in lower or "within" in lower)
-    ):
-        ok, output = await _run_shell(
-            'cmd /c if exist "%USERPROFILE%\\Documents\\GitHub" (echo %USERPROFILE%\\Documents\\GitHub) else if exist "%USERPROFILE%\\GitHub" (echo %USERPROFILE%\\GitHub) else if exist "%USERPROFILE%\\github" (echo %USERPROFILE%\\github) else echo NOT_FOUND'
-        )
-        if ok and output and "NOT_FOUND" not in output:
-            github_path = output.splitlines()[0].strip()
-            target_folder = _extract_target_folder_name(text)
-
-            if target_folder:
-                ok_target, out_target = await _run_shell(
-                    f'cmd /c if exist "{github_path}\\{target_folder}" (echo {github_path}\\{target_folder}) else echo NOT_FOUND'
-                )
-                if ok_target and out_target and "NOT_FOUND" not in out_target:
-                    folder_path = out_target.splitlines()[0].strip()
-                    return f"Yes. I found the {target_folder} folder at: {folder_path}"
-
-                ok_case, out_case = await _run_shell(
-                    f'powershell -NoProfile -Command "Get-ChildItem -Path ''{github_path}'' -Directory | Where-Object {{$_.Name -ieq ''{target_folder}''}} | Select-Object -First 1 -ExpandProperty FullName"'
-                )
-                if ok_case and out_case:
-                    folder_path = out_case.splitlines()[0].strip()
-                    if folder_path:
-                        return f"Yes. I found the {target_folder} folder at: {folder_path}"
-
-            ok2, output2 = await _run_shell(f'cmd /c dir /b /ad "{github_path}"')
-            if ok2 and output2:
-                projects = [line.strip() for line in output2.splitlines() if line.strip()][:50]
-                if projects:
-                    return f"GitHub directory: {github_path}\nProjects: " + ", ".join(projects)
-            return f"GitHub directory found at {github_path}, but I could not list project folders."
-
-        result = await file_tool.execute(action="list", path=".")
-        if result.ok and isinstance(result.output, dict):
-            entries = result.output.get("entries", [])
-            project_names = [e.get("name") for e in entries if isinstance(e, dict) and e.get("type") == "dir"]
-            if project_names:
-                return "GitHub directory projects: " + ", ".join(project_names)
-        return "I couldn't locate your GitHub directory via command line or workspace listing."
-
-    filename_match = _FILE_NAME_RE.search(text)
-    if not filename_match:
-        return None
-    filename = filename_match.group(1)
-    path = f"SlothBrain/{filename}"
-
-    if "create a file" in lower or "write a file" in lower:
-        content_match = re.search(r"with the text\s+(.+)$", text, re.IGNORECASE)
-        content = content_match.group(1).strip() if content_match else ""
-        result = await file_tool.execute(action="write", path=path, content=content)
-        if not result.ok:
-            return result.error or f"Failed to create {filename}."
-        return f"Created {filename} in the SlothBrain project directory."
-
-    if lower.startswith("read ") or "read the file" in lower:
-        result = await file_tool.execute(action="read", path=path)
-        if not result.ok:
-            return result.error or f"Failed to read {filename}."
-        return str(result.output)
-
-    if "append" in lower or "edit" in lower:
-        content_match = re.search(r"(?:saying|with the text)\s+(.+)$", text, re.IGNORECASE)
-        content = content_match.group(1).strip() if content_match else ""
-        if content and not content.startswith("\n"):
-            content = "\n" + content
-        result = await file_tool.execute(action="append", path=path, content=content)
-        if not result.ok:
-            return result.error or f"Failed to append to {filename}."
-        return f"Appended content to {filename}."
-
-    return None
-
-
-def _extract_html_summary_fields(html: str) -> tuple[str, str]:
-    """Extract lightweight title/description fields from an HTML document."""
-    raw = html or ""
-    title_match = re.search(r"<title[^>]*>(.*?)</title>", raw, re.IGNORECASE | re.DOTALL)
-    title = re.sub(r"\s+", " ", title_match.group(1)).strip() if title_match else ""
-
-    meta_desc_match = re.search(
-        r'<meta[^>]+name=["\']description["\'][^>]+content=["\'](.*?)["\']',
-        raw,
-        re.IGNORECASE | re.DOTALL,
-    )
-    if not meta_desc_match:
-        meta_desc_match = re.search(
-            r'<meta[^>]+content=["\'](.*?)["\'][^>]+name=["\']description["\']',
-            raw,
-            re.IGNORECASE | re.DOTALL,
-        )
-    description = re.sub(r"\s+", " ", meta_desc_match.group(1)).strip() if meta_desc_match else ""
-    return title, description
-
-
-def _try_handle_simple_smalltalk(task_message: str) -> str | None:
-    """Fast deterministic replies for tiny greetings to avoid model round-trips."""
-    text = (task_message or "").strip().lower()
-    if not text:
-        return None
-    if text in {"hi", "hello", "hey", "yo", "hiya", "sup", "what's up", "whats up"}:
-        return "Hi! How can I help you today?"
-    return None
-
-
-async def _try_handle_simple_web_task(task_message: str) -> str | None:
-    """Handle explicit URL fetch + short summary prompts deterministically."""
-    if tool_registry is None:
-        return None
-    web_tool = tool_registry.get("web_fetch")
-    if web_tool is None:
-        return None
-
-    text = (task_message or "").strip()
-    lower = text.lower()
-    url_match = re.search(r"https?://[^\s)\]>\"']+", text, re.IGNORECASE)
-    url_question = any(
-        k in lower
-        for k in (
-            "what's up with this",
-            "whats up with this",
-            "what is this",
-            "what's this",
-            "explain this",
-            "tell me about this",
-        )
-    )
-    if not any(k in lower for k in ("visit ", "summarize", "what does", "what is", "tell me what", "tell me about")):
-        if not (url_match and url_question):
-            return None
-
-    if url_match:
-        url = url_match.group(0)
-    elif "bytebrew" in lower:
-        # Common shorthand prompt: "tell me about bytebrew".
-        url = "https://bytebrew.cc"
-    else:
-        return None
-
-    result = await web_tool.execute(url=url, method="GET", timeout=20)
-    if not result.ok:
-        err = result.error or "web fetch failed"
-        return f"I could not fetch {url}: {err}"
-
-    body = result.output
-    if not isinstance(body, str):
-        body = str(body)
-
-    title, description = _extract_html_summary_fields(body)
-    domain = urllib.parse.urlparse(url).netloc or url
-    sentence_one = f"I fetched {url} and found the page title '{title}' on {domain}." if title else f"I fetched {url} on {domain}."
-    if description:
-        sentence_two = f"Page description: {description}"
-    else:
-        cleaned = re.sub(r"<script[\s\S]*?</script>", " ", body, flags=re.IGNORECASE)
-        cleaned = re.sub(r"<style[\s\S]*?</style>", " ", cleaned, flags=re.IGNORECASE)
-        cleaned = re.sub(r"<[^>]+>", " ", cleaned)
-        cleaned = re.sub(r"\s+", " ", cleaned).strip()
-        snippet = cleaned[:220].strip()
-        sentence_two = f"Visible page text starts with: {snippet}" if snippet else "The page did not expose a readable meta description."
-    return f"{sentence_one} {sentence_two}"
-
-
-async def _try_handle_simple_desktop_task(task_message: str) -> str | None:
-    """Handle plain 'what is on my desktop' requests deterministically."""
-    text = (task_message or "").strip()
-    lower = text.lower()
-    normalized = lower.replace("\u2019", "'").replace("`", "'")
-    normalized = re.sub(r"\s+", " ", normalized).strip()
-    intent_text = re.sub(r"https?://\S+", " ", normalized, flags=re.IGNORECASE)
-    intent_text = re.sub(r"\s+", " ", intent_text).strip()
-    desktop_phrases = (
-        "what's on my desktop",
-        "what is on my desktop",
-        "whats on my desktop",
-        "what do you see on my desktop",
-        "what can you see on my desktop",
-        "show me my desktop",
-        "what is on desktop",
-        "what's on desktop",
-    )
-    desktop_intent = any(p in intent_text for p in desktop_phrases)
-    if not desktop_intent and (
-        "desktop" in intent_text
-        and any(k in intent_text for k in ("what", "see", "show", "screen", "look"))
-    ):
-        desktop_intent = True
-    if not desktop_intent:
-        return None
-
-    if tool_registry is None:
-        return "I cannot inspect your desktop right now because tools are not initialized yet."
-    screenshot_tool = tool_registry.get("screenshot")
-    if screenshot_tool is None:
-        return "I cannot inspect your desktop right now because the screenshot tool is not available in this runtime."
-
-    capture = await screenshot_tool.execute(monitor=0, include_image=False)
-    if not capture.ok or not isinstance(capture.output, dict):
-        err = capture.error or "screenshot failed"
-        return f"I could not inspect your desktop: {err}"
-
-    state_text = str(capture.output.get("state_text") or "").strip()
-    if not state_text:
-        return "I captured the desktop but could not extract readable screen details."
-
-    lines = [ln.strip() for ln in state_text.splitlines() if ln.strip()]
-    preview = "\n".join(lines[:14])
-    return f"Here is what I can see on your desktop right now:\n{preview}"
-
-
-async def _try_handle_workspace_list_exists_task(task_message: str) -> str | None:
-    """Handle: list files in directory + confirm path exists."""
-    if tool_registry is None:
-        return None
-    file_tool = tool_registry.get("file")
-    shell_tool = tool_registry.get("shell")
-    if file_tool is None:
-        return None
-
-    text = (task_message or "").strip()
-    lower = text.lower()
-    strict_pattern = (
-        "list" in lower
-        and "files in" in lower
-        and "confirm whether" in lower
-        and "exists" in lower
-    )
-    casual_pattern = (
-        ("check files in" in lower or "list files in" in lower)
-        and "backend/agents" in lower.replace("\\", "/")
-    )
-    if not strict_pattern and not casual_pattern:
-        return None
-
-    list_match = re.search(r"list\s+three\s+files\s+in\s+([^\s,;:]+)", text, re.IGNORECASE)
-    exists_match = re.search(r"confirm\s+whether\s+([^\s,;:]+)\s+exists", text, re.IGNORECASE)
-    if list_match and exists_match:
-        list_path = list_match.group(1).strip().replace("\\", "/")
-        exists_path = exists_match.group(1).strip().replace("\\", "/")
-    else:
-        # Conversational fallback used in validation: "check files in backend/agents".
-        list_path = "backend/agents"
-        exists_path = "backend/agents/main_agent.py"
-
-    listed = await file_tool.execute(action="list", path=list_path)
-    exists = await file_tool.execute(action="exists", path=exists_path)
-    if not listed.ok or not exists.ok:
-        # FileTool is sandboxed to the configured workspace root. Fall back to
-        # shell for explicit repository-path checks like backend/agents.
-        if shell_tool is not None:
-            list_cmd = (
-                "powershell -NoProfile -Command "
-                f"\"$files = Get-ChildItem -Path '{list_path}' -File -ErrorAction SilentlyContinue | "
-                "Select-Object -First 3 -ExpandProperty Name; "
-                "if ($files) { $files -join ', ' } else { '' }\""
-            )
-            exists_cmd = (
-                "powershell -NoProfile -Command "
-                f"\"if (Test-Path '{exists_path}') {{ 'yes' }} else {{ 'no' }}\""
-            )
-            list_result = await shell_tool.execute(command=list_cmd, timeout=20)
-            exists_result = await shell_tool.execute(command=exists_cmd, timeout=20)
-            if list_result.ok and exists_result.ok and isinstance(list_result.output, dict) and isinstance(exists_result.output, dict):
-                list_stdout = str(list_result.output.get("stdout", "")).strip()
-                exists_stdout = str(exists_result.output.get("stdout", "")).strip().lower()
-                return (
-                    f"Three files in {list_path}: {list_stdout if list_stdout else '(none found)'}\n"
-                    f"{exists_path} exists: {'yes' if exists_stdout.startswith('yes') else 'no'}"
-                )
-        if not listed.ok:
-            return listed.error or f"Failed to list files in {list_path}."
-        return exists.error or f"Failed to check existence for {exists_path}."
-
-    entries = []
-    if isinstance(listed.output, dict):
-        rows = listed.output.get("entries", [])
-        entries = [str(r.get("name")) for r in rows if isinstance(r, dict) and r.get("type") == "file"]
-    first_three = entries[:3]
-    exists_value = False
-    if isinstance(exists.output, dict):
-        exists_value = bool(exists.output.get("exists"))
-
-    return (
-        f"Three files in {list_path}: {', '.join(first_three) if first_three else '(none found)'}\n"
-        f"{exists_path} exists: {'yes' if exists_value else 'no'}"
-    )
-
-
 async def _try_handle_simple_slash_command(task_message: str) -> str | None:
     """Handle basic slash commands deterministically without LLM dependence."""
     text = (task_message or "").strip()
@@ -1806,8 +1490,8 @@ async def _try_handle_simple_slash_command(task_message: str) -> str | None:
         return None
 
     command = text.split()[0].lower()
-    if command == "/research":
-        # Keep /research on the regular path so routing/debug options can apply.
+    if command in {"/task", "/agentic", "/research", "/ralph"}:
+        # Keep loop commands on the regular agentic path.
         return None
 
     if command == "/status":
@@ -1821,41 +1505,14 @@ async def _try_handle_simple_slash_command(task_message: str) -> str | None:
         cpu = stats.get("cpu_percent", "n/a") if isinstance(stats, dict) else "n/a"
         return f"System status: CPU={cpu}%, RAM={ram}MB, VRAM={vram}MB."
 
-    return f"Unknown command '{command}'. Try /status or /research <topic>."
-
-
-def _schedule_deterministic_task_persist(task_message: str, response: str) -> None:
-    """Persist deterministic task outcomes and trigger indexing for discovered roots."""
-    if memory is not None:
+    if command in {"/restart", "/restart_llama", "/restart-llama"}:
         try:
-            snippet = (response or "").strip()
-            asyncio.create_task(
-                memory.store(
-                    text=(
-                        "deterministic_task_result\n"
-                        f"task: {task_message}\n"
-                        f"result: {snippet}"
-                    ),
-                    metadata={
-                        "agent": "main",
-                        "mode": "deterministic_task",
-                        "task": (task_message or "")[:200],
-                    },
-                )
-            )
-        except Exception:
-            pass
+            await server_manager.restart(actor="api")
+            return "Requested llama.cpp restart successfully."
+        except Exception as exc:
+            return f"Failed to restart llama.cpp: {exc}"
 
-    github_match = re.search(r"GitHub directory:\s*(.+)", response or "")
-    if github_match and tool_registry is not None:
-        workspace_index = tool_registry.get("workspace_index")
-        github_dir = github_match.group(1).strip().splitlines()[0]
-        if workspace_index is not None and hasattr(workspace_index, "is_available"):
-            try:
-                if workspace_index.is_available() and hasattr(workspace_index, "trigger_auto_index"):
-                    workspace_index.trigger_auto_index(github_dir)
-            except Exception:
-                pass
+    return f"Unknown command '{command}'. Try /status, /restart, /task <goal>, /research <topic>, or /ralph <goal>."
 
 
 # ---------------------------------------------------------------------------
@@ -1932,25 +1589,6 @@ async def chat(http_request: Request, request: ChatRequest) -> dict:
     use_agentic = _should_use_agentic_mode(request.message, request.max_steps, request.mode)
 
     if not use_agentic:
-        deterministic = _try_handle_simple_smalltalk(request.message)
-        if deterministic is None:
-            deterministic = await _try_handle_workspace_list_exists_task(request.message)
-        if deterministic is None:
-            deterministic = await _try_handle_simple_desktop_task(request.message)
-        if deterministic is None:
-            deterministic = await _try_handle_simple_web_task(request.message)
-        if deterministic is not None:
-            _schedule_deterministic_task_persist(request.message, deterministic)
-            return {
-                "agent": "direct",
-                "response": _sanitize_user_facing_response(deterministic),
-                "handoff": False,
-                "result": {
-                    "mode": "direct",
-                    "completed": True,
-                    "deterministic": True,
-                },
-            }
         await _ensure_llama_available("Direct chat")
         async with _inference_lock:
             try:
@@ -1958,6 +1596,8 @@ async def chat(http_request: Request, request: ChatRequest) -> dict:
             except (httpx.HTTPError, RuntimeError, ValueError) as exc:
                 _raise_service_unavailable(exc, "Direct chat")
         response = _sanitize_user_facing_response(response)
+        if not response:
+            response = "I can do that. Please share the response text you'd like me to compact."
         return {
             "agent": "direct",
             "response": response,
@@ -1973,23 +1613,6 @@ async def chat(http_request: Request, request: ChatRequest) -> dict:
     await _ensure_llama_available("Agentic loop")
 
     task_message = _strip_agentic_prefix(request.message.strip())
-
-    simple_file_response = await _try_handle_simple_file_task(task_message)
-    if simple_file_response is not None:
-        _schedule_deterministic_task_persist(task_message, simple_file_response)
-        return {
-            "agent": "agentic",
-            "response": _sanitize_user_facing_response(simple_file_response),
-            "handoff": False,
-            "result": {
-                "task": task_message,
-                "completion_verified": True,
-                "summary": simple_file_response,
-                "steps": [],
-                "total_steps": 0,
-                "duration_seconds": 0.0,
-            },
-        }
 
     async with _inference_lock:
         loop = AgenticLoop(
@@ -2031,26 +1654,6 @@ async def direct_chat(request: ChatRequest) -> dict:
             },
         }
 
-    deterministic = _try_handle_simple_smalltalk(request.message)
-    if deterministic is None:
-        deterministic = await _try_handle_workspace_list_exists_task(request.message)
-    if deterministic is None:
-        deterministic = await _try_handle_simple_desktop_task(request.message)
-    if deterministic is None:
-        deterministic = await _try_handle_simple_web_task(request.message)
-    if deterministic is not None:
-        _schedule_deterministic_task_persist(request.message, deterministic)
-        return {
-            "agent": "direct",
-            "response": _sanitize_user_facing_response(deterministic),
-            "handoff": False,
-            "result": {
-                "mode": "direct",
-                "completed": True,
-                "deterministic": True,
-            },
-        }
-
     await _ensure_llama_available("Direct chat")
     async with _inference_lock:
         try:
@@ -2058,6 +1661,8 @@ async def direct_chat(request: ChatRequest) -> dict:
         except (httpx.HTTPError, RuntimeError, ValueError) as exc:
             _raise_service_unavailable(exc, "Direct chat")
     response = _sanitize_user_facing_response(response)
+    if not response:
+        response = "I can do that. Please share the response text you'd like me to compact."
     return {
         "agent": "direct",
         "response": response,
@@ -2249,15 +1854,19 @@ async def spawn_agent(preset_id: str, body: SpawnRequest = SpawnRequest()) -> di
             status_code=400,
             detail=f"Max running agents ({settings.max_slots}) reached.",
         )
-    if body.context_size and body.context_size > settings.max_context_size:
+    assigned_slot_id = await _choose_idle_parallel_slot_id()
+    if assigned_slot_id is None:
         raise HTTPException(
             status_code=400,
-            detail=f"context_size {body.context_size} exceeds hard limit {settings.max_context_size}",
+            detail=(
+                "No idle parallel slot is available for sub-agent spawn. "
+                "Main agent stays on slot 0; launch with -np >= 2 and ensure a non-main slot is idle."
+            ),
         )
     try:
         agent = agent_registry.spawn(
             preset_id,
-            context_size_override=body.context_size,
+            assigned_slot_id=assigned_slot_id,
             max_tokens_override=body.max_tokens,
             task_description=body.task_description,
         )

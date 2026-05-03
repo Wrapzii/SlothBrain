@@ -1,4 +1,4 @@
-"""Tests for sub-agent dynamic context allocation."""
+"""Tests for sub-agent slot assignment and runtime overrides."""
 from __future__ import annotations
 
 import pytest
@@ -32,10 +32,11 @@ def test_sub_agent_uses_preset_defaults():
     assert agent.max_tokens == 1024
 
 
-def test_sub_agent_context_override():
+def test_sub_agent_assigned_slot_and_max_tokens_override():
     client = _make_llama_client()
-    agent = SubAgent("agent-1", SAMPLE_PRESET, client, context_size_override=16384, max_tokens_override=2048)
-    assert agent.context_size == 16384
+    agent = SubAgent("agent-1", SAMPLE_PRESET, client, assigned_slot_id=2, max_tokens_override=2048)
+    assert agent.slot_id == 2
+    assert agent.context_size == 8192
     assert agent.max_tokens == 2048
 
 
@@ -72,11 +73,12 @@ async def test_registry_spawn_with_overrides():
     registry = AgentRegistry(preset_manager=pm, llama_client=client)
     agent = registry.spawn(
         "test-preset-id",
-        context_size_override=32768,
+        assigned_slot_id=3,
         max_tokens_override=4096,
         task_description="process long document",
     )
-    assert agent.context_size == 32768
+    assert agent.slot_id == 3
+    assert agent.context_size == 8192
     assert agent.max_tokens == 4096
     assert agent.task_description == "process long document"
 

@@ -35,9 +35,8 @@ class SubAgent:
         Shared LlamaClient (same llama-server as MainAgent).
     memory:
         Optional shared memory store.
-    context_size_override:
-        When the MainAgent delegates a task it can specify how many context
-        tokens this sub-agent should consume.  Overrides the preset default.
+    assigned_slot_id:
+        Concrete llama.cpp slot id allocated for this sub-agent.
     max_tokens_override:
         Maximum tokens in the response.  Overrides the preset default.
     task_description:
@@ -51,7 +50,7 @@ class SubAgent:
         preset: dict,
         llama_client: LlamaClient,
         memory: LanceDBMemory | None = None,
-        context_size_override: int | None = None,
+        assigned_slot_id: int = -1,
         max_tokens_override: int | None = None,
         task_description: str = "",
     ) -> None:
@@ -59,18 +58,21 @@ class SubAgent:
         self.preset_id: str = preset["id"]
         self.name: str = preset["name"]
         self.system_prompt: str = preset["system_prompt"]
-        # Runtime allocation – MainAgent can tune these per task
-        self.context_size: int = context_size_override or int(preset.get("context_size", 8192))
+        # Context window is controlled by llama.cpp launch params (-c / -np split).
+        # Do not allow runtime per-agent context overrides.
+        self.context_size: int = int(preset.get("context_size", 8192))
         self.temperature: float = float(preset.get("temperature", 0.7))
         self.max_tokens: int = max_tokens_override or int(preset.get("max_tokens", 1024))
+        self.slot_id: int = int(assigned_slot_id)
         self.task_description: str = task_description
         self._client = llama_client
         self._memory = memory
         if task_description:
             logger.info(
-                "SubAgent %s (%s) spawned: ctx=%d max_tok=%d task=%r",
+                "SubAgent %s (%s) spawned: slot=%d ctx=%d max_tok=%d task=%r",
                 self.agent_id[:8],
                 self.name,
+                self.slot_id,
                 self.context_size,
                 self.max_tokens,
                 task_description,
@@ -81,6 +83,7 @@ class SubAgent:
             "agent_id": self.agent_id,
             "preset_id": self.preset_id,
             "name": self.name,
+            "slot_id": self.slot_id,
             "context_size": self.context_size,
             "temperature": self.temperature,
             "max_tokens": self.max_tokens,
@@ -105,7 +108,12 @@ class SubAgent:
         memory_context = ""
         if self._memory is not None:
             try:
-                results = await self._memory.search(user_input, limit=3)
+                results = await self._memory.search_advanced(
+                    query=user_input,
+                    limit=3,
+                    metadata_filter={"kind": "turn"},
+                    candidate_pool=24,
+                )
                 if results:
                     snippets = "\n".join(f"- {r['text']}" for r in results)
                     memory_context = f"\n\nRelevant context:\n{snippets}"
@@ -131,10 +139,10 @@ class SubAgent:
                 f"{keep_user}"
             )
 
-        # slot_id=-1 → llama.cpp picks any available slot from its pool
+        # Sub-agents are pinned to an explicitly assigned non-main slot.
         response = await self._client.complete(
             prompt=full_prompt,
-            slot_id=-1,
+            slot_id=self.slot_id,
             max_tokens=effective_max_tokens,
             temperature=self.temperature,
         )
@@ -143,7 +151,7 @@ class SubAgent:
             try:
                 await self._memory.store(
                     text=f"user: {user_input}\nassistant: {response}",
-                    metadata={"agent": self.agent_id, "preset": self.preset_id},
+                    metadata={"agent": self.agent_id, "preset": self.preset_id, "mode": "sub_agent", "kind": "turn"},
                 )
             except Exception as exc:
                 logger.warning("SubAgent memory store failed: %s", exc.__class__.__name__)
