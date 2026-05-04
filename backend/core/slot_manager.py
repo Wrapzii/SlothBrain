@@ -53,6 +53,10 @@ class SlotManager:
         self._client = llama_client
         self._main_slot: int | None = None
         self._histories: dict[int, list[dict]] = {}
+        # Per-slot serialization lock. Even when API-level inference
+        # concurrency is >1, concurrent completions targeting the same slot
+        # must not overlap or the slot KV/cache state can be corrupted.
+        self._slot_locks: dict[int, asyncio.Lock] = {}
         self._slot_info_cache: dict | None = None
         self._slot_info_cache_ts: float = 0.0
         self._slot_info_cache_ttl_s: float = 2.0
@@ -90,6 +94,8 @@ class SlotManager:
         self._main_slot = resolved_slot
         if resolved_slot not in self._histories:
             self._histories[resolved_slot] = []
+        if resolved_slot not in self._slot_locks:
+            self._slot_locks[resolved_slot] = asyncio.Lock()
 
     async def get_slot_info(self) -> dict:
         now = time.monotonic()
@@ -122,31 +128,33 @@ class SlotManager:
     async def send_to_main(self, prompt: str, max_tokens: int = 2048) -> str:
         if self._main_slot is None:
             raise RuntimeError("Main slot not assigned")
-        response = await self._client.complete(
-            prompt=prompt,
-            slot_id=self._main_slot,
-            max_tokens=max_tokens,
-            stop=_STOP_SEQUENCES,
-        )
-        response = _sanitize_response(response)
-
-        # Some thinking/reasoning model outputs can be reduced to empty text
-        # after stop-sequence + sanitization trimming. Retry once with the
-        # same stop sequences so we do not fall back into unbounded generation
-        # on models that can emit long reasoning traces.
-        if not response:
-            retry = await self._client.complete(
+        slot_lock = self._slot_locks.setdefault(self._main_slot, asyncio.Lock())
+        async with slot_lock:
+            response = await self._client.complete(
                 prompt=prompt,
                 slot_id=self._main_slot,
                 max_tokens=max_tokens,
                 stop=_STOP_SEQUENCES,
             )
-            response = _sanitize_response(retry) or (retry or "").strip()
+            response = _sanitize_response(response)
 
-        self._histories.setdefault(self._main_slot, []).append(
-            {"role": "assistant", "content": response}
-        )
-        return response
+            # Some thinking/reasoning model outputs can be reduced to empty text
+            # after stop-sequence + sanitization trimming. Retry once with the
+            # same stop sequences so we do not fall back into unbounded generation
+            # on models that can emit long reasoning traces.
+            if not response:
+                retry = await self._client.complete(
+                    prompt=prompt,
+                    slot_id=self._main_slot,
+                    max_tokens=max_tokens,
+                    stop=_STOP_SEQUENCES,
+                )
+                response = _sanitize_response(retry) or (retry or "").strip()
+
+            self._histories.setdefault(self._main_slot, []).append(
+                {"role": "assistant", "content": response}
+            )
+            return response
 
     def get_history(self, slot_id: int) -> list[dict]:
         return self._histories.get(slot_id, [])

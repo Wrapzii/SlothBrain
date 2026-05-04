@@ -42,6 +42,13 @@ from backend.tools.registry import ToolRegistry
 logger = logging.getLogger(__name__)
 
 _DM_SHORT_ACK_RE = re.compile(r"^(?:yes|yep|yeah|ok|okay|sure|do it|go ahead|continue|proceed)$", re.IGNORECASE)
+_LOCAL_FILESYSTEM_ACTION_RE = re.compile(
+    r"\b(?:find|locate|list|show|check|open|create|make|build|write|edit|modify|delete|read)\b"
+    r".{0,80}\b(?:file|folder|directory|filesystem|workspace|github|documents|downloads|desktop|"
+    r"repo(?:sitory)?|project(?:s)?)\b|"
+    r"\b(?:github|documents|downloads|desktop)\b.{0,80}\b(?:folder|directory|projects?|files?)\b",
+    re.IGNORECASE,
+)
 _DISCORD_DM_HANDLE_TIMEOUT_SECONDS = 90.0
 _DISCORD_DM_MAX_BACKLOG_PER_POLL = 20
 
@@ -101,6 +108,65 @@ def _sanitize_user_facing_response(text: str) -> str:
     cleaned = re.sub(r"(?is)<br\s*/?>", "\n", cleaned)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     return cleaned.strip()
+
+
+def _htmlish_to_plain_summary(text: str) -> str:
+    raw = (text or "").replace("\\r", "\n").replace("\\n", "\n")
+    if not raw.strip():
+        return ""
+
+    title = ""
+    title_match = re.search(r"<title[^>]*>(.*?)</title>", raw, re.IGNORECASE | re.DOTALL)
+    if title_match:
+        title = re.sub(r"\s+", " ", title_match.group(1)).strip()
+
+    desc = ""
+    desc_match = re.search(
+        r'<meta[^>]+name=["\']description["\'][^>]+content=["\'](.*?)["\']',
+        raw,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if not desc_match:
+        desc_match = re.search(
+            r'<meta[^>]+content=["\'](.*?)["\'][^>]+name=["\']description["\']',
+            raw,
+            re.IGNORECASE | re.DOTALL,
+        )
+    if desc_match:
+        desc = re.sub(r"\s+", " ", desc_match.group(1)).strip()
+
+    cleaned = re.sub(r"(?is)<script.*?</script>|<style.*?</style>", " ", raw)
+    cleaned = re.sub(r"(?is)<!--.*?-->", " ", cleaned)
+    cleaned = re.sub(r"<[^>]+>", " ", cleaned)
+    cleaned = re.sub(r"&nbsp;", " ", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"&amp;", "&", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"&lt;", "<", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"&gt;", ">", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"&quot;", '"', cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+
+    parts: list[str] = []
+    if title:
+        parts.append(f"Page title: {title}.")
+    if desc:
+        parts.append(desc)
+    elif cleaned:
+        parts.append(cleaned[:800].strip())
+    return " ".join(parts).strip()
+
+
+def _best_user_facing_response(text: str) -> str:
+    cleaned = _sanitize_user_facing_response(text)
+    html_summary = _htmlish_to_plain_summary(text)
+    if html_summary and (not cleaned or "<" in cleaned or ">" in cleaned):
+        return html_summary
+
+    if cleaned:
+        return cleaned
+
+    fallback = re.sub(r"(?is)<[^>]+>", " ", text or "")
+    fallback = re.sub(r"\s+", " ", fallback).strip()
+    return fallback
 
 
 class DiscordDMBridge:
@@ -170,7 +236,7 @@ class DiscordDMBridge:
     @staticmethod
     def _clean_discord_response(text: str) -> str:
         """Strip protocol/HTML residue from model output before posting to Discord."""
-        return _sanitize_user_facing_response(text)
+        return _best_user_facing_response(text)
 
     @staticmethod
     def _render_tools_used_block(tools_used: list[str]) -> str:
@@ -197,12 +263,14 @@ class DiscordDMBridge:
     _META_COMMENTARY_RE = re.compile(
         r"^(?:"
         r"based on (?:the )?(?:research|information|data|findings|results|previous|prior|above)"
+        r"|based on the tool result\(s\) above"
         r"|i will now (?:compile|synthesize|summarize|gather|proceed|write|create|provide|present)"
         r"|i(?:'ll| will) (?:now )?(?:compile|synthesize|summarize|gather|proceed)"
         r"|since (?:no new|the) (?:data|information|research)"
         r"|having (?:gathered|completed|reviewed|researched|analyzed)"
         r"|now (?:that|i(?:'ll| will))\b"
         r"|let me (?:compile|synthesize|summarize|now)"
+        r"|extract and cite what the tool returned"
         r")",
         re.IGNORECASE,
     )
@@ -243,6 +311,8 @@ class DiscordDMBridge:
         # Only explicit loop commands enter the agentic path. Normal language
         # belongs to direct model chat so conversation is not hard-coded.
         if any(lower.startswith(p) for p in ("/task", "/agentic", "/research", "/ralph")):
+            return True
+        if _LOCAL_FILESYSTEM_ACTION_RE.search(text):
             return True
         if _DM_SHORT_ACK_RE.match(text):
             history = list(self._dm_context.get(user_key, []))
@@ -566,6 +636,7 @@ class DiscordDMBridge:
                 if not task_message:
                     response = "Please provide a task after /task, for example: /task summarize https://example.com"
                 else:
+                    self._dm_context[user_key].append(f"User: {raw_content}")
                     # Run in background so the listener loop stays responsive (e.g. /status).
                     await self._run_bg_task(user_key=user_key, label=task_message, coro=self._run_agentic_task(user_key, task_message, raw_content))
                     discord_tool = self._registry.get("discord")
@@ -584,6 +655,7 @@ class DiscordDMBridge:
                     return
             else:
                 # Direct chat — also run in background so listener isn't blocked.
+                self._dm_context[user_key].append(f"User: {raw_content}")
                 await self._run_bg_task(user_key=user_key, label=content[:60], coro=self._run_direct_task(user_key, content, raw_content))
                 return
         except Exception as exc:
@@ -649,6 +721,13 @@ class DiscordDMBridge:
             if lower_original.startswith("/research "):
                 debug_options.allowed_tools = ["web_search", "web_fetch"]
                 debug_options.semantic_routing_enabled = True
+            elif re.search(
+                r"\b(file|folder|directory|filesystem|local|workspace|github|documents|downloads|desktop|repo(?:sitory)?|project(?:s)?)\b",
+                task_message,
+                re.IGNORECASE,
+            ):
+                debug_options.allowed_tools = ["file", "shell", "patch", "diff", "process"]
+                debug_options.semantic_routing_enabled = False
 
             async with _inference_lock:
                 loop = AgenticLoop(
@@ -676,7 +755,6 @@ class DiscordDMBridge:
 
         response = self._clean_discord_response(response) or "I couldn't generate a useful response."
         response += self._render_tools_used_block(used_tools)
-        self._dm_context[user_key].append(f"User: {original_content}")
         self._dm_context[user_key].append(f"SlothBrain: {response}")
         await self._send_to_discord(response)
 
@@ -699,7 +777,6 @@ class DiscordDMBridge:
             logger.error("Discord direct task failed: %s", exc)
 
         response = self._clean_discord_response(response) or "I couldn't generate a useful response."
-        self._dm_context[user_key].append(f"User: {original_content}")
         self._dm_context[user_key].append(f"SlothBrain: {response}")
         await self._send_to_discord(response)
 
@@ -911,6 +988,7 @@ def _register_tools(
 ) -> None:
     """Construct and register all built-in tools into *registry*."""
     from backend.tools.impl.ui_tool import UITool
+    from backend.tools.impl.screenshot_tool import ScreenshotTool
     from backend.tools.impl.image_analysis_tool import ImageAnalysisTool
     from backend.tools.impl.web_fetch_tool import WebFetchTool
     from backend.tools.impl.web_search_tool import WebSearchTool
@@ -930,25 +1008,29 @@ def _register_tools(
     from backend.tools.impl.workspace_index_tool import WorkspaceIndexTool
     from backend.tools.plugin_loader import load_plugins
 
-    # Vision / desktop
+    # Vision / desktop. Image analysis is available even when desktop input
+    # tools are disabled, so callers can pass explicit image_b64 payloads.
+    desktop_controller = None
     if getattr(config, "desktop_tools_enabled", True):
         try:
             from backend.vision.controller import DesktopController
-            controller = DesktopController()
-            registry.register(UITool(controller=controller))
-            registry.register(
-                ImageAnalysisTool(
-                    llama_client=llama_client,
-                    controller=controller,
-                    backend=getattr(config, "image_analysis_backend", "cpu_ocr"),
-                    llama_slot_id=int(getattr(config, "image_analysis_llama_slot_id", 0)),
-                    cpu_max_text_chars=int(getattr(config, "image_analysis_cpu_max_text_chars", 4000)),
-                )
-            )
+            desktop_controller = DesktopController()
+            registry.register(UITool(controller=desktop_controller))
+            registry.register(ScreenshotTool(controller=desktop_controller))
         except Exception as exc:
             logger.warning("Desktop tools unavailable: %s", exc)
     else:
         logger.info("Desktop tools disabled by configuration")
+
+    registry.register(
+        ImageAnalysisTool(
+            llama_client=llama_client,
+            controller=desktop_controller,
+            backend=getattr(config, "image_analysis_backend", "auto"),
+            llama_slot_id=int(getattr(config, "image_analysis_llama_slot_id", 0)),
+            cpu_max_text_chars=int(getattr(config, "image_analysis_cpu_max_text_chars", 4000)),
+        )
+    )
 
     # Web
     registry.register(WebFetchTool())
@@ -1456,6 +1538,9 @@ def _should_use_agentic_mode(message: str, max_steps: int, mode: str) -> bool:
     if any(lower.startswith(p) for p in _AGENTIC_COMMAND_PREFIXES):
         return True
 
+    if _LOCAL_FILESYSTEM_ACTION_RE.search(msg):
+        return True
+
     # Otherwise default to direct chat for quick responsiveness. Natural-language
     # task detection for Discord is handled by the DM bridge separately.
     return False
@@ -1481,6 +1566,7 @@ def _build_debug_options(debug: "Optional[AgenticDebugRequest]") -> AgenticDebug
     for key, value in payload.items():
         setattr(defaults, key, value)
     return defaults
+
 
 
 async def _try_handle_simple_slash_command(task_message: str) -> str | None:
@@ -1615,12 +1701,20 @@ async def chat(http_request: Request, request: ChatRequest) -> dict:
     task_message = _strip_agentic_prefix(request.message.strip())
 
     async with _inference_lock:
+        debug_options = _build_debug_options(request.debug)
+        if re.search(
+            r"\b(file|folder|directory|filesystem|local|workspace|github|documents|downloads|desktop|repo(?:sitory)?|project(?:s)?)\b",
+            task_message,
+            re.IGNORECASE,
+        ):
+            debug_options.allowed_tools = ["file", "shell", "patch", "diff", "process"]
+            debug_options.semantic_routing_enabled = False
         loop = AgenticLoop(
             main_agent=main_agent,
             max_steps=_clamp_steps(request.max_steps),
             checkpoint_manager=checkpoint_manager,
             supervisor=safety_supervisor,
-            debug_options=_build_debug_options(request.debug),
+            debug_options=debug_options,
         )
         try:
             result = await _run_agentic_with_cancel(
@@ -1687,12 +1781,20 @@ async def agentic_chat(http_request: Request, request: AgenticRequest) -> dict:
     await _ensure_llama_available("Agentic loop")
 
     async with _inference_lock:
+        debug_options = _build_debug_options(request.debug)
+        if re.search(
+            r"\b(file|folder|directory|filesystem|local|workspace|github|documents|downloads|desktop|repo(?:sitory)?|project(?:s)?)\b",
+            request.task,
+            re.IGNORECASE,
+        ):
+            debug_options.allowed_tools = ["file", "shell", "patch", "diff", "process"]
+            debug_options.semantic_routing_enabled = False
         loop = AgenticLoop(
             main_agent=main_agent,
             max_steps=_clamp_steps(request.max_steps),
             checkpoint_manager=checkpoint_manager,
             supervisor=safety_supervisor,
-            debug_options=_build_debug_options(request.debug),
+            debug_options=debug_options,
         )
         try:
             result = await _run_agentic_with_cancel(
@@ -2231,11 +2333,34 @@ async def vision_status() -> dict:
     try:
         dc = _get_desktop_controller()
         capabilities = dc.capabilities()
-        capabilities["mmproj_configured"] = False
-        capabilities["notes"] = [
-            "Automated vision_run currently requires OCR-readable screen text.",
-            "True multimodal image-to-model support is not wired into this codebase yet.",
+        llama_props: dict[str, Any] = {}
+        llama_error = ""
+        try:
+            llama_props = await llama_client.get_props()
+        except Exception as exc:
+            llama_error = str(exc)
+
+        modalities = llama_props.get("modalities") if isinstance(llama_props, dict) else {}
+        llama_vision = bool(isinstance(modalities, dict) and modalities.get("vision"))
+        capabilities["multimodal_available"] = llama_vision
+        capabilities["mmproj_configured"] = llama_vision
+        capabilities["llama_model_name"] = llama_props.get("model_name", "") if llama_props else ""
+        capabilities["llama_model_path"] = llama_props.get("model_path", "") if llama_props else ""
+        capabilities["llama_modalities"] = modalities if isinstance(modalities, dict) else {}
+        capabilities["image_analysis_backend"] = getattr(settings, "image_analysis_backend", "auto")
+        capabilities["vision_run_supported"] = bool(
+            capabilities.get("ocr_available") or llama_vision
+        )
+        notes = [
+            "OCR/grid desktop control is available when OCR is installed.",
+            "llama.cpp multimodal image analysis is available when /props reports modalities.vision=true.",
         ]
+        if not llama_vision:
+            notes.append(
+                "llama.cpp did not report active vision support"
+                + (f": {llama_error}" if llama_error else ".")
+            )
+        capabilities["notes"] = notes
         return capabilities
     except Exception as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
@@ -2248,6 +2373,34 @@ class VisionActionRequest(BaseModel):
 class VisionRunRequest(BaseModel):
     task: str
     max_steps: int = 20
+
+
+async def _multimodal_screen_summary(screen: dict) -> str:
+    """Return a concise llama.cpp vision summary for a captured screen."""
+    image_b64 = str(screen.get("annotated_png_b64") or "")
+    if not image_b64:
+        return ""
+    try:
+        props = await llama_client.get_props()
+    except Exception:
+        return ""
+    modalities = props.get("modalities") if isinstance(props, dict) else {}
+    if not (isinstance(modalities, dict) and modalities.get("vision")):
+        return ""
+    try:
+        return await llama_client.complete_with_image(
+            prompt=(
+                "This is an annotated desktop screenshot with grid labels. "
+                "Describe the visible UI, active app/window, readable text, "
+                "and any likely clickable controls. Keep it concise."
+            ),
+            image_b64=image_b64,
+            max_tokens=512,
+            temperature=0.2,
+        )
+    except Exception as exc:
+        logger.debug("Multimodal screen summary failed: %s", exc.__class__.__name__)
+        return ""
 
 
 @app.get("/api/vision/screenshot")
@@ -2316,10 +2469,15 @@ async def vision_run(request: VisionRunRequest) -> dict:
     screen = await loop.run_in_executor(None, dc.capture)
 
     for step_num in range(request.max_steps):
+        multimodal_summary = await _multimodal_screen_summary(screen)
+        screen_context = screen["state_text"]
+        if multimodal_summary.strip():
+            screen_context += "\n\nVISION_MODEL_SUMMARY:\n" + multimodal_summary.strip()
+
         # Build the prompt for the MainAgent
         prompt = (
             f"You are performing a desktop task. Task: {request.task}\n\n"
-            f"{screen['state_text']}\n\n"
+            f"{screen_context}\n\n"
             "Issue exactly ONE action command from the allowed syntax, or DONE to finish.\n"
             "Action:"
         )
@@ -2368,3 +2526,4 @@ async def vision_run(request: VisionRunRequest) -> dict:
         details=f"task={request.task!r} steps={len(steps)}",
     )
     return {"task": request.task, "steps": steps, "total_steps": len(steps)}
+

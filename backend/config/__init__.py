@@ -135,8 +135,8 @@ class AppConfig(BaseSettings):
     # Image analysis backend
     # - cpu_ocr: run OCR + metadata extraction on CPU (no llama.cpp vision call)
     # - llama: force llama.cpp multimodal analysis
-    # - auto: try CPU OCR first, then llama.cpp fallback
-    image_analysis_backend: str = "cpu_ocr"
+    # - auto: use llama.cpp vision when available, then CPU OCR fallback
+    image_analysis_backend: str = "auto"
     # Use a dedicated slot for llama.cpp vision calls to avoid polluting the
     # main assistant slot cache state. Set to -1 for "any available slot".
     image_analysis_llama_slot_id: int = 0

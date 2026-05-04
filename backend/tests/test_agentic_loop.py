@@ -308,7 +308,7 @@ async def test_main_agent_process_direct_includes_memory_context():
     cfg = AppConfig()
 
     memory = MagicMock()
-    memory.search = AsyncMock(return_value=[
+    memory.search_advanced = AsyncMock(return_value=[
         {"text": "user: find my github directory\nassistant: GitHub directory: C:\\Users\\WhiteWidow\\Documents\\GitHub"}
     ])
     memory.store = AsyncMock(return_value=None)
@@ -316,6 +316,11 @@ async def test_main_agent_process_direct_includes_memory_context():
     agent = MainAgent(slot_manager=sm, memory=memory, config=cfg)
     await agent.process_direct("what do you remember?", conversation_context=[])
 
-    memory.search.assert_awaited_once_with("what do you remember?", limit=4)
+    memory.search_advanced.assert_awaited_once_with(
+        query="what do you remember?",
+        limit=4,
+        metadata_filter={"agent": "main", "mode": "direct", "kind": "turn"},
+        candidate_pool=40,
+    )
     prompt = sm.send_to_main.call_args.args[0]
     assert "Relevant long-term memory:" in prompt

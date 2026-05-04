@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import inspect
 import json
 import logging
@@ -40,7 +41,8 @@ _DIRECT_SYSTEM_PROMPT = (
 )
 
 # Maximum tool-call iterations per execute_step call to prevent infinite loops.
-_MAX_TOOL_ITERATIONS = 5
+# Keep this high enough for multi-file and multi-page research tasks.
+_MAX_TOOL_ITERATIONS = 120
 
 # The LlamaClient injects this prefix into every prompt that ends with
 # "assistant:" so that thinking-capable models skip the chain-of-thought
@@ -68,20 +70,51 @@ _TOOL_QUERY_RE = re.compile(
 _URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
 _DOMAIN_RE = re.compile(r"\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}\b", re.IGNORECASE)
 _FETCH_INTENT_RE = re.compile(r"\b(fetch|get|retrieve|download|read|visit|open)\b", re.IGNORECASE)
+_WEB_SUMMARY_INTENT_RE = re.compile(
+    r"\b(?:summari[sz]e|summary|what\s+is|what'?s|tell\s+me\s+about|explain|describe|analy[sz]e)\b"
+    r".{0,80}\b(?:site|website|web\s*page|url|domain|page)\b|"
+    r"\b(?:site|website|web\s*page|url|domain|page)\b.{0,80}"
+    r"\b(?:summari[sz]e|summary|about|overview|details?)\b",
+    re.IGNORECASE,
+)
+_DEEPER_SUMMARY_INTENT_RE = re.compile(
+    r"\b(?:more|deeper|indepth|in-depth|detailed|detail|expand|better|thorough)\b",
+    re.IGNORECASE,
+)
+_PROVENANCE_INTENT_RE = re.compile(
+    r"\b(?:how|where)\s+did\s+you\s+(?:get|find|know|see)\b|"
+    r"\b(?:how|where)\s+(?:was|is)\s+that\s+(?:found|derived|sourced)\b|"
+    r"\bwhat\s+(?:source|sources|tool|tools)\s+did\s+you\s+use\b",
+    re.IGNORECASE,
+)
 _EXPLICIT_TOOL_INTENT_RE = re.compile(
     r"\b(?:web\s*fetch|use\s+(?:a\s+)?tool|run\s+(?:a\s+)?tool|look\s*up|lookup|search\s+(?:the\s+)?web|browse)\b",
+    re.IGNORECASE,
+)
+_DELEGATION_INTENT_RE = re.compile(
+    r"\b(?:delegate|sub[-\s]?agent|spawn\s+(?:an?\s+)?agent|parallel\s+agent|another\s+agent|speciali[sz]ed\s+agent)\b",
     re.IGNORECASE,
 )
 _SCHEDULE_INTENT_RE = re.compile(
     r"\b(?:schedule|remind\s+me|timer|every\s+(?:morning|day|hour|week)|daily|weekly|tomorrow|cron)\b",
     re.IGNORECASE,
 )
+_CASUAL_CHAT_RE = re.compile(
+    r"^\s*(?:hi|hello|hey|yo|hiya|sup|what'?s up|how are you|hello how are you|hey how are you)[\s.!?]*$",
+    re.IGNORECASE,
+)
+_ARCHITECTURE_DRIFT_RE = re.compile(
+    r"\b(?:main agent|distributed system|sub-agents?|central orchestrator|llama\.?cpp|kv-cache|slots?|architecture|capabilities)\b",
+    re.IGNORECASE,
+)
 _LOCAL_FILE_HINT_RE = re.compile(
-    r"\b(file|folder|directory|filesystem|local|workspace|github\s+directory|repo(?:sitory)?|project(?:s)?)\b",
+    r"\b(file|folder|directory|filesystem|local|workspace|github\s+directory|github|documents|downloads|desktop|"
+    r"repo(?:sitory)?|project(?:s)?)\b",
     re.IGNORECASE,
 )
 _PLACEHOLDER_TOOL_NAME_RE = re.compile(r"^\s*(?:<[^>]+>|name|tool)\s*$", re.IGNORECASE)
 _DESKTOP_VISION_TOOLS = {"screenshot", "ui", "image_analysis"}
+_AGENT_HANDOFF_TOOLS = {"sub_agent", "agent_list", "session"}
 _TOOL_BLOCK_RE = re.compile(
     r"</?(?:tool_call|tool_result|fetch|fetch_result|verify|sweep|think|sloth)>"
     r"|thinking\s+process:"
@@ -94,6 +127,32 @@ _RAW_HTML_RE = re.compile(
     r"&(?:nbsp|amp|lt|gt|quot);",
     re.IGNORECASE,
 )
+_FILESYSTEM_TOOL_ALIASES = {
+    "filesystem",
+    "filesystem/search",
+    "filesystem/list",
+    "fs",
+    "fs/search",
+    "local_file",
+    "local_filesystem",
+    "path_search",
+}
+_SHELL_TOOL_ALIASES = {
+    "run",
+    "terminal",
+    "terminal/run",
+    "command",
+    "cmd",
+    "powershell",
+    "bash",
+}
+_LOCAL_ROOTS = [
+    ("home", str(Path.home())),
+    ("desktop", str(Path.home() / "Desktop")),
+    ("documents", str(Path.home() / "Documents")),
+    ("downloads", str(Path.home() / "Downloads")),
+    ("github", str(Path.home() / "Documents" / "GitHub")),
+]
 
 _MEMORY_ROLE_LINE_RE = re.compile(r"(?im)^\s*(?:user|assistant)\s*:\s*.*$")
 _MEMORY_META_LINE_RE = re.compile(
@@ -110,12 +169,12 @@ _MAX_LIST_ITEMS = 20
 _MAX_MODEL_RESPONSE_PREVIEW_CHARS = 240
 # Tool output limits: event payloads vs. model-facing prompts.
 # Event payloads can be compact (logging/discord), but prompts need
-# full content so the model can actually use tool results and not hallucinate.
-_MAX_TOOL_PROMPT_TEXT_CHARS = 5000
-_MAX_TOOL_PROMPT_LIST_ITEMS = 100  # Allow comprehensive result lists
-_MAX_TOOL_CONTEXT_CHARS = 12000
-# Direct mode should remain responsive even with very large global context settings.
-_DIRECT_MAX_TOKENS_CAP = 768
+# enough room for larger fetches and multi-source summarization.
+_MAX_TOOL_PROMPT_TEXT_CHARS = 20000
+_MAX_TOOL_PROMPT_LIST_ITEMS = 250
+_MAX_TOOL_CONTEXT_CHARS = 96000
+# Direct mode should not be the limiting factor for large grounded summaries.
+_DIRECT_MAX_TOKENS_CAP = 4096
 _HEAVY_B64_KEYS = {
     "annotated_png_b64",
     "image_b64",
@@ -204,10 +263,12 @@ def _sanitize_direct_response(text: str) -> str:
     return stripped
 
 
-def _needs_direct_repair(text: str) -> bool:
+def _needs_direct_repair(text: str, *, casual_chat: bool = False) -> bool:
     stripped = (text or "").strip()
     if not stripped:
         return False
+    if casual_chat and (len(stripped) > 180 or _ARCHITECTURE_DRIFT_RE.search(stripped)):
+        return True
     if _TOOL_BLOCK_RE.search(stripped):
         return True
     if _RAW_HTML_RE.search(stripped):
@@ -238,6 +299,362 @@ def _dedupe_repeated_response(text: str) -> str:
     return "\n\n".join(deduped) if deduped else stripped
 
 
+def _htmlish_to_plain_summary(text: str) -> str:
+    raw = (text or "").replace("\\r", "\n").replace("\\n", "\n")
+    if not raw.strip():
+        return ""
+    title = ""
+    title_match = re.search(r"<title[^>]*>(.*?)</title>", raw, re.IGNORECASE | re.DOTALL)
+    if title_match:
+        title = re.sub(r"\s+", " ", title_match.group(1)).strip()
+    desc = ""
+    desc_match = re.search(
+        r'<meta[^>]+name=["\']description["\'][^>]+content=["\'](.*?)["\']',
+        raw,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if not desc_match:
+        desc_match = re.search(
+            r'<meta[^>]+content=["\'](.*?)["\'][^>]+name=["\']description["\']',
+            raw,
+            re.IGNORECASE | re.DOTALL,
+        )
+    if desc_match:
+        desc = re.sub(r"\s+", " ", desc_match.group(1)).strip()
+
+    cleaned = re.sub(r"(?is)<script.*?</script>|<style.*?</style>", " ", raw)
+    cleaned = re.sub(r"(?is)<!--.*?-->", " ", cleaned)
+    cleaned = re.sub(r"<[^>]+>", " ", cleaned)
+    cleaned = re.sub(r"&nbsp;", " ", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"&amp;", "&", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"&lt;", "<", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"&gt;", ">", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"&quot;", '"', cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+
+    parts: list[str] = []
+    if title:
+        parts.append(f"Page title: {title}.")
+    if desc:
+        parts.append(desc)
+    elif cleaned:
+        parts.append(cleaned[:500].strip())
+    if not parts:
+        return ""
+    return " ".join(parts)
+
+
+def _normalize_web_target(target: str) -> str:
+    cleaned = (target or "").strip().strip("<>()[]{}\"'.,;:!?\n\r\t ")
+    if not cleaned:
+        return ""
+    if cleaned.lower().startswith(("http://", "https://")):
+        return cleaned
+    return f"https://{cleaned}"
+
+
+def _extract_url_or_domain(text: str, conversation_context: Optional[list[str]] = None) -> str:
+    haystacks = [text or ""]
+    if conversation_context:
+        haystacks.extend(reversed([line or "" for line in conversation_context[-8:]]))
+    for item in haystacks:
+        url_match = _URL_RE.search(item)
+        if url_match:
+            return _normalize_web_target(url_match.group(0))
+        domain_match = _DOMAIN_RE.search(item)
+        if domain_match:
+            return _normalize_web_target(domain_match.group(0))
+    return ""
+
+
+def _visible_html_items(raw: str, tag_names: str) -> list[str]:
+    items: list[str] = []
+    pattern = re.compile(fr"(?is)<(?:{tag_names})\b[^>]*>(.*?)</(?:{tag_names})>")
+    for match in pattern.finditer(raw or ""):
+        text = re.sub(r"(?is)<[^>]+>", " ", match.group(1))
+        text = html.unescape(re.sub(r"\s+", " ", text)).strip()
+        if text:
+            items.append(text)
+    return items
+
+
+def _clean_visible_web_text(raw: str) -> str:
+    cleaned = re.sub(r"(?is)<script.*?</script>|<style.*?</style>|<svg.*?</svg>|<noscript.*?</noscript>", " ", raw or "")
+    cleaned = re.sub(r"(?is)<!--.*?-->", " ", cleaned)
+    cleaned = re.sub(r"(?is)<br\s*/?>", "\n", cleaned)
+    cleaned = re.sub(r"(?is)</(?:p|div|section|article|li|h[1-6])>", "\n", cleaned)
+    cleaned = re.sub(r"(?is)<[^>]+>", " ", cleaned)
+    cleaned = html.unescape(cleaned)
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def _dedupe_text_items(items: list[str], *, max_items: int = 12) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        cleaned = re.sub(r"\s+", " ", item).strip(" -|")
+        if len(cleaned) < 4:
+            continue
+        key = cleaned.lower()
+        if key in seen:
+            continue
+        if re.fullmatch(r"(?:home|menu|close|search|submit|learn more|read more|skip to content)", key):
+            continue
+        seen.add(key)
+        result.append(cleaned)
+        if len(result) >= max_items:
+            break
+    return result
+
+
+def _render_web_fetch_answer(user_input: str, result_dict: dict) -> str:
+    if not result_dict or not bool(result_dict.get("ok")):
+        error = str((result_dict or {}).get("error") or "").strip()
+        return f"web_fetch failed: {error}" if error else ""
+
+    output = result_dict.get("output")
+    if isinstance(output, (dict, list)):
+        return json.dumps(output, ensure_ascii=False, indent=2, default=str)[:4000]
+    if not isinstance(output, str) or not output.strip():
+        return ""
+
+    raw = output
+    deep = bool(_DEEPER_SUMMARY_INTENT_RE.search(user_input or ""))
+    title = ""
+    title_match = re.search(r"<title[^>]*>(.*?)</title>", raw, re.IGNORECASE | re.DOTALL)
+    if title_match:
+        title = html.unescape(re.sub(r"\s+", " ", title_match.group(1))).strip()
+
+    desc = ""
+    desc_match = re.search(
+        r'<meta[^>]+name=["\']description["\'][^>]+content=["\'](.*?)["\']',
+        raw,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if not desc_match:
+        desc_match = re.search(
+            r'<meta[^>]+content=["\'](.*?)["\'][^>]+name=["\']description["\']',
+            raw,
+            re.IGNORECASE | re.DOTALL,
+        )
+    if desc_match:
+        desc = html.unescape(re.sub(r"\s+", " ", desc_match.group(1))).strip()
+
+    headings = _dedupe_text_items(_visible_html_items(raw, "h1|h2|h3"), max_items=8 if deep else 5)
+    body_items = _dedupe_text_items(
+        _visible_html_items(raw, "p|li"),
+        max_items=12 if deep else 6,
+    )
+    visible = _clean_visible_web_text(raw)
+
+    lines: list[str] = []
+    if title:
+        lines.append(f"Page title: {title}.")
+    if desc:
+        lines.append(f"Overview: {desc}")
+    elif visible:
+        lines.append(f"Overview: {visible[:700 if deep else 420].strip()}")
+    if headings:
+        lines.append("Notable sections: " + "; ".join(headings) + ".")
+    if body_items:
+        detail_limit = 7 if deep else 4
+        lines.append("Details:")
+        lines.extend(f"- {item}" for item in body_items[:detail_limit])
+
+    if not lines and visible:
+        return visible[:1200 if deep else 700].strip()
+    return "\n".join(lines).strip()
+
+
+def _render_tool_result_answer(user_input: str, tool_name: str, result_dict: dict) -> str:
+    if not result_dict or not bool(result_dict.get("ok")):
+        if tool_name == "web_fetch" and result_dict:
+            error = str(result_dict.get("error") or "").strip()
+            return (
+                "web_fetch could not retrieve the requested URL"
+                + (f": {error}" if error else ".")
+                + " I do not have page content to summarize from that fetch."
+            )
+        return ""
+    output = result_dict.get("output")
+    if tool_name == "file" and isinstance(output, dict):
+        path = str(output.get("absolute_path") or output.get("path") or "").strip()
+        entries = output.get("entries")
+        if isinstance(entries, list):
+            dirs = [str(e.get("name")) for e in entries if isinstance(e, dict) and e.get("type") == "dir"]
+            files = [str(e.get("name")) for e in entries if isinstance(e, dict) and e.get("type") == "file"]
+            bits = []
+            if dirs:
+                bits.append("Folders: " + ", ".join(dirs[:60]))
+            if files:
+                bits.append("Files: " + ", ".join(files[:30]))
+            prefix = f"Found path: {path}" if path else "Found filesystem results"
+            return prefix + ("\n" + "\n".join(bits) if bits else "")
+        if "exists" in output:
+            return f"Path exists: {bool(output.get('exists'))}\nPath: {output.get('path', '')}"
+        if "written" in output:
+            return f"Wrote file: {output.get('written')}"
+        if "appended" in output:
+            return f"Appended to file: {output.get('appended')}"
+        if "deleted" in output:
+            return f"Deleted file: {output.get('deleted')}"
+    if tool_name == "file" and isinstance(output, str):
+        return output[:4000]
+    if tool_name == "shell" and isinstance(output, dict):
+        stdout = str(output.get("stdout") or "").strip()
+        stderr = str(output.get("stderr") or "").strip()
+        if stdout:
+            return stdout[:4000]
+        if stderr and not result_dict.get("ok"):
+            return f"Shell command failed:\n{stderr[:2000]}"
+    if tool_name == "web_fetch":
+        return _render_web_fetch_answer(user_input, result_dict)
+    if tool_name == "sub_agent" and isinstance(output, dict):
+        summary = str(output.get("handoff_summary") or "").strip()
+        response = str(output.get("response") or "").strip()
+        agent_id = str(output.get("agent_id") or "").strip()
+        slot_id = output.get("slot_id")
+        body = summary or response
+        if not body:
+            return ""
+        prefix = "Sub-agent handoff summary"
+        if agent_id or slot_id is not None:
+            details: list[str] = []
+            if agent_id:
+                details.append(f"agent={agent_id}")
+            if slot_id is not None:
+                details.append(f"slot={slot_id}")
+            prefix += f" ({', '.join(details)})"
+        return f"{prefix}:\n{body[:4000]}"
+    return ""
+
+
+def _local_filesystem_context() -> str:
+    lines = [
+        "Local filesystem context:",
+        "- You are running on the user's Windows machine with trusted local access.",
+        "- For arbitrary folder discovery, use ONLY real tools named file or shell; do not invent tools.",
+        "- The file tool accepts absolute paths in this trusted runtime.",
+        "- Useful starting roots:",
+    ]
+    for label, path in _LOCAL_ROOTS:
+        lines.append(f"  - {label}: {path}")
+    lines.append("- To find an arbitrary folder, list or shell-search from these roots, then report the exact path.")
+    return "\n".join(lines)
+
+
+def _root_for_text(text: str) -> str:
+    lower = (text or "").lower()
+    for label, path in _LOCAL_ROOTS:
+        if label in lower:
+            return path
+    return str(Path.home())
+
+
+def _coerce_tool_args(tool_name: str, tool_args: dict, user_input: str) -> dict:
+    args = dict(tool_args or {})
+    if tool_name == "web_fetch":
+        requested_url = _normalize_web_target(str(args.get("url") or ""))
+        user_target = _extract_url_or_domain(user_input)
+        if requested_url:
+            requested_host = re.sub(r"^https?://", "", requested_url, flags=re.IGNORECASE).split("/", 1)[0].lower()
+            user_host = re.sub(r"^https?://", "", user_target, flags=re.IGNORECASE).split("/", 1)[0].lower() if user_target else ""
+            if user_host and requested_host == f"www.{user_host}":
+                args["url"] = user_target
+            else:
+                args["url"] = requested_url
+        elif user_target:
+            args["url"] = user_target
+        return args
+    if tool_name == "file" and ("action" not in args or "path" not in args):
+        args.setdefault("action", "list")
+        args.setdefault("path", _root_for_text(user_input))
+        return args
+    if tool_name == "shell" and not args.get("command"):
+        query = str(args.get("query") or args.get("q") or args.get("name") or "").strip()
+        if not query:
+            query = (user_input or "").strip()
+        escaped_query = query.replace("'", "''")[:120]
+        roots = "; ".join(
+            f"'{path.replace(chr(39), chr(39) + chr(39))}'"
+            for _, path in _LOCAL_ROOTS
+        )
+        args["command"] = (
+            "powershell -NoProfile -Command "
+            f"\"$roots=@({roots}); "
+            f"$q='{escaped_query}'; "
+            "$roots | Where-Object { Test-Path $_ } | ForEach-Object { "
+            "Get-ChildItem -LiteralPath $_ -Directory -Recurse -ErrorAction SilentlyContinue "
+            "| Where-Object { $_.Name -like ('*' + $q + '*') } "
+            "| Select-Object -First 25 -ExpandProperty FullName }\""
+        )
+        args.setdefault("timeout", 45)
+    return args
+
+
+def _extract_folder_search_query(text: str) -> str:
+    raw = (text or "").strip()
+    match = re.search(
+        r"\b(?:find|locate|search\s+for|look\s+for|open|get\s+(?:me\s+)?to)\s+(?:my\s+|the\s+)?(.+?)\s+"
+        r"(?:folder|directory|project|repo(?:sitory)?)\b",
+        raw,
+        re.IGNORECASE,
+    )
+    if match:
+        query = match.group(1)
+    else:
+        query = raw
+    query = re.sub(
+        r"\b(?:find|locate|search|look|for|my|the|folder|directory|project|projects|repo|repository|"
+        r"files|list|show|check|open|create|make|build|write|edit|modify|delete)\b",
+        " ",
+        query,
+        flags=re.IGNORECASE,
+    )
+    query = " ".join(query.split()).strip(" .")
+    return query
+
+
+def _is_local_retrieval_request(text: str) -> bool:
+    lower = (text or "").lower()
+    if re.search(r"\b(?:create|make|build|write|edit|modify|delete|remove)\b", lower):
+        return False
+    return bool(re.search(r"\b(?:find|locate|list|show|check|open|where|search)\b", lower))
+
+
+async def _try_local_filesystem_fast_path(tool_registry, text: str) -> str:
+    if tool_registry is None or not _is_local_retrieval_request(text):
+        return ""
+    file_tool = tool_registry.get("file")
+    shell_tool = tool_registry.get("shell")
+    if file_tool is None:
+        return ""
+
+    root = _root_for_text(text)
+    lower = (text or "").lower()
+    query = _extract_folder_search_query(text)
+    root_labels = {label for label, _ in _LOCAL_ROOTS if label in lower}
+
+    # If the user asks for a known root or its projects/files, list it directly.
+    if root_labels or re.search(r"\b(?:projects?|files?|folders?|directories)\b", lower):
+        result = await file_tool.execute(action="list", path=root)
+        result_dict = result.to_dict()
+        rendered = _render_tool_result_answer(text, "file", result_dict)
+        if rendered:
+            return rendered
+
+    # Otherwise search for a folder name across useful local roots.
+    if query and shell_tool is not None:
+        args = _coerce_tool_args("shell", {"query": query}, text)
+        result = await shell_tool.execute(**args)
+        result_dict = result.to_dict()
+        rendered = _render_tool_result_answer(text, "shell", result_dict)
+        if rendered:
+            return rendered
+
+    return ""
+
+
 def _trim_tool_context(context: str) -> str:
     """Bound accumulated tool-context size to avoid prompt-eval blowups.
 
@@ -261,10 +678,20 @@ def _sanitize_memory_snippet(text: str) -> str:
     cleaned = (text or "").strip()
     if not cleaned:
         return ""
-    cleaned = _MEMORY_ROLE_LINE_RE.sub("", cleaned)
-    cleaned = _MEMORY_META_LINE_RE.sub("", cleaned)
-    cleaned = re.sub(r"\s+", " ", cleaned).strip()
-    return cleaned
+    parts: list[str] = []
+    for line in cleaned.splitlines():
+        line = line.strip()
+        if not line or _MEMORY_META_LINE_RE.match(line):
+            continue
+        role_match = re.match(r"^(user|assistant)\s*:\s*(.*)$", line, re.IGNORECASE)
+        if role_match:
+            role = role_match.group(1).lower()
+            content = role_match.group(2).strip()
+            if content:
+                parts.append(f"{role} said: {content}")
+            continue
+        parts.append(line)
+    return re.sub(r"\s+", " ", " ".join(parts)).strip()
 
 
 def _resolve_tool_name(
@@ -290,6 +717,13 @@ def _resolve_tool_name(
         if lower_name == candidate.lower():
             return candidate
 
+    if lower_name in _FILESYSTEM_TOOL_ALIASES and "search" in lower_name and "shell" in active_names:
+        return "shell"
+    if lower_name in _FILESYSTEM_TOOL_ALIASES and "file" in active_names:
+        return "file"
+    if lower_name in _SHELL_TOOL_ALIASES and "shell" in active_names:
+        return "shell"
+
     if name and not _PLACEHOLDER_TOOL_NAME_RE.match(name):
         # Keep the original unknown name so the caller can report a proper error.
         return name
@@ -314,6 +748,12 @@ def _resolve_tool_name(
         return "file"
 
     return active_names[0] if active_names else name
+
+
+def _filter_agent_handoff_tools(tools: list, text: str) -> list:
+    if _DELEGATION_INTENT_RE.search(text or ""):
+        return tools
+    return [tool for tool in tools if tool.name not in _AGENT_HANDOFF_TOOLS]
 
 
 def _load_protected_prompt() -> str:
@@ -457,11 +897,52 @@ class MainAgent:
         except Exception as exc:
             logger.warning("RollingContext add_message failed: %s", exc.__class__.__name__)
 
+    def _schedule_direct_memory_store(
+        self,
+        user_input: str,
+        response: str,
+        tool_context: str = "",
+    ) -> None:
+        if self._memory is None:
+            return
+        text = f"user: {user_input}\nassistant: {response}"
+        if tool_context.strip():
+            text += f"\ncontext: {tool_context.strip()}"
+        try:
+            asyncio.create_task(
+                self._memory.store(
+                    text=text,
+                    metadata={"agent": "main", "slot": self.slot_id, "mode": "direct", "kind": "turn"},
+                )
+            )
+        except Exception:
+            pass
+
     def _rolling_context_prompt(self, ctx: RollingContext, header: str) -> str:
         prompt = ctx.get_context_prompt().strip()
         if not prompt:
             return ""
         return f"{header}:\n{prompt}"
+
+    def _augment_sub_agent_task(self, task: str, context_lines: list[str] | None = None) -> str:
+        context_bits: list[str] = []
+        if context_lines:
+            context_bits.extend(line.strip() for line in context_lines[-6:] if line and line.strip())
+        rolling = self._rolling_context_prompt(
+            self._direct_rolling_context,
+            "Recent main-agent conversation",
+        )
+        if rolling:
+            context_bits.append(rolling)
+        if not context_bits:
+            return task
+        context_text = "\n".join(context_bits)
+        return (
+            f"{task}\n\n"
+            "Context handed off from the main agent:\n"
+            f"{context_text}\n\n"
+            "Use this context only as background; answer the delegated task directly."
+        )
 
     # ------------------------------------------------------------------
     # Sub-agent delegation
@@ -563,19 +1044,42 @@ class MainAgent:
         if _TOOL_QUERY_RE.search(latest_user_input):
             return self._describe_direct_capabilities()
 
-        web_intent = bool(_FETCH_INTENT_RE.search(latest_user_input)) and (
-            bool(_URL_RE.search(latest_user_input)) or bool(_DOMAIN_RE.search(latest_user_input))
+        casual_chat = bool(_CASUAL_CHAT_RE.match(latest_user_input))
+        web_target = _extract_url_or_domain(latest_user_input, conversation_context)
+        current_web_target = _extract_url_or_domain(latest_user_input)
+        web_summary_intent = bool(_WEB_SUMMARY_INTENT_RE.search(latest_user_input))
+        explicit_tool_intent = bool(_EXPLICIT_TOOL_INTENT_RE.search(latest_user_input))
+        delegation_intent = bool(_DELEGATION_INTENT_RE.search(latest_user_input))
+        provenance_intent = bool(_PROVENANCE_INTENT_RE.search(latest_user_input))
+        deeper_web_followup_intent = bool(_DEEPER_SUMMARY_INTENT_RE.search(latest_user_input)) and bool(web_target)
+        web_intent = bool(web_target) and (
+            bool(current_web_target)
+            or (bool(_FETCH_INTENT_RE.search(latest_user_input)) and not provenance_intent)
+            or web_summary_intent
+            or explicit_tool_intent
+            or deeper_web_followup_intent
         )
         local_file_intent = bool(_LOCAL_FILE_HINT_RE.search(latest_user_input)) and not web_intent
-        explicit_tool_intent = bool(_EXPLICIT_TOOL_INTENT_RE.search(latest_user_input))
         schedule_intent = bool(_SCHEDULE_INTENT_RE.search(latest_user_input))
-        tool_intent = web_intent or local_file_intent or explicit_tool_intent or schedule_intent
         short_followup_edit_intent = bool(_SHORT_FOLLOWUP_EDIT_RE.search(latest_user_input)) and len(latest_user_input) <= 120
+        if (short_followup_edit_intent or deeper_web_followup_intent) and web_target:
+            web_intent = True
+            web_summary_intent = True
+            local_file_intent = False
+        tool_intent = web_intent or local_file_intent or explicit_tool_intent or schedule_intent or delegation_intent
+
+        if local_file_intent:
+            fast = await _try_local_filesystem_fast_path(self._tool_registry, latest_user_input)
+            if fast:
+                await self._append_rolling_context(self._direct_rolling_context, "user", latest_user_input)
+                await self._append_rolling_context(self._direct_rolling_context, "assistant", fast)
+                self._schedule_direct_memory_store(latest_user_input, fast)
+                return fast
 
         # Tool-grounded direct requests should rely on fresh tool outputs rather
         # than semantically retrieved memory, which can leak stale facts into
         # summarization/fetch tasks and increase prompt size.
-        allow_memory_context = not (web_intent or local_file_intent or short_followup_edit_intent)
+        allow_memory_context = not (casual_chat or web_intent or local_file_intent or short_followup_edit_intent)
         if conversation_context and short_followup_edit_intent:
             allow_memory_context = False
 
@@ -599,10 +1103,12 @@ class MainAgent:
             except Exception as exc:
                 logger.warning("MainAgent direct memory search failed: %s", exc.__class__.__name__)
 
-        rolling_context = self._rolling_context_prompt(
-            self._direct_rolling_context,
-            "Rolling conversation summary",
-        )
+        rolling_context = ""
+        if not casual_chat:
+            rolling_context = self._rolling_context_prompt(
+                self._direct_rolling_context,
+                "Rolling conversation summary",
+            )
 
         # ── Tool injection ───────────────────────────────────────────────────
         # Route tools semantically based on the user input so the model always
@@ -615,6 +1121,7 @@ class MainAgent:
                 context=latest_user_input,
                 semantic_routing_enabled=True,
             )
+            active_tools = _filter_agent_handoff_tools(active_tools, latest_user_input)
             if web_intent:
                 active_tools = [t for t in active_tools if t.name not in _DESKTOP_VISION_TOOLS]
                 for must_have in ("web_fetch", "web_search"):
@@ -622,8 +1129,11 @@ class MainAgent:
                     if forced is not None and all(t.name != must_have for t in active_tools):
                         active_tools.append(forced)
             if local_file_intent:
-                active_tools = [t for t in active_tools if t.name not in _DESKTOP_VISION_TOOLS]
-                for must_have in ("file", "shell", "workspace_index"):
+                active_tools = [
+                    t for t in active_tools
+                    if t.name not in _DESKTOP_VISION_TOOLS and t.name in {"file", "shell", "patch", "diff", "process"}
+                ]
+                for must_have in ("file", "shell", "patch", "diff", "process"):
                     forced = self._tool_registry.get(must_have)
                     if forced is not None and all(t.name != must_have for t in active_tools):
                         active_tools.append(forced)
@@ -644,11 +1154,20 @@ class MainAgent:
                     "The tool result will be provided and you may continue.\n"
                     "During tool calls: output ONLY the next <tool_call> block, no prose.\n"
                     "Never invent file paths, URLs, or facts not present in tool outputs.\n"
+                    "When the user asks about the content, purpose, location, or details of a URL/domain/site, "
+                    "use web_fetch unless recent conversation already contains a successful fetched result for that same target.\n"
                     "When you have real data from tools: write the answer using actual results, not guesses."
                 )
 
         sys_prompt = _DIRECT_SYSTEM_PROMPT
         prompt_parts = [f"system: {sys_prompt}"]
+        if casual_chat:
+            prompt_parts.append(
+                "Style constraint: this is a simple casual check-in. "
+                "Reply in one short friendly sentence. Do not mention identity, architecture, tools, model, or capabilities."
+            )
+        if local_file_intent:
+            prompt_parts.append(_local_filesystem_context())
         if memory_context:
             prompt_parts.append(memory_context)
         if rolling_context:
@@ -661,7 +1180,7 @@ class MainAgent:
             prompt_parts.append(tools_section.strip())
         prompt_parts.append(f"user: {latest_user_input}\nassistant:")
         prompt = "\n\n".join(prompt_parts)
-        direct_max_tokens = max(
+        direct_max_tokens = 96 if casual_chat else max(
             128,
             min(int(self._config.main_context_size or 4096), _DIRECT_MAX_TOKENS_CAP),
         )
@@ -669,6 +1188,9 @@ class MainAgent:
         # ── Tool-call loop ───────────────────────────────────────────────────
         accumulated_tool_context = ""
         response = ""
+        last_tool_answer = ""
+        executed_tool_notes: list[str] = []
+        any_tool_error = False
         for iteration in range(_MAX_TOOL_ITERATIONS):
             full_prompt = prompt + accumulated_tool_context
             try:
@@ -716,7 +1238,12 @@ class MainAgent:
                     active_tools=active_tools,
                     user_input=latest_user_input,
                 )
-                tool_args = tc.get("args", {})
+                tool_args = _coerce_tool_args(tool_name, tc.get("args", {}), latest_user_input)
+                if tool_name == "sub_agent" and isinstance(tool_args, dict):
+                    tool_args["task"] = self._augment_sub_agent_task(
+                        str(tool_args.get("task") or latest_user_input),
+                        conversation_context,
+                    )
                 tool = self._tool_registry.get(tool_name)
                 if tool is None:
                     result_dict = {"ok": False, "error": f"Unknown tool: {tool_name!r}"}
@@ -727,6 +1254,25 @@ class MainAgent:
                     except Exception as exc:
                         logger.warning("Direct tool %s raised: %s", tool_name, exc)
                         result_dict = {"ok": False, "error": "Tool execution failed"}
+                rendered = _render_tool_result_answer(latest_user_input, tool_name, result_dict)
+                if rendered:
+                    last_tool_answer = rendered
+                if not bool(result_dict.get("ok")):
+                    any_tool_error = True
+                note_parts = [f"tool={tool_name}", f"ok={bool(result_dict.get('ok'))}"]
+                if isinstance(tool_args, dict) and tool_args:
+                    note_parts.append(
+                        "args="
+                        + _truncate_text(
+                            json.dumps(_sanitize_tool_payload_for_prompt(tool_args), ensure_ascii=False, default=str),
+                            500,
+                        )
+                    )
+                if rendered:
+                    note_parts.append("result_summary=" + _truncate_text(rendered, 1000))
+                elif result_dict.get("error"):
+                    note_parts.append("error=" + _truncate_text(str(result_dict.get("error")), 500))
+                executed_tool_notes.append("; ".join(note_parts))
                 result_json = json.dumps(
                     {
                         "tool": tool_name,
@@ -759,7 +1305,13 @@ class MainAgent:
                 except Exception:
                     pass
 
-        if _needs_direct_repair(response):
+        if (
+            (not (response or "").strip() or _needs_direct_repair(response, casual_chat=casual_chat) or any_tool_error)
+            and last_tool_answer
+        ):
+            response = last_tool_answer
+
+        if _needs_direct_repair(response, casual_chat=casual_chat):
             repair_prompt = (
                 "system: Rewrite raw model/tool output into a concise Discord-ready answer. "
                 "Do not include HTML, XML tags, tool protocol, or internal architecture. "
@@ -777,20 +1329,19 @@ class MainAgent:
                 logger.warning("MainAgent direct repair failed: %s", exc.__class__.__name__)
 
         response = _sanitize_direct_response(response)
+        if _needs_direct_repair(response, casual_chat=casual_chat) and _RAW_HTML_RE.search(response or ""):
+            fallback = _htmlish_to_plain_summary(response)
+            if fallback:
+                response = fallback
         response = _dedupe_repeated_response(response)
+        tool_context_note = ""
+        if executed_tool_notes:
+            tool_context_note = "Tool usage this turn:\n" + "\n".join(f"- {note}" for note in executed_tool_notes[-8:])
+            await self._append_rolling_context(self._direct_rolling_context, "system", tool_context_note)
         await self._append_rolling_context(self._direct_rolling_context, "user", latest_user_input)
         await self._append_rolling_context(self._direct_rolling_context, "assistant", response)
 
-        if self._memory is not None:
-            try:
-                asyncio.create_task(
-                    self._memory.store(
-                        text=f"user: {latest_user_input}\nassistant: {response}",
-                        metadata={"agent": "main", "slot": self.slot_id, "mode": "direct", "kind": "turn"},
-                    )
-                )
-            except Exception:
-                pass
+        self._schedule_direct_memory_store(latest_user_input, response, tool_context_note)
 
         return response
 
@@ -837,6 +1388,14 @@ class MainAgent:
         url_match = _URL_RE.search(task_text)
         domain_match = _DOMAIN_RE.search(task_text)
         local_file_task = bool(_LOCAL_FILE_HINT_RE.search(task_text))
+        if local_file_task:
+            return {
+                "approach": "Use local filesystem tools directly and report concrete paths or file changes.",
+                "steps": [
+                    "Resolve the user's local filesystem request using real file or shell tools, then report exact paths, files found, or changes made."
+                ],
+            }
+
         if _FETCH_INTENT_RE.search(task_text) and (url_match or domain_match) and not local_file_task:
             if url_match:
                 url = url_match.group(0)
@@ -931,6 +1490,13 @@ class MainAgent:
         # Build tool descriptions block if tools are available
         tools_section = ""
         tools: list = []
+        local_file_intent = bool(_LOCAL_FILE_HINT_RE.search(f"{task}\n{step}"))
+        if local_file_intent:
+            fast = await _try_local_filesystem_fast_path(self._tool_registry, f"{task}\n{step}")
+            if fast:
+                await self._append_rolling_context(self._agentic_rolling_context, "user", step)
+                await self._append_rolling_context(self._agentic_rolling_context, "assistant", fast)
+                return fast
         if self._tool_registry is not None and tool_calls_enabled:
             routing_context_parts = [
                 f"task: {task}",
@@ -946,6 +1512,7 @@ class MainAgent:
                 semantic_routing_enabled=semantic_routing_enabled,
                 allow_tool_names=allowed_tool_names,
             )
+            tools = _filter_agent_handoff_tools(tools, routing_context)
 
             # Guardrail: web-fetch intent should not route through desktop/vision
             # tools, which can trigger expensive screenshots and unrelated UI actions.
@@ -957,10 +1524,13 @@ class MainAgent:
 
             local_file_intent = bool(_LOCAL_FILE_HINT_RE.search(routing_context)) and not web_intent
             if local_file_intent:
-                tools = [t for t in tools if t.name not in _DESKTOP_VISION_TOOLS]
+                tools = [
+                    t for t in tools
+                    if t.name not in _DESKTOP_VISION_TOOLS and t.name in {"file", "shell", "patch", "diff", "process"}
+                ]
                 # Always expose core filesystem tools for local-file requests,
                 # even if semantic routing did not include them in top-k.
-                for must_have in ("file", "shell", "workspace_index"):
+                for must_have in ("file", "shell", "patch", "diff", "process"):
                     forced = self._tool_registry.get(must_have)
                     if forced is not None and all(t.name != must_have for t in tools):
                         tools.append(forced)
@@ -987,6 +1557,7 @@ class MainAgent:
             f"Overall task: {task}\n"
             f"Current step: {step}"
             f"{context_section}"
+            f"{chr(10) + chr(10) + _local_filesystem_context() if local_file_intent else ''}"
             f"{tools_section}\n\n"
             "Execute this step and return ACTUAL results now.\n"
             "Do NOT say what you plan to do or will compile later — output the real content directly.\n"
@@ -995,6 +1566,7 @@ class MainAgent:
 
         # Tool-calling loop
         accumulated_tool_context = ""
+        last_tool_answer = ""
         for iteration in range(_MAX_TOOL_ITERATIONS):
             prompt = step_prompt + accumulated_tool_context
             logger.info(
@@ -1070,7 +1642,15 @@ class MainAgent:
                     active_tools=tools,
                     user_input=f"{task}\n{step}",
                 )
-                tool_args = tc.get("args", {})
+                tool_args = _coerce_tool_args(tool_name, tc.get("args", {}), f"{task}\n{step}")
+                if tool_name == "sub_agent" and isinstance(tool_args, dict):
+                    handoff_lines = list(context or [])
+                    handoff_lines.append(f"Overall task: {task}")
+                    handoff_lines.append(f"Current step: {step}")
+                    tool_args["task"] = self._augment_sub_agent_task(
+                        str(tool_args.get("task") or step),
+                        handoff_lines,
+                    )
 
                 if on_event is not None:
                     safe_args = _sanitize_tool_payload(tool_args)
@@ -1096,6 +1676,9 @@ class MainAgent:
                         logger.warning("Tool %s raised: %s", tool_name, exc)
                         # Avoid leaking internal paths or credentials to the model.
                         result_dict = {"ok": False, "error": "Tool execution failed"}
+                rendered = _render_tool_result_answer(f"{task}\n{step}", tool_name, result_dict)
+                if rendered:
+                    last_tool_answer = rendered
 
                 if on_event is not None:
                     safe_output = _sanitize_tool_payload(result_dict.get("output"))

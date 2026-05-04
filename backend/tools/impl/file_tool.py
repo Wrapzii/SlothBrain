@@ -182,7 +182,7 @@ class FileTool(Tool):
                 out_path = str(path.relative_to(self._root))
             except ValueError:
                 out_path = str(path)
-            return ToolResult(ok=True, output={"path": out_path, "entries": entries})
+            return ToolResult(ok=True, output={"path": out_path, "absolute_path": str(path), "entries": entries})
         except Exception as exc:
             return ToolResult(ok=False, error=str(exc))
 

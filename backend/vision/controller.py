@@ -128,18 +128,22 @@ class DesktopController:
         state_text = self._build_state_text(info, grid, cells)
 
         annotated_b64 = ""
+        raw_b64 = ""
         if include_image:
+            raw_b64 = base64.b64encode(info.image_bytes).decode()
             try:
                 annotated = grid.annotate_image(info.image_bytes)
                 annotated_b64 = base64.b64encode(annotated).decode()
             except Exception:
-                annotated_b64 = base64.b64encode(info.image_bytes).decode()
+                annotated_b64 = raw_b64
 
         return {
             "width": info.width,
             "height": info.height,
             "cols": self._cols,
             "rows": self._rows,
+            "image_b64": raw_b64,
+            "image_mime_type": "image/jpeg",
             "annotated_png_b64": annotated_b64,
             "state_text": state_text,
             "cells": cells,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from typing import Any
 
 import httpx
 
@@ -90,6 +91,26 @@ class LlamaClient:
             raise last_exc
         raise RuntimeError("Completion call failed without an exception")
 
+    async def _post_chat_completion(self, payload: dict) -> dict:
+        last_exc: Exception | None = None
+        for attempt in range(self._MAX_COMPLETION_RETRIES + 1):
+            try:
+                async with httpx.AsyncClient(timeout=self._completion_timeout) as client:
+                    response = await client.post(f"{self.base_url}/v1/chat/completions", json=payload)
+                if response.status_code >= 400:
+                    self._raise_completion_error(response)
+                return response.json()
+            except Exception as exc:
+                if not self._is_transient_completion_error(exc) or attempt >= self._MAX_COMPLETION_RETRIES:
+                    raise
+                last_exc = exc
+                await self._wait_for_server_recovery(self._RECOVERY_HEALTH_WAIT_SECONDS)
+                await asyncio.sleep(self._RETRY_BASE_DELAY_SECONDS * (2 ** attempt))
+
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("Chat completion call failed without an exception")
+
     async def complete(
         self,
         prompt: str,
@@ -129,6 +150,72 @@ class LlamaClient:
         retry_result = await self._post_completion(retry_payload)
         return self._extract_text(retry_result)
 
+    async def chat_complete(
+        self,
+        messages: list[dict[str, Any]],
+        max_tokens: int = 512,
+        temperature: float = 0.3,
+        *,
+        model: str = "local",
+        extra: dict[str, Any] | None = None,
+    ) -> str:
+        """Run an OpenAI-compatible llama.cpp chat completion.
+
+        This path is required for multimodal input on current llama.cpp
+        servers: images are passed as chat content parts rather than embedded
+        into the legacy raw ``/completion`` prompt.
+        """
+        payload: dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            # Supported by some llama.cpp builds/templates; harmless to retry
+            # without it if a model/template responds with empty content.
+            "thinking": False,
+        }
+        if extra:
+            payload.update(extra)
+
+        result = await self._post_chat_completion(payload)
+        text = self._extract_chat_text(result)
+        if text.strip():
+            return text
+
+        retry_payload = dict(payload)
+        retry_payload.pop("thinking", None)
+        retry_result = await self._post_chat_completion(retry_payload)
+        return self._extract_chat_text(retry_result)
+
+    async def complete_with_image(
+        self,
+        prompt: str,
+        image_b64: str,
+        max_tokens: int = 1024,
+        temperature: float = 0.3,
+        *,
+        mime_type: str = "image/png",
+    ) -> str:
+        image_payload = (image_b64 or "").strip()
+        if image_payload.startswith("data:image"):
+            image_url = image_payload
+        else:
+            image_url = f"data:{mime_type};base64,{image_payload}"
+
+        return await self.chat_complete(
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": image_url}},
+                    ],
+                }
+            ],
+            max_tokens=max_tokens,
+            temperature=temperature,
+        )
+
     @staticmethod
     def _extract_text(result: dict) -> str:
         # Handle both response shapes.
@@ -136,9 +223,44 @@ class LlamaClient:
             return result["choices"][0].get("text", "")
         return result.get("content", "")
 
+    @staticmethod
+    def _extract_chat_text(result: dict) -> str:
+        choices = result.get("choices")
+        if not isinstance(choices, list) or not choices:
+            return ""
+        message = choices[0].get("message") if isinstance(choices[0], dict) else None
+        if not isinstance(message, dict):
+            return ""
+
+        content = message.get("content", "")
+        if isinstance(content, str) and content.strip():
+            return content
+        if isinstance(content, list):
+            parts: list[str] = []
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    text = item.get("text")
+                    if isinstance(text, str) and text.strip():
+                        parts.append(text)
+            if parts:
+                return "\n".join(parts)
+
+        # Several thinking-capable local models emit useful multimodal
+        # observations in reasoning_content even when visible content is empty.
+        reasoning = message.get("reasoning_content") or message.get("reasoning")
+        if isinstance(reasoning, str):
+            return reasoning.strip()
+        return ""
+
     async def get_slots(self) -> list[dict]:
         async with httpx.AsyncClient(timeout=self._probe_timeout) as client:
             response = await client.get(f"{self.base_url}/slots")
+            response.raise_for_status()
+            return response.json()
+
+    async def get_props(self) -> dict:
+        async with httpx.AsyncClient(timeout=self._probe_timeout) as client:
+            response = await client.get(f"{self.base_url}/props")
             response.raise_for_status()
             return response.json()
 

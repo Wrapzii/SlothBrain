@@ -13,7 +13,9 @@ def test_vision_status_reports_capabilities() -> None:
         assert "screenshot_backend" in body
         assert "input_available" in body
         assert "ocr_available" in body
-        assert body["multimodal_available"] is False
+        assert "multimodal_available" in body
+        assert "mmproj_configured" in body
+        assert "image_analysis_backend" in body
 
 
 def test_vision_run_returns_503_without_ocr_or_multimodal() -> None:

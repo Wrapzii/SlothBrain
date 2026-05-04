@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, MagicMock
 from backend.agents.sub_agent import SubAgent
 from backend.agents.registry import AgentRegistry
 from backend.agents.preset_manager import PresetManager
+from backend.tools.impl.sub_agent_tool import SubAgentTool
 
 SAMPLE_PRESET = {
     "id": "test-preset-id",
@@ -94,3 +95,28 @@ async def test_registry_spawn_without_overrides_uses_preset():
     assert agent.context_size == 8192
     assert agent.max_tokens == 1024
     assert agent.task_description == ""
+
+
+@pytest.mark.asyncio
+async def test_sub_agent_tool_returns_handoff_summary_and_slot():
+    registry = MagicMock()
+    registry._llama_client.get_slots = AsyncMock(
+        return_value=[
+            {"id": 0, "next_token": {"has_next_token": False}},
+            {"id": 1, "next_token": {"has_next_token": False}},
+        ]
+    )
+    agent = MagicMock()
+    agent.agent_id = "agent-1"
+    agent.preset_id = "research"
+    agent.slot_id = 1
+    agent.process = AsyncMock(return_value="Important delegated result.\nWith details.")
+    registry.spawn.return_value = agent
+    tool = SubAgentTool(registry=registry)
+
+    result = await tool.execute(preset_id="research", task="do work")
+
+    assert result.ok is True
+    assert result.output["slot_id"] == 1
+    assert result.output["response"] == "Important delegated result.\nWith details."
+    assert result.output["handoff_summary"] == "Important delegated result. With details."

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
@@ -17,6 +18,19 @@ logger = logging.getLogger(__name__)
 _DEFAULT_TIMEOUT = 30.0
 _MAX_RESPONSE_CHARS = 50_000
 _USER_AGENT = "SlothBrain/1.0 (+https://github.com/Wrapzii/SlothBrain)"
+
+
+def _apex_fallback_url(url: str) -> str:
+    try:
+        parts = urlsplit(url)
+    except Exception:
+        return ""
+    if not parts.netloc.lower().startswith("www."):
+        return ""
+    netloc = parts.netloc[4:]
+    if not netloc:
+        return ""
+    return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
 
 
 class WebFetchTool(Tool):
@@ -82,15 +96,29 @@ class WebFetchTool(Tool):
         if headers:
             request_headers.update(headers)
 
-        try:
+        async def _request(target_url: str) -> httpx.Response:
             async with httpx.AsyncClient(follow_redirects=True, timeout=timeout) as client:
                 if method.upper() == "POST":
                     if json_body is not None:
-                        resp = await client.post(url, headers=request_headers, json=json_body)
+                        return await client.post(target_url, headers=request_headers, json=json_body)
                     else:
-                        resp = await client.post(url, headers=request_headers, content=body.encode())
+                        return await client.post(target_url, headers=request_headers, content=body.encode())
                 else:
-                    resp = await client.get(url, headers=request_headers)
+                    return await client.get(target_url, headers=request_headers)
+
+        try:
+            try:
+                resp = await _request(url)
+            except httpx.ConnectError as exc:
+                fallback_url = _apex_fallback_url(url)
+                if not fallback_url:
+                    raise
+                logger.info("WebFetchTool retrying without www host: %s -> %s", url, fallback_url)
+                try:
+                    resp = await _request(fallback_url)
+                    url = fallback_url
+                except Exception:
+                    raise exc
 
             status = resp.status_code
             content_type = resp.headers.get("content-type", "")

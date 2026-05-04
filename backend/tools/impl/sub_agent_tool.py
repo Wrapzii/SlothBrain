@@ -17,6 +17,16 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _DEFAULT_MAX_TOKENS = 2048
+_MAX_HANDOFF_SUMMARY_CHARS = 2400
+
+
+def _make_handoff_summary(response: str) -> str:
+    cleaned = " ".join((response or "").split()).strip()
+    if not cleaned:
+        return ""
+    if len(cleaned) <= _MAX_HANDOFF_SUMMARY_CHARS:
+        return cleaned
+    return cleaned[:_MAX_HANDOFF_SUMMARY_CHARS].rstrip() + " ...[truncated]"
 
 
 class SubAgentTool(Tool):
@@ -115,6 +125,9 @@ class SubAgentTool(Tool):
                 output={
                     "agent_id": agent.agent_id,
                     "preset_id": agent.preset_id,
+                    "slot_id": agent.slot_id,
+                    "task": task,
+                    "handoff_summary": _make_handoff_summary(response),
                     "response": response,
                 },
             )
