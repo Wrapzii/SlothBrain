@@ -229,6 +229,8 @@ class AgenticLoop:
 
         await emit("start", {"task": task, "run_id": run_id})
 
+        # Initialised to empty dict so finish_run() always receives a valid
+        # argument even when _execute raises before producing a result.
         result: dict = {}
         try:
             result = await self._execute(

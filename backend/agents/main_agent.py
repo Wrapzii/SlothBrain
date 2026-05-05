@@ -1379,6 +1379,25 @@ class MainAgent:
     # Agentic-loop helpers
     # ------------------------------------------------------------------
 
+    def _diag_fast_plan(
+        self,
+        run_id: str | None,
+        approach: str,
+        steps: list[str],
+        source: str,
+    ) -> dict:
+        """Build a fast-path plan dict and optionally record it diagnostically."""
+        plan = {"approach": approach, "steps": steps}
+        if self._diagnostic is not None and run_id is not None:
+            self._diagnostic.record(
+                run_id,
+                "plan_parsed",
+                approach=approach,
+                steps=steps,
+                source=source,
+            )
+        return plan
+
     async def plan_task(self, task: str, *, run_id: str | None = None) -> dict:
         """Break a task into an ordered list of actionable steps.
 
@@ -1396,56 +1415,38 @@ class MainAgent:
         domain_match = _DOMAIN_RE.search(task_text)
         local_file_task = bool(_LOCAL_FILE_HINT_RE.search(task_text))
         if local_file_task:
-            fast_plan = {
-                "approach": "Use local filesystem tools directly and report concrete paths or file changes.",
-                "steps": [
+            return self._diag_fast_plan(
+                run_id,
+                approach="Use local filesystem tools directly and report concrete paths or file changes.",
+                steps=[
                     "Resolve the user's local filesystem request using real file or shell tools, then report exact paths, files found, or changes made."
                 ],
-            }
-            if self._diagnostic is not None and run_id is not None:
-                self._diagnostic.record(
-                    run_id, "plan_parsed",
-                    approach=fast_plan["approach"],
-                    steps=fast_plan["steps"],
-                    source="fast_path_local_file",
-                )
-            return fast_plan
+                source="fast_path_local_file",
+            )
 
         if _FETCH_INTENT_RE.search(task_text) and (url_match or domain_match) and not local_file_task:
             if url_match:
                 url = url_match.group(0)
             else:
                 url = f"https://{domain_match.group(0)}"
-            fast_plan = {
-                "approach": "Use web_fetch directly and summarize the response.",
-                "steps": [f"Use web_fetch to fetch {url} and report key findings."],
-            }
-            if self._diagnostic is not None and run_id is not None:
-                self._diagnostic.record(
-                    run_id, "plan_parsed",
-                    approach=fast_plan["approach"],
-                    steps=fast_plan["steps"],
-                    source="fast_path_web_fetch",
-                )
-            return fast_plan
+            return self._diag_fast_plan(
+                run_id,
+                approach="Use web_fetch directly and summarize the response.",
+                steps=[f"Use web_fetch to fetch {url} and report key findings."],
+                source="fast_path_web_fetch",
+            )
 
         # Fetch intent without a concrete URL/domain should ask for target
         # instead of letting the model invent a placeholder URL.
         if _FETCH_INTENT_RE.search(task_text) and not (url_match or domain_match) and not local_file_task:
-            fast_plan = {
-                "approach": "Ask user for a specific URL before running web_fetch.",
-                "steps": [
+            return self._diag_fast_plan(
+                run_id,
+                approach="Ask user for a specific URL before running web_fetch.",
+                steps=[
                     "Ask the user to provide a full URL or domain to fetch (for example: https://example.com)."
                 ],
-            }
-            if self._diagnostic is not None and run_id is not None:
-                self._diagnostic.record(
-                    run_id, "plan_parsed",
-                    approach=fast_plan["approach"],
-                    steps=fast_plan["steps"],
-                    source="fast_path_no_url",
-                )
-            return fast_plan
+                source="fast_path_no_url",
+            )
 
         # NOTE: The plan prompt MUST share the same system-prompt prefix as
         # execute_step so llama.cpp can reuse the KV cache between planning and
