@@ -151,9 +151,10 @@ class AppConfig(BaseSettings):
     workspace_index_db_path: str = ""
 
     # Offline agentic failure diagnostics
-    # When enabled, every agentic run writes a structured JSON bundle to
-    # diagnostics_output_dir/{run_id}/bundle.json for offline analysis.
-    diagnostics_enabled: bool = False
+    # Enabled by default.  Every run (agentic and direct) writes a structured
+    # JSON bundle to diagnostics_output_dir/{run_id}/bundle.json for offline
+    # analysis.  Set SLOTHBRAIN_DIAGNOSTICS_ENABLED=false to opt out.
+    diagnostics_enabled: bool = True
     diagnostics_output_dir: str = "diagnostics/runs"
 
     # Agentic debug loop defaults

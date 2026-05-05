@@ -1,9 +1,23 @@
 """Offline agentic failure diagnostics – structured trace bundle recorder.
 
-Every agentic run emits a self-contained JSON bundle to
+Every run emits a self-contained JSON bundle to
 ``diagnostics/runs/{run_id}/bundle.json``.  The bundle is designed to be
 read by a human *or* fed to a separate AI model for offline failure analysis,
 without requiring a second running llama.cpp instance.
+
+Crash safety
+------------
+Events are flushed **incrementally** so that no data is lost if the process
+terminates before :meth:`finish_run` is called:
+
+* :meth:`start_run` creates ``{run_dir}/partial.json`` (run metadata) and
+  opens ``{run_dir}/events.jsonl`` for appended writes.
+* Every :meth:`record` call appends one JSON line to ``events.jsonl``
+  **before** returning.
+* :meth:`finish_run` assembles the final ``bundle.json`` from in-memory
+  events, then removes ``partial.json``.  If the process crashes after
+  ``start_run`` but before ``finish_run``, all events recorded so far are
+  preserved in ``events.jsonl``.
 
 Bundle sections
 ---------------
@@ -28,9 +42,16 @@ Bundle sections
 
 Usage
 -----
-Set ``SLOTHBRAIN_DIAGNOSTICS_ENABLED=true`` to activate.  Each run writes
-one bundle.  Completed bundles are listed via ``GET /api/diagnostics/runs``
-and fetched via ``GET /api/diagnostics/runs/{run_id}``.
+Diagnostics are **enabled by default**.  Set
+``SLOTHBRAIN_DIAGNOSTICS_ENABLED=false`` to opt out.  Each run writes one
+bundle.  Completed bundles are listed via ``GET /api/diagnostics/runs`` and
+fetched via ``GET /api/diagnostics/runs/{run_id}``.
+
+Path safety
+-----------
+The output directory must resolve to a path **inside** the project root.
+An incorrect ``diagnostics_output_dir`` value that would write outside the
+project is rejected at construction time.
 """
 
 from __future__ import annotations
@@ -52,6 +73,42 @@ _MAX_PROMPT_PREVIEW_CHARS = 600
 _MAX_TOOL_OUTPUT_CHARS = 3000
 _MAX_TOOL_ARG_CHARS = 1000
 
+# Project root is three levels up from this file:
+# backend/core/diagnostic_recorder.py → backend/core → backend → project root
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+
+
+def _resolve_and_validate_output_dir(output_dir: str | Path) -> Path:
+    """Resolve *output_dir* and, for relative paths, verify it stays inside the project root.
+
+    Relative paths are anchored to the project root so that
+    ``diagnostics/runs`` always means ``{project_root}/diagnostics/runs``
+    regardless of the process working directory.  Paths that would escape
+    the project root (e.g. ``../../etc``) are rejected.
+
+    Absolute paths are accepted as-is so that tests and explicit
+    deployments can write to arbitrary locations.
+
+    Raises
+    ------
+    ValueError
+        If a relative path resolves outside the project root.
+    """
+    path = Path(output_dir)
+    if path.is_absolute():
+        return path.resolve()
+    # Relative path: anchor to project root and check for escapes.
+    resolved = (_PROJECT_ROOT / path).resolve()
+    try:
+        resolved.relative_to(_PROJECT_ROOT.resolve())
+    except ValueError:
+        raise ValueError(
+            f"diagnostics_output_dir {output_dir!r} resolves to {resolved!r} "
+            f"which escapes the project root {_PROJECT_ROOT.resolve()!r}. "
+            "Set SLOTHBRAIN_DIAGNOSTICS_OUTPUT_DIR to a path inside the project."
+        )
+    return resolved
+
 
 class DiagnosticRecorder:
     """Captures agentic-run events and writes diagnostic bundles to disk.
@@ -63,9 +120,9 @@ class DiagnosticRecorder:
     ----------
     output_dir:
         Root directory for bundles.  Subdirectory ``{output_dir}/{run_id}/``
-        is created per run.
+        is created per run.  Must resolve to a path inside the project root.
     enabled:
-        When ``False`` every method is a no-op (zero overhead in production).
+        When ``False`` every method is a no-op (zero overhead).
     """
 
     def __init__(
@@ -74,7 +131,17 @@ class DiagnosticRecorder:
         enabled: bool = True,
     ) -> None:
         self._enabled = enabled
-        self._output_dir = Path(output_dir)
+        if enabled:
+            try:
+                self._output_dir = _resolve_and_validate_output_dir(output_dir)
+            except ValueError as exc:
+                logger.error(
+                    "DiagnosticRecorder: disabling diagnostics due to invalid output_dir — %s", exc
+                )
+                self._enabled = False
+                self._output_dir = Path(output_dir)
+        else:
+            self._output_dir = Path(output_dir)
         # run_id → internal run state dict
         self._runs: dict[str, dict] = {}
 
@@ -91,18 +158,49 @@ class DiagnosticRecorder:
         if not self._enabled:
             return
         now = time.monotonic()
+        started_at = datetime.now(timezone.utc).isoformat()
+        # run_dir is None if the directory could not be created; in that case
+        # events are still kept in memory but not incrementally flushed.
+        run_dir: Path | None = self._output_dir / run_id
+        try:
+            run_dir.mkdir(parents=True, exist_ok=True)  # type: ignore[union-attr]
+            # Write partial.json immediately so the run is visible even if
+            # the process crashes before finish_run() is called.
+            partial = {
+                "schema_version": _SCHEMA_VERSION,
+                "run_id": run_id,
+                "task": task,
+                "started_at": started_at,
+                "run_metadata": dict(metadata),
+                "status": "in_progress",
+            }
+            (run_dir / "partial.json").write_text(  # type: ignore[operator]
+                json.dumps(partial, ensure_ascii=False, indent=2, default=str),
+                encoding="utf-8",
+            )
+        except Exception as exc:
+            logger.warning(
+                "DiagnosticRecorder: failed to create run dir for %s: %s", run_id, exc
+            )
+            run_dir = None
+
         self._runs[run_id] = {
             "task": task,
-            "started_at": datetime.now(timezone.utc).isoformat(),
+            "started_at": started_at,
             "start_mono": now,
             "metadata": dict(metadata),
             "events": [],
             "seq": 0,
+            "run_dir": run_dir,
         }
         self.record(run_id, "run_start", task=task)
 
     def record(self, run_id: str, event_type: str, **data: Any) -> None:
-        """Append a timestamped event to the run's event log."""
+        """Append a timestamped event to the run's event log.
+
+        The event is written to ``events.jsonl`` immediately so no data is
+        lost if the process terminates before :meth:`finish_run`.
+        """
         if not self._enabled:
             return
         state = self._runs.get(run_id)
@@ -114,8 +212,21 @@ class DiagnosticRecorder:
         event.update(data)
         state["events"].append(event)
 
+        # Incremental flush — append to events.jsonl right away.
+        run_dir: Path | None = state.get("run_dir")
+        if run_dir is not None:
+            try:
+                with (run_dir / "events.jsonl").open("a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(event, ensure_ascii=False, default=str))
+                    fh.write("\n")
+            except Exception as exc:
+                logger.warning(
+                    "DiagnosticRecorder: failed to write event to events.jsonl for %s: %s",
+                    run_id, exc,
+                )
+
     def finish_run(self, run_id: str, final_result: dict) -> None:
-        """Finalise recording and flush the bundle to disk."""
+        """Finalise recording and flush the complete bundle to disk."""
         if not self._enabled:
             return
         state = self._runs.pop(run_id, None)
@@ -134,7 +245,7 @@ class DiagnosticRecorder:
             "events": state["events"],
             "final_result": _safe_serialize(final_result),
         }
-        self._write_bundle(run_id, bundle)
+        self._write_bundle(run_id, bundle, run_dir=state.get("run_dir"))
 
     # ------------------------------------------------------------------
     # Typed convenience recorders
@@ -266,9 +377,10 @@ class DiagnosticRecorder:
     # I/O
     # ------------------------------------------------------------------
 
-    def _write_bundle(self, run_id: str, bundle: dict) -> None:
-        try:
+    def _write_bundle(self, run_id: str, bundle: dict, run_dir: Path | None = None) -> None:
+        if run_dir is None:
             run_dir = self._output_dir / run_id
+        try:
             run_dir.mkdir(parents=True, exist_ok=True)
             bundle_path = run_dir / "bundle.json"
             bundle_path.write_text(
@@ -276,6 +388,13 @@ class DiagnosticRecorder:
                 encoding="utf-8",
             )
             logger.info("Diagnostic bundle written: %s", bundle_path)
+            # Remove partial.json now that bundle.json supersedes it.
+            partial_path = run_dir / "partial.json"
+            if partial_path.exists():
+                try:
+                    partial_path.unlink()
+                except Exception:
+                    pass
             # Auto-run the analyzer immediately after writing the bundle.
             self._run_analyzer(run_id, bundle, run_dir)
         except Exception as exc:
@@ -313,7 +432,12 @@ class DiagnosticRecorder:
     # ------------------------------------------------------------------
 
     def list_runs(self) -> list[dict]:
-        """Return summary metadata for all completed bundles on disk, newest first."""
+        """Return summary metadata for all runs on disk, newest first.
+
+        Includes both completed runs (``bundle.json`` present) and
+        partial/crashed runs (``partial.json`` or ``events.jsonl`` present
+        without a ``bundle.json``).
+        """
         runs: list[dict] = []
         if not self._output_dir.exists():
             return runs
@@ -324,20 +448,56 @@ class DiagnosticRecorder:
         )
         for entry in entries:
             bundle_path = entry / "bundle.json"
-            if not bundle_path.exists():
+            if bundle_path.exists():
+                try:
+                    data = json.loads(bundle_path.read_text(encoding="utf-8"))
+                    final = data.get("final_result") or {}
+                    runs.append(
+                        {
+                            "run_id": data.get("run_id", entry.name),
+                            "task": data.get("task", ""),
+                            "started_at": data.get("started_at", ""),
+                            "duration_seconds": data.get("duration_seconds"),
+                            "event_count": len(data.get("events", [])),
+                            "completion_verified": final.get("completion_verified"),
+                            "total_steps": final.get("total_steps"),
+                            "status": "complete",
+                        }
+                    )
+                except Exception:
+                    pass
                 continue
+
+            # Partial / crashed run — try partial.json first, then events.jsonl.
+            partial_path = entry / "partial.json"
+            jsonl_path = entry / "events.jsonl"
             try:
-                data = json.loads(bundle_path.read_text(encoding="utf-8"))
-                final = data.get("final_result") or {}
+                if partial_path.exists():
+                    meta = json.loads(partial_path.read_text(encoding="utf-8"))
+                    task = meta.get("task", "")
+                    started_at = meta.get("started_at", "")
+                elif jsonl_path.exists():
+                    # Read just the first line (run_start event).
+                    with jsonl_path.open(encoding="utf-8") as fh:
+                        first = json.loads(fh.readline())
+                    task = first.get("task", "")
+                    started_at = ""
+                else:
+                    continue
+                event_count = 0
+                if jsonl_path.exists():
+                    with jsonl_path.open(encoding="utf-8") as fh:
+                        event_count = sum(1 for _ in fh)
                 runs.append(
                     {
-                        "run_id": data.get("run_id", entry.name),
-                        "task": data.get("task", ""),
-                        "started_at": data.get("started_at", ""),
-                        "duration_seconds": data.get("duration_seconds"),
-                        "event_count": len(data.get("events", [])),
-                        "completion_verified": final.get("completion_verified"),
-                        "total_steps": final.get("total_steps"),
+                        "run_id": entry.name,
+                        "task": task,
+                        "started_at": started_at,
+                        "duration_seconds": None,
+                        "event_count": event_count,
+                        "completion_verified": None,
+                        "total_steps": None,
+                        "status": "partial",
                     }
                 )
             except Exception:
@@ -345,15 +505,57 @@ class DiagnosticRecorder:
         return runs
 
     def get_bundle(self, run_id: str) -> dict | None:
-        """Load and return a specific bundle by run_id, or None if not found."""
-        bundle_path = self._output_dir / run_id / "bundle.json"
-        if not bundle_path.exists():
+        """Load and return a specific bundle by run_id, or None if not found.
+
+        For partial/crashed runs (no ``bundle.json`` yet) the partial metadata
+        and all events from ``events.jsonl`` are assembled and returned with
+        ``"status": "partial"``.
+        """
+        run_dir = self._output_dir / run_id
+        bundle_path = run_dir / "bundle.json"
+        if bundle_path.exists():
+            try:
+                return json.loads(bundle_path.read_text(encoding="utf-8"))
+            except Exception as exc:
+                logger.warning(
+                    "Failed to read diagnostic bundle for run %s: %s", run_id, exc
+                )
+                return None
+
+        # Partial run: try to assemble from events.jsonl + partial.json.
+        jsonl_path = run_dir / "events.jsonl"
+        partial_path = run_dir / "partial.json"
+        if not jsonl_path.exists() and not partial_path.exists():
             return None
         try:
-            return json.loads(bundle_path.read_text(encoding="utf-8"))
+            meta: dict = {}
+            if partial_path.exists():
+                meta = json.loads(partial_path.read_text(encoding="utf-8"))
+            events: list[dict] = []
+            if jsonl_path.exists():
+                with jsonl_path.open(encoding="utf-8") as fh:
+                    for line in fh:
+                        line = line.strip()
+                        if line:
+                            try:
+                                events.append(json.loads(line))
+                            except Exception:
+                                pass
+            return {
+                "schema_version": _SCHEMA_VERSION,
+                "run_id": run_id,
+                "task": meta.get("task", ""),
+                "started_at": meta.get("started_at", ""),
+                "finished_at": None,
+                "duration_seconds": None,
+                "run_metadata": meta.get("run_metadata", {}),
+                "events": events,
+                "final_result": None,
+                "status": "partial",
+            }
         except Exception as exc:
             logger.warning(
-                "Failed to read diagnostic bundle for run %s: %s", run_id, exc
+                "Failed to assemble partial bundle for run %s: %s", run_id, exc
             )
             return None
 

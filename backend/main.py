@@ -7,6 +7,7 @@ import logging
 import re
 import shlex
 import time
+import uuid
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from functools import lru_cache
@@ -762,19 +763,38 @@ class DiscordDMBridge:
 
     async def _run_direct_task(self, user_key: str, content: str, original_content: str) -> None:
         """Run a direct chat turn and post the result to Discord."""
+        _diag_run_id = f"discord-direct-{uuid.uuid4().hex[:12]}"
+        _diag = diagnostic_recorder
+        if _diag is not None and _diag.enabled:
+            _diag.start_run(
+                _diag_run_id,
+                task=content,
+                metadata={"mode": "direct", "source": "discord_dm", "user_key": user_key},
+            )
         try:
             async with _inference_lock:
                 response = await self._main_agent.process_direct(
                     user_input=content,
                     conversation_context=list(self._dm_context.get(user_key, [])),
                 )
+            if _diag is not None and _diag.enabled:
+                _diag.finish_run(
+                    _diag_run_id,
+                    {"mode": "direct", "completed": True, "completion_verified": True},
+                )
         except (httpx.ConnectError, httpx.RemoteProtocolError, ConnectionRefusedError) as exc:
+            if _diag is not None and _diag.enabled:
+                _diag.record(_diag_run_id, "run_error", error=exc.__class__.__name__)
+                _diag.finish_run(_diag_run_id, {"mode": "direct", "completed": False})
             response = (
                 "⚠️ SlothBrain cannot reach the AI inference server. "
                 "Make sure llama.cpp is running, then try again."
             )
             logger.error("Discord direct task — inference server unreachable: %s", exc)
         except Exception as exc:
+            if _diag is not None and _diag.enabled:
+                _diag.record(_diag_run_id, "run_error", error=exc.__class__.__name__)
+                _diag.finish_run(_diag_run_id, {"mode": "direct", "completed": False})
             response = f"[Error: {exc.__class__.__name__}]"
             logger.error("Discord direct task failed: %s", exc)
 
@@ -936,16 +956,18 @@ async def lifespan(app: FastAPI):  # type: ignore[type-arg]
     # Safety infrastructure for the agentic loop
     checkpoint_manager = CheckpointManager()
 
-    # Offline diagnostics recorder (opt-in via SLOTHBRAIN_DIAGNOSTICS_ENABLED)
+    # Offline diagnostics recorder (on by default; set SLOTHBRAIN_DIAGNOSTICS_ENABLED=false to disable)
     diagnostic_recorder = DiagnosticRecorder(
         output_dir=settings.diagnostics_output_dir,
         enabled=settings.diagnostics_enabled,
     )
-    if settings.diagnostics_enabled:
+    if diagnostic_recorder.enabled:
         logger.info(
             "Diagnostic recorder enabled; bundles will be written to %s",
-            settings.diagnostics_output_dir,
+            diagnostic_recorder._output_dir,
         )
+    else:
+        logger.info("Diagnostic recorder disabled.")
     safety_supervisor = SafetySupervisor(
         llama_client=llama_client,
         checkpoint_manager=checkpoint_manager,
@@ -1694,11 +1716,26 @@ async def chat(http_request: Request, request: ChatRequest) -> dict:
 
     if not use_agentic:
         await _ensure_llama_available("Direct chat")
+        _diag_run_id = f"direct-{uuid.uuid4().hex[:12]}"
+        if diagnostic_recorder is not None and diagnostic_recorder.enabled:
+            diagnostic_recorder.start_run(
+                _diag_run_id,
+                task=request.message,
+                metadata={"mode": "direct", "source": "/api/chat"},
+            )
         async with _inference_lock:
             try:
                 response = await main_agent.process_direct(user_input=request.message)
             except (httpx.HTTPError, RuntimeError, ValueError) as exc:
+                if diagnostic_recorder is not None and diagnostic_recorder.enabled:
+                    diagnostic_recorder.record(_diag_run_id, "run_error", error=str(exc))
+                    diagnostic_recorder.finish_run(_diag_run_id, {"mode": "direct", "completed": False})
                 _raise_service_unavailable(exc, "Direct chat")
+        if diagnostic_recorder is not None and diagnostic_recorder.enabled:
+            diagnostic_recorder.finish_run(
+                _diag_run_id,
+                {"mode": "direct", "completed": True, "completion_verified": True},
+            )
         response = _sanitize_user_facing_response(response)
         if not response:
             response = "I can do that. Please share the response text you'd like me to compact."
@@ -1768,11 +1805,26 @@ async def direct_chat(request: ChatRequest) -> dict:
         }
 
     await _ensure_llama_available("Direct chat")
+    _diag_run_id = f"direct-{uuid.uuid4().hex[:12]}"
+    if diagnostic_recorder is not None and diagnostic_recorder.enabled:
+        diagnostic_recorder.start_run(
+            _diag_run_id,
+            task=request.message,
+            metadata={"mode": "direct", "source": "/api/chat/direct"},
+        )
     async with _inference_lock:
         try:
             response = await main_agent.process_direct(user_input=request.message)
         except (httpx.HTTPError, RuntimeError, ValueError) as exc:
+            if diagnostic_recorder is not None and diagnostic_recorder.enabled:
+                diagnostic_recorder.record(_diag_run_id, "run_error", error=str(exc))
+                diagnostic_recorder.finish_run(_diag_run_id, {"mode": "direct", "completed": False})
             _raise_service_unavailable(exc, "Direct chat")
+    if diagnostic_recorder is not None and diagnostic_recorder.enabled:
+        diagnostic_recorder.finish_run(
+            _diag_run_id,
+            {"mode": "direct", "completed": True, "completion_verified": True},
+        )
     response = _sanitize_user_facing_response(response)
     if not response:
         response = "I can do that. Please share the response text you'd like me to compact."
@@ -1836,11 +1888,12 @@ async def agentic_chat(http_request: Request, request: AgenticRequest) -> dict:
 
 @app.get("/api/diagnostics/runs")
 async def list_diagnostic_runs() -> dict:
-    """List all completed diagnostic bundles, newest first.
+    """List all diagnostic run bundles (complete and partial), newest first.
 
     Each entry contains ``run_id``, ``task``, ``started_at``,
     ``duration_seconds``, ``event_count``, ``completion_verified``,
-    ``total_steps``, and ``finding_count`` (if analysis ran).
+    ``total_steps``, ``status`` (``"complete"`` | ``"partial"``), and
+    ``finding_count`` (if analysis ran).
     """
     if diagnostic_recorder is None or not diagnostic_recorder.enabled:
         return {"enabled": False, "runs": []}
