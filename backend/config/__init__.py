@@ -150,6 +150,12 @@ class AppConfig(BaseSettings):
     # from the main LanceDB memory.  Defaults to a sub-directory of lancedb_path.
     workspace_index_db_path: str = ""
 
+    # Offline agentic failure diagnostics
+    # When enabled, every agentic run writes a structured JSON bundle to
+    # diagnostics_output_dir/{run_id}/bundle.json for offline analysis.
+    diagnostics_enabled: bool = False
+    diagnostics_output_dir: str = "diagnostics/runs"
+
     # Agentic debug loop defaults
     # Enable to run the loop with runtime-tunable feature toggles and loop telemetry.
     debug_loop_enabled: bool = False

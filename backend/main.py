@@ -28,6 +28,7 @@ from backend.config import settings
 from backend.core.approval_queue import ApprovalQueue
 from backend.core.audit_log import AuditLog
 from backend.core.checkpoint_manager import CheckpointManager
+from backend.core.diagnostic_recorder import DiagnosticRecorder
 from backend.core.llama_client import LlamaClient
 from backend.core.resource_manager import ResourceManager
 from backend.core.safety_supervisor import SafetySupervisor
@@ -736,6 +737,7 @@ class DiscordDMBridge:
                     checkpoint_manager=checkpoint_manager,
                     supervisor=safety_supervisor,
                     debug_options=debug_options,
+                    diagnostic=diagnostic_recorder,
                 )
                 result = await loop.run(task=task_message, on_progress=_capture_progress)
             # Defensive: ensure result is a valid dict before extracting
@@ -855,6 +857,7 @@ checkpoint_manager: CheckpointManager
 safety_supervisor: SafetySupervisor
 tool_registry: ToolRegistry
 discord_dm_bridge: "DiscordDMBridge | None" = None
+diagnostic_recorder: "DiagnosticRecorder | None" = None
 
 
 @asynccontextmanager
@@ -863,6 +866,7 @@ async def lifespan(app: FastAPI):  # type: ignore[type-arg]
     global memory, main_agent, benchmark_suite
     global preset_manager, agent_registry, server_manager, audit_log, approval_queue
     global checkpoint_manager, safety_supervisor, tool_registry, discord_dm_bridge
+    global diagnostic_recorder
 
     audit_log = AuditLog()
     approval_queue = ApprovalQueue(max_entries=settings.max_pending_approvals)
@@ -931,6 +935,17 @@ async def lifespan(app: FastAPI):  # type: ignore[type-arg]
 
     # Safety infrastructure for the agentic loop
     checkpoint_manager = CheckpointManager()
+
+    # Offline diagnostics recorder (opt-in via SLOTHBRAIN_DIAGNOSTICS_ENABLED)
+    diagnostic_recorder = DiagnosticRecorder(
+        output_dir=settings.diagnostics_output_dir,
+        enabled=settings.diagnostics_enabled,
+    )
+    if settings.diagnostics_enabled:
+        logger.info(
+            "Diagnostic recorder enabled; bundles will be written to %s",
+            settings.diagnostics_output_dir,
+        )
     safety_supervisor = SafetySupervisor(
         llama_client=llama_client,
         checkpoint_manager=checkpoint_manager,
@@ -1110,6 +1125,7 @@ def _register_tools(
                     checkpoint_manager=checkpoint_manager,
                     supervisor=safety_supervisor,
                     debug_options=AgenticDebugOptions(),
+                    diagnostic=diagnostic_recorder,
                 )
                 result = await loop.run(task=task_message, on_progress=_capture_progress)
             if isinstance(result, dict):
@@ -1290,6 +1306,8 @@ class SettingsUpdate(BaseModel):
     debug_loop_supervisor_enabled: Optional[bool] = None
     debug_loop_per_event_logging: Optional[bool] = None
     debug_loop_allowed_tools: Optional[list[str]] = None
+    diagnostics_enabled: Optional[bool] = None
+    diagnostics_output_dir: Optional[str] = None
 
 
 class BenchmarkRequest(BaseModel):
@@ -1715,6 +1733,7 @@ async def chat(http_request: Request, request: ChatRequest) -> dict:
             checkpoint_manager=checkpoint_manager,
             supervisor=safety_supervisor,
             debug_options=debug_options,
+            diagnostic=diagnostic_recorder,
         )
         try:
             result = await _run_agentic_with_cancel(
@@ -1795,6 +1814,7 @@ async def agentic_chat(http_request: Request, request: AgenticRequest) -> dict:
             checkpoint_manager=checkpoint_manager,
             supervisor=safety_supervisor,
             debug_options=debug_options,
+            diagnostic=diagnostic_recorder,
         )
         try:
             result = await _run_agentic_with_cancel(
@@ -1808,6 +1828,39 @@ async def agentic_chat(http_request: Request, request: AgenticRequest) -> dict:
         details=request.task[:100],
     )
     return result
+
+
+# ---------------------------------------------------------------------------
+# Diagnostic bundle endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/api/diagnostics/runs")
+async def list_diagnostic_runs() -> dict:
+    """List all completed diagnostic bundles, newest first.
+
+    Each entry contains ``run_id``, ``task``, ``started_at``,
+    ``duration_seconds``, ``event_count``, ``completion_verified``, and
+    ``total_steps``.
+    """
+    if diagnostic_recorder is None or not diagnostic_recorder.enabled:
+        return {"enabled": False, "runs": []}
+    return {"enabled": True, "runs": diagnostic_recorder.list_runs()}
+
+
+@app.get("/api/diagnostics/runs/{run_id}")
+async def get_diagnostic_run(run_id: str) -> dict:
+    """Return the full diagnostic bundle for a specific run_id.
+
+    The bundle is the AI-readable JSON file written to
+    ``diagnostics/runs/{run_id}/bundle.json``.  Returns 404 if the run does
+    not exist or diagnostics are disabled.
+    """
+    if diagnostic_recorder is None or not diagnostic_recorder.enabled:
+        raise HTTPException(status_code=404, detail="Diagnostics not enabled")
+    bundle = diagnostic_recorder.get_bundle(run_id)
+    if bundle is None:
+        raise HTTPException(status_code=404, detail=f"Run {run_id!r} not found")
+    return bundle
 
 
 @app.get("/api/mode")

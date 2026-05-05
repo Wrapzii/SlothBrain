@@ -17,6 +17,7 @@ from backend.memory.rolling_context import RollingContext
 if TYPE_CHECKING:
     from backend.agents.registry import AgentRegistry
     from backend.agents.sub_agent import SubAgent
+    from backend.core.diagnostic_recorder import DiagnosticRecorder
     from backend.tools.registry import ToolRegistry
 
 logger = logging.getLogger(__name__)
@@ -879,6 +880,8 @@ class MainAgent:
             summarize_at=summarize_at,
             summary_timeout_seconds=summary_timeout,
         )
+        # Optional diagnostic recorder – injected after construction.
+        self._diagnostic: "DiagnosticRecorder | None" = None
 
     def set_registry(self, registry: "AgentRegistry") -> None:
         """Inject the AgentRegistry so MainAgent can spawn sub-agents."""
@@ -887,6 +890,10 @@ class MainAgent:
     def set_tool_registry(self, tool_registry: "ToolRegistry") -> None:
         """Inject the ToolRegistry."""
         self._tool_registry = tool_registry
+
+    def set_diagnostic_recorder(self, recorder: "DiagnosticRecorder | None") -> None:
+        """Inject an optional DiagnosticRecorder for offline run analysis."""
+        self._diagnostic = recorder
 
     async def _append_rolling_context(self, ctx: RollingContext, role: str, content: str) -> None:
         text = (content or "").strip()
@@ -1372,7 +1379,7 @@ class MainAgent:
     # Agentic-loop helpers
     # ------------------------------------------------------------------
 
-    async def plan_task(self, task: str) -> dict:
+    async def plan_task(self, task: str, *, run_id: str | None = None) -> dict:
         """Break a task into an ordered list of actionable steps.
 
         Requests JSON output for reliable parsing.  Falls back to regex
@@ -1389,32 +1396,56 @@ class MainAgent:
         domain_match = _DOMAIN_RE.search(task_text)
         local_file_task = bool(_LOCAL_FILE_HINT_RE.search(task_text))
         if local_file_task:
-            return {
+            fast_plan = {
                 "approach": "Use local filesystem tools directly and report concrete paths or file changes.",
                 "steps": [
                     "Resolve the user's local filesystem request using real file or shell tools, then report exact paths, files found, or changes made."
                 ],
             }
+            if self._diagnostic is not None and run_id is not None:
+                self._diagnostic.record(
+                    run_id, "plan_parsed",
+                    approach=fast_plan["approach"],
+                    steps=fast_plan["steps"],
+                    source="fast_path_local_file",
+                )
+            return fast_plan
 
         if _FETCH_INTENT_RE.search(task_text) and (url_match or domain_match) and not local_file_task:
             if url_match:
                 url = url_match.group(0)
             else:
                 url = f"https://{domain_match.group(0)}"
-            return {
+            fast_plan = {
                 "approach": "Use web_fetch directly and summarize the response.",
                 "steps": [f"Use web_fetch to fetch {url} and report key findings."],
             }
+            if self._diagnostic is not None and run_id is not None:
+                self._diagnostic.record(
+                    run_id, "plan_parsed",
+                    approach=fast_plan["approach"],
+                    steps=fast_plan["steps"],
+                    source="fast_path_web_fetch",
+                )
+            return fast_plan
 
         # Fetch intent without a concrete URL/domain should ask for target
         # instead of letting the model invent a placeholder URL.
         if _FETCH_INTENT_RE.search(task_text) and not (url_match or domain_match) and not local_file_task:
-            return {
+            fast_plan = {
                 "approach": "Ask user for a specific URL before running web_fetch.",
                 "steps": [
                     "Ask the user to provide a full URL or domain to fetch (for example: https://example.com)."
                 ],
             }
+            if self._diagnostic is not None and run_id is not None:
+                self._diagnostic.record(
+                    run_id, "plan_parsed",
+                    approach=fast_plan["approach"],
+                    steps=fast_plan["steps"],
+                    source="fast_path_no_url",
+                )
+            return fast_plan
 
         # NOTE: The plan prompt MUST share the same system-prompt prefix as
         # execute_step so llama.cpp can reuse the KV cache between planning and
@@ -1434,6 +1465,10 @@ class MainAgent:
             "- Steps must be ordered and build on each other.\n\n"
             f"Task: {task}\nassistant:"
         )
+
+        if self._diagnostic is not None and run_id is not None:
+            self._diagnostic.record_planning_request(run_id, prompt=plan_prompt)
+
         try:
             # Plan JSON rarely needs more than a few hundred tokens, but give it
             # room in case the task has many steps.
@@ -1441,10 +1476,27 @@ class MainAgent:
                 plan_prompt, max_tokens=1024
             )
         except Exception as exc:
+            if self._diagnostic is not None and run_id is not None:
+                self._diagnostic.record_planning_response(
+                    run_id, response="", error=exc.__class__.__name__
+                )
             logger.warning("plan_task failed: %s", exc.__class__.__name__)
             return {"steps": [task], "approach": "Direct execution"}
 
-        return _parse_plan(response)
+        if self._diagnostic is not None and run_id is not None:
+            self._diagnostic.record_planning_response(run_id, response=response)
+
+        result = _parse_plan(response)
+
+        if self._diagnostic is not None and run_id is not None:
+            self._diagnostic.record(
+                run_id, "plan_parsed",
+                approach=result.get("approach", ""),
+                steps=result.get("steps", []),
+                source="model",
+            )
+
+        return result
 
     async def execute_step(
         self,
@@ -1457,6 +1509,8 @@ class MainAgent:
         tool_calls_enabled: bool = True,
         semantic_routing_enabled: bool = True,
         allowed_tool_names: list[str] | None = None,
+        run_id: str | None = None,
+        step_num: int | None = None,
     ) -> str:
         """Execute a single step within a larger task.
 
@@ -1567,6 +1621,8 @@ class MainAgent:
         # Tool-calling loop
         accumulated_tool_context = ""
         last_tool_answer = ""
+        _diag = self._diagnostic  # local alias for brevity
+        _tool_names = [t.name for t in tools] if tools else []
         for iteration in range(_MAX_TOOL_ITERATIONS):
             prompt = step_prompt + accumulated_tool_context
             logger.info(
@@ -1579,9 +1635,27 @@ class MainAgent:
             # Give each iteration ample room. The model stops naturally when
             # done; we don't need to force-truncate the output.
             iter_max_tokens = self._config.main_context_size or 4096
+
+            if _diag is not None and run_id is not None:
+                _diag.record_model_request(
+                    run_id,
+                    step_num=step_num,
+                    iteration=iteration + 1,
+                    prompt=prompt,
+                    tools_available=_tool_names,
+                )
+
             try:
                 response = await self._slot_manager.send_to_main(prompt, max_tokens=iter_max_tokens)
             except Exception as exc:
+                if _diag is not None and run_id is not None:
+                    _diag.record_model_response(
+                        run_id,
+                        step_num=step_num,
+                        iteration=iteration + 1,
+                        response="",
+                        error=exc.__class__.__name__,
+                    )
                 if on_event is not None:
                     maybe = on_event(
                         {
@@ -1594,6 +1668,14 @@ class MainAgent:
                     if intervention:
                         return intervention.get("message", "Execution paused by SafetySupervisor.")
                 raise
+
+            if _diag is not None and run_id is not None:
+                _diag.record_model_response(
+                    run_id,
+                    step_num=step_num,
+                    iteration=iteration + 1,
+                    response=response,
+                )
 
             if on_event is not None:
                 maybe = on_event({"type": "model_output", "output": response})
@@ -1652,6 +1734,15 @@ class MainAgent:
                         handoff_lines,
                     )
 
+                if _diag is not None and run_id is not None:
+                    _diag.record_tool_call_parsed(
+                        run_id,
+                        step_num=step_num,
+                        iteration=iteration + 1,
+                        tool_name=tool_name,
+                        args=tool_args if isinstance(tool_args, dict) else {},
+                    )
+
                 if on_event is not None:
                     safe_args = _sanitize_tool_payload(tool_args)
                     maybe = on_event(
@@ -1676,6 +1767,17 @@ class MainAgent:
                         logger.warning("Tool %s raised: %s", tool_name, exc)
                         # Avoid leaking internal paths or credentials to the model.
                         result_dict = {"ok": False, "error": "Tool execution failed"}
+
+                if _diag is not None and run_id is not None:
+                    _diag.record_tool_executed(
+                        run_id,
+                        step_num=step_num,
+                        tool_name=tool_name,
+                        ok=bool(result_dict.get("ok")),
+                        output=result_dict.get("output"),
+                        error=result_dict.get("error"),
+                    )
+
                 rendered = _render_tool_result_answer(f"{task}\n{step}", tool_name, result_dict)
                 if rendered:
                     last_tool_answer = rendered

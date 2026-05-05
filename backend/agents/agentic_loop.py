@@ -47,6 +47,7 @@ from typing import TYPE_CHECKING, Awaitable, Callable, Optional
 if TYPE_CHECKING:
     from backend.agents.main_agent import MainAgent
     from backend.core.checkpoint_manager import CheckpointManager
+    from backend.core.diagnostic_recorder import DiagnosticRecorder
     from backend.core.safety_supervisor import LoopHandle, SafetySupervisor
 
 logger = logging.getLogger(__name__)
@@ -150,6 +151,7 @@ class AgenticLoop:
         checkpoint_manager: Optional["CheckpointManager"] = None,
         supervisor: Optional["SafetySupervisor"] = None,
         debug_options: Optional[AgenticDebugOptions] = None,
+        diagnostic: Optional["DiagnosticRecorder"] = None,
     ) -> None:
         self._main = main_agent
         self._max_steps = max_steps
@@ -157,6 +159,7 @@ class AgenticLoop:
         self._cp = checkpoint_manager
         self._supervisor = supervisor
         self._debug = debug_options or AgenticDebugOptions()
+        self._diagnostic = diagnostic
 
     # ------------------------------------------------------------------
     # Public interface
@@ -186,6 +189,28 @@ class AgenticLoop:
         run_id = str(uuid.uuid4())
         start_time = time.monotonic()
 
+        # Inject the diagnostic recorder into the main agent so plan_task and
+        # execute_step can record model-level events tied to this run_id.
+        if self._diagnostic is not None:
+            self._diagnostic.start_run(
+                run_id,
+                task=task,
+                metadata={
+                    "slot_id": self._main.slot_id,
+                    "max_steps": self._max_steps,
+                    "tool_calls_enabled": self._debug.tool_calls_enabled and not self._debug.llm_only,
+                    "planning_enabled": self._debug.planning_enabled,
+                    "rolling_context_enabled": self._debug.rolling_context_enabled,
+                    "semantic_routing_enabled": self._debug.semantic_routing_enabled,
+                    "checkpointing_enabled": self._debug.checkpointing_enabled,
+                    "supervisor_enabled": self._debug.supervisor_enabled,
+                    "allowed_tools": list(self._debug.allowed_tools or []),
+                    "llm_only": self._debug.llm_only,
+                },
+            )
+        # Give main_agent a reference to the recorder for model-level events.
+        self._main.set_diagnostic_recorder(self._diagnostic)
+
         async def emit(event_type: str, data: dict | None = None) -> None:
             payload: dict = {"type": event_type, **(data or {})}
             if self._debug.per_event_logging:
@@ -204,6 +229,7 @@ class AgenticLoop:
 
         await emit("start", {"task": task, "run_id": run_id})
 
+        result: dict = {}
         try:
             result = await self._execute(
                 run_id=run_id,
@@ -212,12 +238,25 @@ class AgenticLoop:
                 emit=emit,
                 start_time=start_time,
             )
+        except Exception as exc:
+            if self._diagnostic is not None:
+                self._diagnostic.record(
+                    run_id,
+                    "run_error",
+                    error=exc.__class__.__name__,
+                    message=str(exc)[:500],
+                )
+            raise
         finally:
             # Always deregister and clean up checkpoints
             if self._supervisor is not None and handle is not None:
                 self._supervisor.deregister(run_id)
             if self._cp is not None and self._debug.checkpointing_enabled:
                 self._cp.clear(run_id)
+            # Flush diagnostic bundle to disk and detach from main agent.
+            if self._diagnostic is not None:
+                self._diagnostic.finish_run(run_id, result)
+            self._main.set_diagnostic_recorder(None)
 
         return result
 
@@ -248,7 +287,7 @@ class AgenticLoop:
         else:
             await emit("planning", {"task": task})
             try:
-                plan = await self._main.plan_task(task)
+                plan = await self._main.plan_task(task, run_id=run_id)
             except Exception as exc:
                 logger.warning(
                     "plan_task failed (%s); falling back to single-step execution",
@@ -290,6 +329,12 @@ class AgenticLoop:
                     context=context,
                     executed_steps=[s.to_dict() for s in executed],
                 )
+                if self._diagnostic is not None:
+                    self._diagnostic.record(
+                        run_id,
+                        "checkpoint_saved",
+                        step_num=step_num,
+                    )
 
             # ── Supervisor heartbeat ──────────────────────────────────────
             if handle is not None:
@@ -317,6 +362,13 @@ class AgenticLoop:
                     "description": description,
                 },
             )
+            if self._diagnostic is not None:
+                self._diagnostic.record(
+                    run_id,
+                    "step_start",
+                    step_num=step_num,
+                    description=description,
+                )
 
             for attempt in range(_MAX_STEP_RETRIES + 1):
                 had_execution_error = False
@@ -449,6 +501,8 @@ class AgenticLoop:
                         tool_calls_enabled=self._debug.tool_calls_enabled and not self._debug.llm_only,
                         semantic_routing_enabled=self._debug.semantic_routing_enabled,
                         allowed_tool_names=self._debug.allowed_tools or None,
+                        run_id=run_id,
+                        step_num=step_num,
                     )
                     step.result = result
                     await emit(
@@ -542,6 +596,15 @@ class AgenticLoop:
             executed.append(step)
 
             await emit("step_complete", step.to_dict())
+            if self._diagnostic is not None:
+                self._diagnostic.record(
+                    run_id,
+                    "step_complete",
+                    step_num=step_num,
+                    status=step.status,
+                    retries=step.retries,
+                    result_preview=_preview(step.result),
+                )
 
             if final_action in ("abort", "escalate"):
                 reason = step.result
@@ -565,6 +628,14 @@ class AgenticLoop:
         summary = _derive_summary_from_steps(executed, verified)
 
         result_dict = _build_result(task, executed, verified, summary, start_time)
+        if self._diagnostic is not None:
+            self._diagnostic.record(
+                run_id,
+                "run_complete",
+                verified=verified,
+                total_steps=len(executed),
+                duration_seconds=result_dict.get("duration_seconds"),
+            )
         await emit(
             "complete",
             {
@@ -607,6 +678,14 @@ class AgenticLoop:
                 "message": message,
             },
         )
+        if self._diagnostic is not None:
+            self._diagnostic.record(
+                run_id,
+                "supervisor_intervention",
+                step_num=step.step_num,
+                action=action,
+                message=message[:300],
+            )
         logger.info(
             "Supervisor intervention (run=%s, step=%d): %s – %s",
             run_id,
@@ -620,6 +699,13 @@ class AgenticLoop:
             cp = self._cp.restore_last(run_id) if self._cp is not None else None
             if cp is not None:
                 new_idx = cp.step_num - 1  # 0-based
+                if self._diagnostic is not None:
+                    self._diagnostic.record(
+                        run_id,
+                        "checkpoint_restored",
+                        restored_to_step=cp.step_num,
+                        reason="supervisor_reset_context",
+                    )
                 await emit(
                     "context_reset",
                     {
