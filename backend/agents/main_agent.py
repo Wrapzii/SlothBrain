@@ -1644,6 +1644,7 @@ class MainAgent:
                     iteration=iteration + 1,
                     prompt=prompt,
                     tools_available=_tool_names,
+                    slot_id=self.slot_id,
                 )
 
             try:
@@ -1656,6 +1657,7 @@ class MainAgent:
                         iteration=iteration + 1,
                         response="",
                         error=exc.__class__.__name__,
+                        slot_id=self.slot_id,
                     )
                 if on_event is not None:
                     maybe = on_event(
@@ -1676,6 +1678,7 @@ class MainAgent:
                     step_num=step_num,
                     iteration=iteration + 1,
                     response=response,
+                    slot_id=self.slot_id,
                 )
 
             if on_event is not None:

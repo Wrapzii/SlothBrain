@@ -1839,12 +1839,17 @@ async def list_diagnostic_runs() -> dict:
     """List all completed diagnostic bundles, newest first.
 
     Each entry contains ``run_id``, ``task``, ``started_at``,
-    ``duration_seconds``, ``event_count``, ``completion_verified``, and
-    ``total_steps``.
+    ``duration_seconds``, ``event_count``, ``completion_verified``,
+    ``total_steps``, and ``finding_count`` (if analysis ran).
     """
     if diagnostic_recorder is None or not diagnostic_recorder.enabled:
         return {"enabled": False, "runs": []}
-    return {"enabled": True, "runs": diagnostic_recorder.list_runs()}
+    runs = diagnostic_recorder.list_runs()
+    # Enrich with finding_count from analysis.json where available.
+    for run in runs:
+        analysis = diagnostic_recorder.get_analysis(run["run_id"])
+        run["finding_count"] = analysis.get("finding_count") if analysis else None
+    return {"enabled": True, "runs": runs}
 
 
 @app.get("/api/diagnostics/runs/{run_id}")
@@ -1861,6 +1866,44 @@ async def get_diagnostic_run(run_id: str) -> dict:
     if bundle is None:
         raise HTTPException(status_code=404, detail=f"Run {run_id!r} not found")
     return bundle
+
+
+@app.get("/api/diagnostics/runs/{run_id}/analysis")
+async def get_diagnostic_analysis(run_id: str) -> dict:
+    """Return the pre-computed failure-mode analysis for a specific run.
+
+    The analysis is generated automatically when the bundle is written and
+    contains machine-readable findings with severity, confidence, and
+    suggested code areas.  Returns 404 if the run or analysis does not exist.
+    """
+    if diagnostic_recorder is None or not diagnostic_recorder.enabled:
+        raise HTTPException(status_code=404, detail="Diagnostics not enabled")
+    analysis = diagnostic_recorder.get_analysis(run_id)
+    if analysis is None:
+        raise HTTPException(status_code=404, detail=f"Analysis for run {run_id!r} not found")
+    return analysis
+
+
+@app.get("/api/diagnostics/runs/{run_id}/review-prompt")
+async def get_diagnostic_review_prompt(run_id: str) -> dict:
+    """Return the model review prompt for a specific run.
+
+    This is a ready-to-paste prompt designed to be sent to a second AI model
+    (Qwen / GPT / Claude / etc.) for targeted failure diagnosis.  Contains:
+    - condensed event trace
+    - automatic findings summary
+    - focused diagnostic instructions
+
+    Returns ``{"run_id": ..., "prompt": ...}`` or 404.
+    """
+    if diagnostic_recorder is None or not diagnostic_recorder.enabled:
+        raise HTTPException(status_code=404, detail="Diagnostics not enabled")
+    prompt = diagnostic_recorder.get_review_prompt(run_id)
+    if prompt is None:
+        raise HTTPException(
+            status_code=404, detail=f"Review prompt for run {run_id!r} not found"
+        )
+    return {"run_id": run_id, "prompt": prompt}
 
 
 @app.get("/api/mode")

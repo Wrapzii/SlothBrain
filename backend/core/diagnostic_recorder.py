@@ -178,12 +178,14 @@ class DiagnosticRecorder:
         iteration: int,
         prompt: str,
         tools_available: list[str],
+        slot_id: int | None = None,
     ) -> None:
         self.record(
             run_id,
             "model_request",
             step_num=step_num,
             iteration=iteration,
+            slot_id=slot_id,
             prompt_len=len(prompt),
             prompt_preview=prompt[:_MAX_PROMPT_PREVIEW_CHARS],
             tools_available=tools_available,
@@ -197,6 +199,7 @@ class DiagnosticRecorder:
         iteration: int,
         response: str,
         error: str | None = None,
+        slot_id: int | None = None,
     ) -> None:
         stripped = (response or "").strip()
         self.record(
@@ -204,6 +207,7 @@ class DiagnosticRecorder:
             "model_response_raw",
             step_num=step_num,
             iteration=iteration,
+            slot_id=slot_id,
             response=stripped[:_MAX_RESPONSE_CHARS],
             response_len=len(stripped),
             is_empty=not bool(stripped),
@@ -272,9 +276,36 @@ class DiagnosticRecorder:
                 encoding="utf-8",
             )
             logger.info("Diagnostic bundle written: %s", bundle_path)
+            # Auto-run the analyzer immediately after writing the bundle.
+            self._run_analyzer(run_id, bundle, run_dir)
         except Exception as exc:
             logger.warning(
                 "Failed to write diagnostic bundle for run %s: %s", run_id, exc
+            )
+
+    def _run_analyzer(self, run_id: str, bundle: dict, run_dir: Path) -> None:
+        """Run the failure-mode analyzer and write analysis artefacts."""
+        try:
+            # Local import: DiagnosticAnalyzer is a sibling module that itself
+            # imports no recorder state, so there is no circular dependency at
+            # runtime.  The local import keeps the recorder module lightweight
+            # and allows the analyzer to be replaced or disabled independently.
+            from backend.core.diagnostic_analyzer import DiagnosticAnalyzer
+
+            analyzer = DiagnosticAnalyzer(run_dir=run_dir)
+            findings = analyzer.analyze()
+            if findings:
+                logger.info(
+                    "Diagnostic analyzer found %d finding(s) for run %s: %s",
+                    len(findings),
+                    run_id,
+                    [f["id"] for f in findings],
+                )
+            else:
+                logger.info("Diagnostic analyzer: no failures detected for run %s", run_id)
+        except Exception as exc:
+            logger.warning(
+                "Diagnostic analyzer failed for run %s: %s", run_id, exc
             )
 
     # ------------------------------------------------------------------
@@ -323,6 +354,32 @@ class DiagnosticRecorder:
         except Exception as exc:
             logger.warning(
                 "Failed to read diagnostic bundle for run %s: %s", run_id, exc
+            )
+            return None
+
+    def get_analysis(self, run_id: str) -> dict | None:
+        """Return ``analysis.json`` for *run_id*, or ``None`` if not found."""
+        analysis_path = self._output_dir / run_id / "analysis.json"
+        if not analysis_path.exists():
+            return None
+        try:
+            return json.loads(analysis_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            logger.warning(
+                "Failed to read analysis.json for run %s: %s", run_id, exc
+            )
+            return None
+
+    def get_review_prompt(self, run_id: str) -> str | None:
+        """Return ``model_review_prompt.md`` content for *run_id*, or ``None``."""
+        path = self._output_dir / run_id / "model_review_prompt.md"
+        if not path.exists():
+            return None
+        try:
+            return path.read_text(encoding="utf-8")
+        except Exception as exc:
+            logger.warning(
+                "Failed to read model_review_prompt.md for run %s: %s", run_id, exc
             )
             return None
 
